@@ -469,16 +469,20 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
             scale=scale,
             mask=mask,
         )
-        if result is not None:
-            return result
-        float_keys, float_values = helper.dequantize_for_attention(keys, values)
-        return mx.fast.scaled_dot_product_attention(
-            queries,
-            float_keys.astype(queries.dtype),
-            float_values.astype(queries.dtype),
-            scale=scale,
-            mask=mask,
-        )
+        if result is None:
+            float_keys, float_values = helper.dequantize_for_attention(keys, values)
+            result = mx.fast.scaled_dot_product_attention(
+                queries,
+                float_keys.astype(queries.dtype),
+                float_values.astype(queries.dtype),
+                scale=scale,
+                mask=mask,
+            )
+        if os.environ.get("MLX_VLM_PAGED_PREFILL_EAGER_RELEASE") == "1":
+            # Bound the lifetime of this layer's temporary contiguous and
+            # dequantized compatibility views in an otherwise lazy forward.
+            mx.eval(result)
+        return result
 
     def new_empty(self) -> PagedBatchTurboQuantKVCache:
         """Create a B=1 prefill cache sharing this facade's page pool."""

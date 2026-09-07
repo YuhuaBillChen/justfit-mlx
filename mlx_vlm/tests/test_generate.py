@@ -1210,6 +1210,60 @@ class TestBatchGenerator:
 
         assert events == ["prefill"]
 
+    def test_mixed_prefill_step_cap_only_applies_while_decode_is_active(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        monkeypatch.setenv("MLX_VLM_MIXED_PREFILL_STEP_SIZE", "64")
+
+        class ActiveAR:
+            is_speculative = False
+            logits_processors = []
+
+            def __len__(self):
+                return 1
+
+            def next(self):
+                return ["token"]
+
+        observed = []
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=2,
+        )
+        gen._generation_batch = ActiveAR()
+        prompt = SimpleNamespace(prefill_step_size=256)
+        prompt.needs_processing = lambda: True
+        prompt.prompt_step = lambda: observed.append(prompt.prefill_step_size)
+        gen._prompt_batch = prompt
+
+        gen.next()
+
+        assert observed == [64]
+        assert prompt.prefill_step_size == 256
+        gen.close()
+
+    def test_mixed_prefill_step_cap_does_not_throttle_prefill_alone(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        monkeypatch.setenv("MLX_VLM_MIXED_PREFILL_STEP_SIZE", "64")
+        observed = []
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=2,
+        )
+        prompt = SimpleNamespace(prefill_step_size=256)
+        prompt.needs_processing = lambda: True
+        prompt.prompt_step = lambda: observed.append(prompt.prefill_step_size)
+        gen._prompt_batch = prompt
+
+        gen.next()
+
+        assert observed == [256]
+        assert prompt.prefill_step_size == 256
+        gen.close()
+
     def test_prompt_progress_reports_apc_cached_tokens(self):
         batch = PromptProcessingBatch(
             model=SimpleNamespace(),
@@ -1749,6 +1803,37 @@ class TestBatchGenerator:
         # The paged scheduler will prefill one row at a time, but the other
         # three rows are already resident work and require an AR cohort.
         assert gen._draft_for_prompt_batch(1) == (None, None, None)
+        gen.close()
+
+    def test_peer_arriving_mid_prefill_suppresses_stale_singleton_mtp(
+        self, monkeypatch, mock_model, mock_processor, caplog
+    ):
+        """A prompt's MTP choice must be rechecked at its final boundary."""
+        monkeypatch.setenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "1")
+        caplog.set_level(logging.INFO, logger="mlx_vlm.generate")
+        draft = object()
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=2,
+            prefill_batch_size=1,
+            draft_model=draft,
+            draft_kind="mtp",
+            draft_block_size=3,
+        )
+        prompt = SimpleNamespace(
+            draft_model=draft,
+            draft_kind="mtp",
+            draft_block_size=3,
+        )
+
+        assert not gen._suppress_stale_singleton_mtp(prompt)
+        gen._unprocessed_sequences.append(object())
+        assert gen._suppress_stale_singleton_mtp(prompt)
+        assert prompt.draft_model is None
+        assert prompt.draft_kind is None
+        assert prompt.draft_block_size is None
+        assert "cold peer arrived during prefill" in caplog.text
         gen.close()
 
     def test_initial_ar_cohort_retains_singleton_mtp_repromotion_owner(

@@ -246,6 +246,17 @@ def _get_prefill_schedule_interval() -> int:
         return DEFAULT_PREFILL_SCHEDULE_INTERVAL
 
 
+def _get_mixed_prefill_step_size() -> int:
+    raw = os.environ.get("MLX_VLM_MIXED_PREFILL_STEP_SIZE")
+    if raw is None:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("Ignoring invalid MLX_VLM_MIXED_PREFILL_STEP_SIZE=%r", raw)
+        return 0
+
+
 def _position_seed(seed: int, row_id: int, position: int) -> int:
     x = (int(seed) ^ 0x9E3779B9) & 0xFFFFFFFF
     x = (x + (int(row_id) + 1) * 0x85EBCA6B) & 0xFFFFFFFF
@@ -3221,12 +3232,18 @@ class BatchGenerator:
         self._steps_counter = 0
         self._cache_eval_interval = _get_batch_cache_eval_interval()
         self._prefill_schedule_interval = _get_prefill_schedule_interval()
+        self._mixed_prefill_step_size = _get_mixed_prefill_step_size()
         self._decode_prefill_cadence_step = 0
         if self._prefill_schedule_interval > 1:
             logger.info(
                 "Prefill cadence enabled: one mixed prefill step per %d "
                 "active decode steps.",
                 self._prefill_schedule_interval,
+            )
+        if self._mixed_prefill_step_size > 0:
+            logger.info(
+                "Mixed prefill chunk cap enabled: %d tokens while decode is active.",
+                self._mixed_prefill_step_size,
             )
 
         self._wire_stack = contextlib.ExitStack()
@@ -3253,6 +3270,27 @@ class BatchGenerator:
             getattr(self, "draft_kind", None),
             getattr(self, "draft_block_size", None),
         )
+
+    def _suppress_stale_singleton_mtp(self, prompt_batch) -> bool:
+        """Drop a prompt's stale MTP choice when a peer arrived mid-prefill."""
+
+        singleton_only = os.environ.get(
+            "MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "0"
+        ).lower() in ("1", "true", "yes")
+        if not (
+            singleton_only
+            and getattr(prompt_batch, "draft_kind", None) == "mtp"
+            and bool(self._unprocessed_sequences)
+        ):
+            return False
+        prompt_batch.draft_model = None
+        prompt_batch.draft_kind = None
+        prompt_batch.draft_block_size = None
+        logger.info(
+            "Suppressed stale singleton MTP at prefill boundary because a "
+            "cold peer arrived during prefill."
+        )
+        return True
 
     def demote_mtp_to_ar(self) -> bool:
         """Switch an active MTP cohort to AR at a completed round boundary."""
@@ -3841,6 +3879,20 @@ class BatchGenerator:
             return progress()
         return []
 
+    def _advance_prompt_batch(self, prompt_batch) -> int:
+        """Advance prefill with a smaller transient chunk beside active decode."""
+
+        original_step = getattr(prompt_batch, "prefill_step_size", None)
+        cap = getattr(self, "_mixed_prefill_step_size", 0)
+        should_cap = len(self._generation_batch) > 0 and cap > 0 and original_step
+        if should_cap:
+            prompt_batch.prefill_step_size = min(int(original_step), cap)
+        try:
+            return prompt_batch.prompt_step()
+        finally:
+            if should_cap:
+                prompt_batch.prefill_step_size = original_step
+
     def _extend_generation_batch(self, gen_batch) -> None:
         if len(self._generation_batch) == 0:
             self._generation_batch = gen_batch
@@ -3942,12 +3994,13 @@ class BatchGenerator:
         if self._prompt_batch is not None:
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
-                self._prompt_batch.prompt_step()
+                self._advance_prompt_batch(self._prompt_batch)
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
                 return prompt_responses, generation_responses
 
+            self._suppress_stale_singleton_mtp(self._prompt_batch)
             tic = time.perf_counter()
             gen_batch = self._prompt_batch.generate(
                 self.sampler,
@@ -3986,11 +4039,12 @@ class BatchGenerator:
                 self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
                 if self._prompt_batch.needs_processing():
                     tic = time.perf_counter()
-                    nstep = self._prompt_batch.prompt_step()
+                    nstep = self._advance_prompt_batch(self._prompt_batch)
                     elapsed = time.perf_counter() - tic
                     self._prompt_time_counter += elapsed
                     self._record_prompt_batch_time(self._prompt_batch, elapsed)
                 else:
+                    self._suppress_stale_singleton_mtp(self._prompt_batch)
                     tic = time.perf_counter()
                     gen_batch = self._prompt_batch.generate(
                         self.sampler,
@@ -4063,7 +4117,7 @@ class BatchGenerator:
 
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
-                n = self._prompt_batch.prompt_step()
+                n = self._advance_prompt_batch(self._prompt_batch)
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
