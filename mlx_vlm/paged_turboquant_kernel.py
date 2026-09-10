@@ -821,6 +821,221 @@ def _singleton_paged_mse_verify_qtile_kernel(
     )
 
 
+@cache
+def _paged_mse_q4_direct_inverse_kernel(dim: int, page_size: int):
+    """Direct Q4 page dequant with MLX-compatible inverse RHT per vector."""
+
+    if not _metal_available() or dim != 256 or page_size != 256:
+        return None
+    header = r"""
+#include <metal_simdgroup>
+template <short R>
+METAL_FUNC void tq_radix(thread float* x) {
+    constexpr short logR = __builtin_ctz(R);
+    short h = 1;
+    #pragma clang loop unroll(full)
+    for (short s = 0; s < logR; ++s) {
+        #pragma clang loop unroll(full)
+        for (short ii = 0; ii < R / 2; ++ii) {
+            short k = ii & (h - 1);
+            short j = ((ii - k) << 1) + k;
+            float a = x[j];
+            float b = x[j + h];
+            x[j] = a + b;
+            x[j + h] = a - b;
+        }
+        h <<= 1;
+    }
+}
+"""
+    source = r"""
+        constexpr short Radix = 16;
+        constexpr short Threads = Dim / Radix;
+        short i = short(thread_index_in_threadgroup);
+        int token = int(threadgroup_position_in_grid.y);
+        int head = int(threadgroup_position_in_grid.z);
+        int token_count = seq_lens[0];
+        if (token >= token_count || head >= NumKVHeads) return;
+
+        int logical_page = token / PageSize;
+        int page_token = token - logical_page * PageSize;
+        int physical_page = physical_page_ids[logical_page];
+        int norm_index =
+            (physical_page * NumKVHeads + head) * PageSize + page_token;
+        int key_word_base = norm_index * KPackedWidth;
+        int val_word_base = norm_index * VPackedWidth;
+        threadgroup float buf[Dim];
+        float x[Radix];
+
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < Radix / 4; ++j) {
+            short index = j * 4 * Threads + i * 4;
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 4; ++r) {
+                int d = int(index + r);
+                int byte_in_vector = d >> 1;
+                int word_in_vector = byte_in_vector >> 2;
+                int byte_in_word = byte_in_vector & 3;
+                uint packed_byte = (key_packed[key_word_base + word_in_vector]
+                    >> (byte_in_word * 8)) & 255u;
+                uint code = (packed_byte >> ((d & 1) * 4)) & 15u;
+                buf[d] = static_cast<float>(key_codebook[code]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        short h = 1;
+        #pragma clang loop unroll(full)
+        for (short stage = 0; stage < 2; ++stage) {
+            short k = i & (h - 1);
+            short j = ((i - k) << 4) + k;
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < Radix; ++r) x[r] = buf[j + h * r];
+            tq_radix<Radix>(x);
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < Radix; ++r) buf[j + h * r] = x[r];
+            h <<= 4;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float key_norm = static_cast<float>(key_norms[norm_index]);
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < Radix / 4; ++j) {
+            short index = j * 4 * Threads + i * 4;
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 4; ++r) {
+                int d = int(index + r);
+                int output_index = (head * token_count + token) * Dim + d;
+                keys_out[output_index] = static_cast<T>(
+                    buf[d] * (1.0f / 16.0f) * key_norm
+                    * static_cast<float>(key_signs[d]));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < Radix / 4; ++j) {
+            short index = j * 4 * Threads + i * 4;
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 4; ++r) {
+                int d = int(index + r);
+                int byte_in_vector = d >> 1;
+                int word_in_vector = byte_in_vector >> 2;
+                int byte_in_word = byte_in_vector & 3;
+                uint packed_byte = (val_packed[val_word_base + word_in_vector]
+                    >> (byte_in_word * 8)) & 255u;
+                uint code = (packed_byte >> ((d & 1) * 4)) & 15u;
+                buf[d] = static_cast<float>(val_codebook[code]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        h = 1;
+        #pragma clang loop unroll(full)
+        for (short stage = 0; stage < 2; ++stage) {
+            short k = i & (h - 1);
+            short j = ((i - k) << 4) + k;
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < Radix; ++r) x[r] = buf[j + h * r];
+            tq_radix<Radix>(x);
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < Radix; ++r) buf[j + h * r] = x[r];
+            h <<= 4;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float val_norm = static_cast<float>(val_norms[norm_index]);
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < Radix / 4; ++j) {
+            short index = j * 4 * Threads + i * 4;
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 4; ++r) {
+                int d = int(index + r);
+                int output_index = (head * token_count + token) * Dim + d;
+                vals_out[output_index] = static_cast<T>(
+                    buf[d] * (1.0f / 16.0f) * val_norm
+                    * static_cast<float>(val_signs[d]));
+            }
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="turboquant_paged_q4_direct_inverse_d256_p256",
+        input_names=[
+            "key_norms",
+            "key_packed",
+            "key_codebook",
+            "key_signs",
+            "val_norms",
+            "val_packed",
+            "val_codebook",
+            "val_signs",
+            "physical_page_ids",
+            "seq_lens",
+        ],
+        output_names=["keys_out", "vals_out"],
+        header=header,
+        source=source,
+    )
+
+
+def paged_mse_q4_prefill_direct_inverse_attention(
+    queries: mx.array,
+    key_pages: TurboQuantMSEState,
+    value_pages: TurboQuantMSEState,
+    schedule: CompactPageSchedule,
+    *,
+    key_codec,
+    value_codec,
+    scale: float,
+    mask,
+    page_size: int = PAGED_TURBOQUANT_PAGE_SIZE,
+) -> mx.array:
+    """Directly dequantize paged Q4 K/V to BF16, then use stock SDPA."""
+
+    if queries.ndim != 4 or int(queries.shape[0]) != 1:
+        raise ValueError("paged direct-inverse prefill requires [1, Hq, Q, D]")
+    if int(schedule.seq_lens.shape[0]) != 1:
+        raise ValueError("paged direct-inverse prefill requires one sequence")
+    token_count = int(schedule.seq_lens[0].item())
+    _, query_heads, _, dim = queries.shape
+    kv_heads = int(key_pages.norms.shape[1])
+    if dim != 256 or query_heads % kv_heads:
+        raise ValueError("unsupported paged direct-inverse prefill geometry")
+    kernel = _paged_mse_q4_direct_inverse_kernel(dim, page_size)
+    if kernel is None:
+        raise RuntimeError("paged direct-inverse dequant kernel is unavailable")
+    keys, values = kernel(
+        inputs=[
+            key_pages.norms,
+            key_pages.indices,
+            key_codec.codebook,
+            key_codec.signs,
+            value_pages.norms,
+            value_pages.indices,
+            value_codec.codebook,
+            value_codec.signs,
+            schedule.physical_page_ids,
+            schedule.seq_lens,
+        ],
+        template=[
+            ("T", queries.dtype),
+            ("Dim", dim),
+            ("PageSize", page_size),
+            ("NumKVHeads", kv_heads),
+            ("KPackedWidth", key_pages.indices.shape[-1]),
+            ("VPackedWidth", value_pages.indices.shape[-1]),
+        ],
+        grid=(16, token_count, kv_heads),
+        threadgroup=(16, 1, 1),
+        output_shapes=[
+            (1, kv_heads, token_count, dim),
+            (1, kv_heads, token_count, dim),
+        ],
+        output_dtypes=[queries.dtype, queries.dtype],
+    )
+    return mx.fast.scaled_dot_product_attention(
+        queries, keys, values, scale=scale, mask=mask
+    )
+
+
 def paged_mse_q4_verify_attention(
     queries: mx.array,
     key_pages: TurboQuantMSEState,

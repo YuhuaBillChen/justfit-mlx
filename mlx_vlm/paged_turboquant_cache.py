@@ -26,6 +26,7 @@ from .paged_turboquant_kernel import (
     PAGED_TURBOQUANT_PAGE_SIZE,
     build_compact_page_schedule,
     paged_mse_q4_decode_attention,
+    paged_mse_q4_prefill_direct_inverse_attention,
     paged_mse_q4_verify_attention,
 )
 from .paged_turboquant_storage import PagedTurboQuantMSEStorage
@@ -439,6 +440,33 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
             raise ValueError("paged prefill currently supports batch_size=1 only")
 
         query_length = int(queries.shape[-2])
+        causal_array = (
+            isinstance(mask, mx.array)
+            and mask.ndim >= 2
+            and int(mask.shape[-2]) == query_length
+            and int(mask.shape[-1]) == self.sequence_lengths[0]
+        )
+        if (
+            os.environ.get("MLX_VLM_PAGED_PREFILL_IMPL") == "direct_inverse"
+            and (isinstance(mask, str) and mask == "causal" or causal_array)
+        ):
+            if self.storage is None or self.empty():
+                raise ValueError("cannot prefill against an empty paged cache")
+            result = paged_mse_q4_prefill_direct_inverse_attention(
+                queries,
+                self.storage.keys,
+                self.storage.values,
+                self._decode_schedule(),
+                key_codec=self.key_codec,
+                value_codec=self.value_codec,
+                scale=scale,
+                mask=mask,
+                page_size=PAGED_TURBOQUANT_PAGE_SIZE,
+            )
+            if os.environ.get("MLX_VLM_PAGED_PREFILL_EAGER_RELEASE") == "1":
+                mx.eval(result)
+            return result
+
         if (
             os.environ.get("MLX_VLM_TQ_MTP_QTILE") == "1"
             and isinstance(mask, str)

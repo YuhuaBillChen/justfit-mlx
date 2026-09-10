@@ -202,6 +202,88 @@ def test_base_attention_dispatches_paged_prefill_without_reading_pool_as_dense()
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_direct_inverse_prefill_never_materializes_contiguous_kv(monkeypatch):
+    mx.random.seed(8110)
+    query_length = 8
+    keys, values = _kv(PAGE + query_length)
+    queries = mx.random.normal((1, H_Q, query_length, D)).astype(mx.bfloat16)
+    paged = PagedBatchTurboQuantKVCache([0], bits=4, capacity_pages=4)
+    pool_keys, pool_values = paged.update_and_fetch(keys, values)
+
+    expected = scaled_dot_product_attention(
+        queries,
+        pool_keys,
+        pool_values,
+        cache=paged,
+        scale=SCALE,
+        mask="causal",
+    )
+    mx.eval(expected)
+    monkeypatch.setenv("MLX_VLM_PAGED_PREFILL_IMPL", "direct_inverse")
+
+    def fail_materialize(*args, **kwargs):
+        raise AssertionError("direct-inverse prefill must not materialize KV")
+
+    monkeypatch.setattr(paged, "materialize", fail_materialize)
+    actual = scaled_dot_product_attention(
+        queries,
+        pool_keys,
+        pool_values,
+        cache=paged,
+        scale=SCALE,
+        mask="causal",
+    )
+    mx.eval(actual, expected)
+
+    assert actual.shape == queries.shape
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_direct_inverse_prefill_is_bitwise_with_fragmented_physical_pages(
+    monkeypatch,
+):
+    mx.random.seed(8111)
+    owner = PagedBatchTurboQuantKVCache([0], bits=4, capacity_pages=8)
+    owner.update_and_fetch(*_kv(PAGE))
+    target = owner.new_empty()
+    target.update_and_fetch(*_kv(PAGE))
+    blocker = owner.new_empty()
+    blocker.update_and_fetch(*_kv(PAGE))
+    query_length = 37
+    target.update_and_fetch(*_kv(PAGE + query_length))
+    assert target._rows.rows[0].page_ids[:3] == (1, 3, 4)
+
+    queries = mx.random.normal((1, H_Q, query_length, D)).astype(mx.bfloat16)
+    pool_keys, pool_values = target.state
+    expected = scaled_dot_product_attention(
+        queries,
+        pool_keys,
+        pool_values,
+        cache=target,
+        scale=SCALE,
+        mask="causal",
+    )
+    mx.eval(expected)
+    monkeypatch.setenv("MLX_VLM_PAGED_PREFILL_IMPL", "direct_inverse")
+
+    def fail_materialize(*args, **kwargs):
+        raise AssertionError("direct-inverse prefill must not materialize KV")
+
+    monkeypatch.setattr(target, "materialize", fail_materialize)
+    actual = scaled_dot_product_attention(
+        queries,
+        pool_keys,
+        pool_values,
+        cache=target,
+        scale=SCALE,
+        mask="causal",
+    )
+    mx.eval(actual)
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
 @pytest.mark.parametrize("query_length", [2, 3, 4])
 def test_paged_mtp_qtile_dispatch_never_materializes_contiguous_kv(
     monkeypatch, query_length
