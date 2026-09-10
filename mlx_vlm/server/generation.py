@@ -1298,7 +1298,10 @@ class ResponseGenerator:
             tokenizer = getattr(processor, "tokenizer", processor)
             stopping_criteria = getattr(tokenizer, "stopping_criteria", None)
             if stopping_criteria is not None:
-                stopping_criteria.reset([])
+                # StoppingCriteria.reset([]) deliberately re-adds the
+                # tokenizer's own EOS token. Capacity qualification needs an
+                # actually empty predicate so generation reaches max_tokens.
+                stopping_criteria.eos_token_ids = []
             logger.warning(
                 "Capacity benchmark mode enabled: EOS stopping is disabled."
             )

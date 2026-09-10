@@ -35,6 +35,7 @@ from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
+from mlx_vlm.utils import StoppingCriteria
 
 
 def test_response_generator_prefill_step_override_wins_over_environment(monkeypatch):
@@ -1421,21 +1422,11 @@ def test_server_includes_tokenizer_eos_in_stop_tokens(monkeypatch):
 
 def test_server_capacity_mode_disables_eos_stopping(monkeypatch):
     config = SimpleNamespace(eos_token_id=[248044])
-    stopping_criteria = SimpleNamespace(
-        eos_token_ids=[248046, 248044],
-        reset=MagicMock(
-            side_effect=lambda token_ids: setattr(
-                stopping_criteria, "eos_token_ids", list(token_ids)
-            )
-        ),
-    )
+    tokenizer = SimpleNamespace(eos_token_id=248046)
+    stopping_criteria = StoppingCriteria([248044], tokenizer)
+    tokenizer.stopping_criteria = stopping_criteria
     model = SimpleNamespace(language_model=SimpleNamespace(config=config))
-    processor = SimpleNamespace(
-        tokenizer=SimpleNamespace(
-            eos_token_id=248046,
-            stopping_criteria=stopping_criteria,
-        )
-    )
+    processor = SimpleNamespace(tokenizer=tokenizer)
     gen = _unstarted_response_generator()
 
     monkeypatch.setenv("MLX_VLM_CAPACITY_IGNORE_EOS", "1")
@@ -1451,7 +1442,6 @@ def test_server_capacity_mode_disables_eos_stopping(monkeypatch):
 
     assert gen.stop_tokens == set()
     assert stopping_criteria.eos_token_ids == []
-    stopping_criteria.reset.assert_called_once_with([])
 
 
 def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
