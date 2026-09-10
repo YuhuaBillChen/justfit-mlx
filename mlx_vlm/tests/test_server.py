@@ -1419,6 +1419,41 @@ def test_server_includes_tokenizer_eos_in_stop_tokens(monkeypatch):
     assert gen.stop_tokens == {248044, 248046}
 
 
+def test_server_capacity_mode_disables_eos_stopping(monkeypatch):
+    config = SimpleNamespace(eos_token_id=[248044])
+    stopping_criteria = SimpleNamespace(
+        eos_token_ids=[248046, 248044],
+        reset=MagicMock(
+            side_effect=lambda token_ids: setattr(
+                stopping_criteria, "eos_token_ids", list(token_ids)
+            )
+        ),
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(config=config))
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(
+            eos_token_id=248046,
+            stopping_criteria=stopping_criteria,
+        )
+    )
+    gen = _unstarted_response_generator()
+
+    monkeypatch.setenv("MLX_VLM_CAPACITY_IGNORE_EOS", "1")
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+
+    gen._initialize_model()
+
+    assert gen.stop_tokens == set()
+    assert stopping_criteria.eos_token_ids == []
+    stopping_criteria.reset.assert_called_once_with([])
+
+
 def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
     config = SimpleNamespace(eos_token_id=[])
     language_model = SimpleNamespace()

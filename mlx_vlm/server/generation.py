@@ -376,6 +376,16 @@ def get_server_enable_thinking():
     return raw.lower() in ("1", "true", "yes", "on")
 
 
+def capacity_ignore_eos_enabled():
+    """Return whether exact-length capacity runs should ignore EOS tokens."""
+    return os.environ.get("MLX_VLM_CAPACITY_IGNORE_EOS", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def get_server_thinking_budget():
     raw = os.environ.get("MLX_VLM_THINKING_BUDGET")
     return None if raw is None else int(raw)
@@ -1283,6 +1293,15 @@ class ResponseGenerator:
             )
         )
         stop_tokens.update(getattr(processor, "additional_eos_token_ids", ()))
+        if capacity_ignore_eos_enabled():
+            stop_tokens.clear()
+            tokenizer = getattr(processor, "tokenizer", processor)
+            stopping_criteria = getattr(tokenizer, "stopping_criteria", None)
+            if stopping_criteria is not None:
+                stopping_criteria.reset([])
+            logger.warning(
+                "Capacity benchmark mode enabled: EOS stopping is disabled."
+            )
 
         draft_model = None
         draft_kind = self.draft_kind_override or os.environ.get("MLX_VLM_DRAFT_KIND")
