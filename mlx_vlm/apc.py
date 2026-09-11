@@ -3409,10 +3409,6 @@ class APCManager:
         disk = self.disk
         if disk is None or prefix_len >= max_len:
             return prefix_len
-        if self._disk_min_free_ram_bytes > 0:
-            free_now = _free_ram_bytes()
-            if free_now is not None and free_now < self._disk_min_free_ram_bytes:
-                return prefix_len
         disk_match = disk.find_exact_prefix(
             token_tuple,
             extra_hash=extra_hash,

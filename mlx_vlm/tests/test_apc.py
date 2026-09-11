@@ -131,6 +131,8 @@ def test_direct_exact_disk_write_roundtrip_is_immediately_visible(
 
     disk = DiskBlockStore(tmp_path, namespace="direct-exact")
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    manager._disk_min_free_ram_bytes = 1
+    monkeypatch.setattr(apc_module, "_free_ram_bytes", lambda: 0)
     stats_before = manager.stats_snapshot()
     assert (
         manager.peek_exact_prefix_length(token_ids + [999], extra_hash=17)
@@ -138,6 +140,7 @@ def test_direct_exact_disk_write_roundtrip_is_immediately_visible(
     )
     assert manager.peek_exact_prefix_length(token_ids + [999], extra_hash=18) == 0
     assert manager.stats_snapshot() == stats_before
+    manager._disk_min_free_ram_bytes = 0
     warm, matched_tokens = manager.lookup_exact_cache(token_ids + [999], extra_hash=17)
 
     assert matched_tokens == len(token_ids)
