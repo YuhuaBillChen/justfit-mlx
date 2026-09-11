@@ -1262,6 +1262,67 @@ def test_paged_kv_budget_keeps_page_rounded_admission_safety_margin(monkeypatch)
     assert deferred == [peer]
 
 
+def test_elastic_capacity_finishes_largest_surplus_consumer(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "1024")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "128")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {
+        1: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 300,
+            "queued_at": 1.0,
+        },
+        2: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 128,
+            "queued_at": 2.0,
+        },
+    }
+
+    assert gen._elastic_capacity_victims(active) == [1]
+
+
+def test_elastic_capacity_is_disabled_without_output_guarantee(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "512")
+    monkeypatch.delenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", raising=False)
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {
+        1: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 300,
+        }
+    }
+
+    assert gen._elastic_capacity_victims(active) == []
+
+
+def test_elastic_capacity_never_breaks_admission_guarantees(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "768")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "128")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {
+        1: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 127,
+        },
+        2: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 127,
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="guarantees exceed"):
+        gen._elastic_capacity_victims(active)
+
+
 def test_paged_scheduler_fills_free_lane_with_short_request_behind_long(
     monkeypatch,
 ):

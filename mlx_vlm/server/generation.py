@@ -1008,6 +1008,10 @@ class GenerationMetrics:
     draft_rounds: Optional[int] = None
     draft_n_accepted: Optional[int] = None
     draft_n: Optional[int] = None
+    capacity_exhausted: bool = False
+    guaranteed_output_tokens: Optional[int] = None
+    elastic_output_tokens: int = 0
+    capacity_wait_ms: float = 0.0
 
     def record_chunk(self, chunk) -> Optional[float]:
         now = getattr(chunk, "emitted_at", None) or time.perf_counter()
@@ -1065,6 +1069,21 @@ class GenerationMetrics:
         draft_n = getattr(result, "draft_n", None)
         if draft_n is not None:
             self.draft_n = int(draft_n)
+        self.capacity_exhausted = bool(
+            self.capacity_exhausted
+            or getattr(result, "capacity_exhausted", False)
+        )
+        guaranteed = getattr(result, "guaranteed_output_tokens", None)
+        if guaranteed is not None:
+            self.guaranteed_output_tokens = int(guaranteed)
+        elastic = getattr(result, "elastic_output_tokens", None)
+        if elastic is not None:
+            self.elastic_output_tokens = max(
+                self.elastic_output_tokens, int(elastic)
+            )
+        wait_ms = getattr(result, "capacity_wait_ms", None)
+        if wait_ms is not None:
+            self.capacity_wait_ms = max(self.capacity_wait_ms, float(wait_ms))
 
 
 @dataclass
@@ -1090,6 +1109,10 @@ class StreamingToken:
     cached_tokens: int = 0
     token_count: int = 1
     emitted_at: Optional[float] = None
+    capacity_exhausted: bool = False
+    guaranteed_output_tokens: Optional[int] = None
+    elastic_output_tokens: int = 0
+    capacity_wait_ms: float = 0.0
 
 
 class _DiffusionBlockEmitter:
@@ -2179,6 +2202,119 @@ class ResponseGenerator:
         value = info.get("context_budget_tokens")
         return None if value is None else max(0, int(value))
 
+    @staticmethod
+    def _page_round_tokens(tokens: int) -> int:
+        return (
+            (max(0, int(tokens)) + PAGED_TURBOQUANT_PAGE_SIZE - 1)
+            // PAGED_TURBOQUANT_PAGE_SIZE
+            * PAGED_TURBOQUANT_PAGE_SIZE
+        )
+
+    def _elastic_capacity_victims(self, active: dict) -> list[int]:
+        """Choose rows to finish before their next token can exceed the pool.
+
+        Admission guarantees remain protected. Only rows that have already
+        generated their guarantee are eligible, and the row using the most
+        elastic surplus yields first. Ties prefer the newest request.
+        """
+
+        if not active or not paged_turboquant_enabled():
+            return []
+        if get_paged_output_guarantee_tokens() is None:
+            return []
+        capacity = get_paged_kv_capacity_tokens()
+        if capacity is None:
+            return []
+        usable = max(
+            0,
+            int(capacity)
+            - self._page_round_tokens(get_paged_kv_safety_tokens()),
+        )
+        budgets = {
+            uid: self._page_round_tokens(
+                int(info.get("prompt_tokens", 0) or 0)
+                + max(
+                    int(info.get("guaranteed_output_tokens", 0) or 0),
+                    int(info.get("generated_tokens", 0) or 0) + 1,
+                )
+            )
+            for uid, info in active.items()
+        }
+        victims = []
+        while sum(budgets.values()) > usable:
+            eligible = [
+                uid
+                for uid in budgets
+                if int(active[uid].get("generated_tokens", 0) or 0)
+                >= int(active[uid].get("guaranteed_output_tokens", 0) or 0)
+            ]
+            if not eligible:
+                raise RuntimeError(
+                    "Elastic KV guarantees exceed usable paged capacity."
+                )
+            victim = max(
+                eligible,
+                key=lambda uid: (
+                    int(active[uid].get("generated_tokens", 0) or 0)
+                    - int(
+                        active[uid].get("guaranteed_output_tokens", 0) or 0
+                    ),
+                    float(active[uid].get("queued_at", 0.0) or 0.0),
+                ),
+            )
+            victims.append(victim)
+            del budgets[victim]
+        return victims
+
+    def _finish_elastic_capacity_victims(
+        self, batch_gen, active: dict
+    ) -> list[int]:
+        victims = self._elastic_capacity_victims(active)
+        for uid in victims:
+            info = active.get(uid)
+            if info is None or not batch_gen.remove(uid):
+                continue
+            generated = int(info.get("generated_tokens", 0) or 0)
+            guaranteed = int(info.get("guaranteed_output_tokens", 0) or 0)
+            text = info["streamer"].finalize()
+            emitted_at = self._log_decode_progress(
+                uid,
+                info,
+                token=0,
+                text=text,
+                finish_reason="length",
+                token_count=0,
+            )
+            info["rqueue"].put(
+                StreamingToken(
+                    text=text,
+                    token=0,
+                    logprobs=0.0,
+                    finish_reason="length",
+                    peak_memory=mx.get_peak_memory() / 1e9,
+                    prompt_tps=info.get("prompt_tps"),
+                    cached_tokens=info.get("cached_tokens", 0),
+                    token_count=0,
+                    emitted_at=emitted_at,
+                    capacity_exhausted=True,
+                    guaranteed_output_tokens=guaranteed,
+                    elastic_output_tokens=max(0, generated - guaranteed),
+                    capacity_wait_ms=float(
+                        info.get("capacity_wait_ms", 0.0) or 0.0
+                    ),
+                )
+            )
+            info["rqueue"].put(None)
+            del active[uid]
+            logger.info(
+                "Elastic KV capacity exhausted: request=%s "
+                "generated_tokens=%d guaranteed_output_tokens=%d",
+                info.get("request_id", uid),
+                generated,
+                guaranteed,
+            )
+        return victims
+
     def _partition_kv_budget_admission(
         self, pending, active, admission_capacity: Optional[int] = None
     ):
@@ -2636,6 +2772,11 @@ class ResponseGenerator:
                         "prompt_tps": None,
                         "cached_tokens": 0,
                         "cancel_event": request.cancel_event,
+                        "queued_at": request.queued_at,
+                        "capacity_wait_ms": max(
+                            0.0,
+                            (time.perf_counter() - request.queued_at) * 1000.0,
+                        ),
                         "prompt_tokens": max(0, int(prompt_tokens)),
                         "requested_output_tokens": max(
                             0, int(args.max_tokens or 0)
@@ -2661,6 +2802,9 @@ class ResponseGenerator:
                 if not active or batch_gen is None:
                     continue
 
+                self._finish_elastic_capacity_victims(batch_gen, active)
+                if not active:
+                    continue
                 self._step(batch_gen, active)
                 previous_paged_active_count = last_paged_active_count
                 if len(active) != previous_paged_active_count:
@@ -2954,6 +3098,20 @@ class ResponseGenerator:
                     cached_tokens=info.get("cached_tokens", 0),
                     token_count=token_count,
                     emitted_at=emitted_at,
+                    capacity_exhausted=False,
+                    guaranteed_output_tokens=info.get(
+                        "guaranteed_output_tokens"
+                    ),
+                    elastic_output_tokens=max(
+                        0,
+                        int(info.get("generated_tokens", 0) or 0)
+                        - int(
+                            info.get("guaranteed_output_tokens", 0) or 0
+                        ),
+                    ),
+                    capacity_wait_ms=float(
+                        info.get("capacity_wait_ms", 0.0) or 0.0
+                    ),
                 )
             )
 

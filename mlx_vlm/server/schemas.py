@@ -448,6 +448,12 @@ class GenerationTimings(BaseModel):
     draft_rounds: Optional[int] = None
     draft_n: Optional[int] = None
     draft_n_accepted: Optional[int] = None
+    capacity_exhausted: bool = False
+    guaranteed_output_tokens: Optional[int] = None
+    elastic_output_tokens: int = 0
+    capacity_wait_ms: float = 0.0
+    preemption_count: int = 0
+    recompute_tokens: int = 0
 
     @staticmethod
     def _derive_gen_tps(token_times: List[float]) -> Optional[float]:
@@ -492,6 +498,18 @@ class GenerationTimings(BaseModel):
             draft_rounds=getattr(metrics, "draft_rounds", None),
             draft_n=getattr(metrics, "draft_n", None),
             draft_n_accepted=getattr(metrics, "draft_n_accepted", None),
+            capacity_exhausted=bool(
+                getattr(metrics, "capacity_exhausted", False)
+            ),
+            guaranteed_output_tokens=getattr(
+                metrics, "guaranteed_output_tokens", None
+            ),
+            elastic_output_tokens=int(
+                getattr(metrics, "elastic_output_tokens", 0) or 0
+            ),
+            capacity_wait_ms=float(
+                getattr(metrics, "capacity_wait_ms", 0.0) or 0.0
+            ),
         )
 
 
