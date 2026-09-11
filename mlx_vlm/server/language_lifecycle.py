@@ -5,13 +5,77 @@ from __future__ import annotations
 import gc
 import logging
 import time
+from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Set
 
 import mlx.core as mx
 import mlx.nn as nn
 
 logger = logging.getLogger("mlx_vlm.server")
+
+
+class ComponentResidencyManager:
+    """Coordinate phase-swapped components shared by one GPU scheduler.
+
+    Components expose idempotent ``load()`` and ``unload()`` methods. Owners
+    hold named leases while a component is required; an idle component may be
+    swapped out only after its last lease is released. The generation worker
+    is the sole caller, so transitions remain serialized with model forwards.
+    """
+
+    def __init__(self) -> None:
+        self._components: Dict[str, Any] = {}
+        self._owners: Dict[str, Set[str]] = defaultdict(set)
+
+    def register(self, name: str, component: Any) -> Any:
+        existing = self._components.get(name)
+        if existing is not None and existing is not component:
+            raise ValueError(f"Phase component already registered: {name}")
+        self._components[name] = component
+        return component
+
+    def contains(self, name: str) -> bool:
+        return name in self._components
+
+    def owners(self, name: str) -> frozenset[str]:
+        return frozenset(self._owners.get(name, ()))
+
+    def acquire(self, name: str, owner: str) -> Any:
+        component = self._components[name]
+        owners = self._owners[name]
+        if owner in owners:
+            return component
+        component.load()
+        owners.add(owner)
+        logger.info(
+            "Phase component acquired: component=%s owner=%s leases=%d",
+            name,
+            owner,
+            len(owners),
+        )
+        return component
+
+    def release(self, name: str, owner: str) -> bool:
+        component = self._components.get(name)
+        if component is None:
+            return False
+        owners = self._owners[name]
+        if owner not in owners:
+            return False
+        owners.remove(owner)
+        if owners:
+            return False
+        component.unload()
+        logger.info("Phase component idle: component=%s", name)
+        return True
+
+    def unload_if_idle(self, name: str) -> bool:
+        component = self._components.get(name)
+        if component is None or self._owners.get(name):
+            return False
+        component.unload()
+        return True
 
 
 class LanguageHeadPhaseSwap:

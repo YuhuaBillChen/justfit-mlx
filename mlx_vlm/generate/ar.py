@@ -2744,7 +2744,14 @@ class PromptProcessingBatch:
             return 0
         phase_swap = getattr(self.model, "prefill_head_phase_swap", None)
         if phase_swap is not None:
-            phase_swap.unload()
+            residency = getattr(self.model, "phase_residency_manager", None)
+            if (
+                residency is not None
+                and residency.contains("lm_head") is True
+            ):
+                residency.unload_if_idle("lm_head")
+            else:
+                phase_swap.unload()
         if any(self._cached_tokens_per_row):
             _reserve_warm_prompt_capacity(
                 self.prompt_cache,
@@ -2828,7 +2835,14 @@ class PromptProcessingBatch:
         """Process final tokens and transition to GenerationBatch."""
         phase_swap = getattr(self.model, "prefill_head_phase_swap", None)
         if phase_swap is not None:
-            phase_swap.load()
+            residency = getattr(self.model, "phase_residency_manager", None)
+            if (
+                residency is not None
+                and residency.contains("lm_head") is True
+            ):
+                residency.acquire("lm_head", "generation")
+            else:
+                phase_swap.load()
         call_kwargs = dict(self._prompt_kwargs)
         if self.draft_model is not None and self.draft_kind is not None:
             call_kwargs.update(
@@ -3248,6 +3262,17 @@ class BatchGenerator:
 
         self._wire_stack = contextlib.ExitStack()
         self._wire_stack.enter_context(wired_limit(model, [self._stream]))
+
+    def _sync_generation_head_residency(self) -> None:
+        model = getattr(self, "model", None)
+        residency = getattr(model, "phase_residency_manager", None)
+        if residency is None or residency.contains("lm_head") is not True:
+            return
+        generation_batch = getattr(self, "_generation_batch", ())
+        if len(generation_batch) > 0:
+            residency.acquire("lm_head", "generation")
+        else:
+            residency.release("lm_head", "generation")
 
     def _draft_for_prompt_batch(self, batch_size: int):
         # Batch-invariant mode compares the same AR execution across cohort
@@ -3730,6 +3755,13 @@ class BatchGenerator:
         generation_batch = getattr(self, "_generation_batch", None)
         if generation_batch is not None:
             _release_cache_resources(getattr(generation_batch, "prompt_cache", []))
+        model = getattr(self, "model", None)
+        residency = getattr(model, "phase_residency_manager", None)
+        if (
+            residency is not None
+            and residency.contains("lm_head") is True
+        ):
+            residency.release("lm_head", "generation")
         paged_factory = getattr(self, "_paged_cache_factory", None)
         release_factory = getattr(paged_factory, "release", None)
         if callable(release_factory) and getattr(
@@ -3829,6 +3861,7 @@ class BatchGenerator:
                 idx = self._generation_batch.uids.index(uid)
                 keep = [i for i in range(len(self._generation_batch.uids)) if i != idx]
                 self._generation_batch.filter(keep)
+                self._sync_generation_head_residency()
                 return True
 
             return False
@@ -3950,6 +3983,7 @@ class BatchGenerator:
                 self._decode_prefill_cadence_step += 1
             else:
                 self._decode_prefill_cadence_step = 0
+            self._sync_generation_head_residency()
             if (
                 self._cache_eval_interval > 0
                 and self._steps_counter % self._cache_eval_interval == 0

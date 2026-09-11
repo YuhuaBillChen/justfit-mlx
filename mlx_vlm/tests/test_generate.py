@@ -1390,6 +1390,70 @@ class TestBatchGenerator:
             batch.generate(sampler, stop)
         model.prefill_head_phase_swap.load.assert_called_once_with()
 
+    def test_prompt_head_phase_swap_respects_active_generation_lease(
+        self, monkeypatch
+    ):
+        cache_state = mx.array([1])
+        phase_swap = SimpleNamespace(unload=MagicMock(), load=MagicMock())
+        residency = SimpleNamespace(
+            contains=MagicMock(return_value=True),
+            unload_if_idle=MagicMock(),
+            acquire=MagicMock(),
+        )
+
+        model = MagicMock()
+        model.supports_skip_logits = True
+        model.prefill_head_phase_swap = phase_swap
+        model.phase_residency_manager = residency
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[1],
+            input_ids=[[1, 2, 3]],
+            max_tokens=[1],
+            inputs_embeds=mx.ones((1, 3, 4)),
+            prompt_kwargs={},
+            prefill_step_size=2,
+            warm_cache=[SimpleNamespace(state=cache_state)],
+        )
+        monkeypatch.setattr(ar_module.mx, "async_eval", MagicMock())
+        monkeypatch.setattr(ar_module.mx, "clear_cache", MagicMock())
+
+        assert batch.prompt_step() == 2
+        residency.unload_if_idle.assert_called_once_with("lm_head")
+        phase_swap.unload.assert_not_called()
+
+        model.side_effect = RuntimeError("stop after lifecycle transition")
+        sampler = lambda logits: mx.array([1])
+        stop = MagicMock()
+        stop.eos_token_ids = []
+        with pytest.raises(RuntimeError, match="lifecycle transition"):
+            batch.generate(sampler, stop)
+        residency.acquire.assert_called_once_with("lm_head", "generation")
+        phase_swap.load.assert_not_called()
+
+    def test_batch_generator_releases_head_after_last_decoder_finishes(self):
+        residency = SimpleNamespace(
+            contains=MagicMock(return_value=True),
+            acquire=MagicMock(),
+            release=MagicMock(),
+        )
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen.model = SimpleNamespace(phase_residency_manager=residency)
+        gen._generation_batch = []
+
+        gen._sync_generation_head_residency()
+
+        residency.release.assert_called_once_with("lm_head", "generation")
+        residency.acquire.assert_not_called()
+
+        residency.acquire.reset_mock()
+        residency.release.reset_mock()
+        gen._generation_batch = [object()]
+        gen._sync_generation_head_residency()
+
+        residency.acquire.assert_called_once_with("lm_head", "generation")
+        residency.release.assert_not_called()
+
     def test_prompt_step_keeps_exact_apc_checkpoint_async(self, monkeypatch):
         cache_state = mx.array([1])
         batch = PromptProcessingBatch(

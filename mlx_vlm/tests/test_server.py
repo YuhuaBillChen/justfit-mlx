@@ -34,6 +34,7 @@ from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server.runtime_config import RuntimeConfig
+from mlx_vlm.server.language_lifecycle import ComponentResidencyManager
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 from mlx_vlm.utils import StoppingCriteria
 
@@ -94,6 +95,91 @@ def test_response_generator_releases_persistent_paged_pool_at_worker_shutdown(
     registry.release.assert_called_once_with()
     assert gen._paged_registry is None
     clear_streams.assert_called_once_with()
+
+
+def test_component_residency_waits_for_last_owner_before_unload():
+    component = SimpleNamespace(load=MagicMock(), unload=MagicMock())
+    residency = ComponentResidencyManager()
+    residency.register("lm_head", component)
+
+    residency.acquire("lm_head", "decode")
+    residency.acquire("lm_head", "final_prefill")
+
+    assert residency.owners("lm_head") == frozenset(
+        {"decode", "final_prefill"}
+    )
+    assert residency.unload_if_idle("lm_head") is False
+    assert residency.release("lm_head", "final_prefill") is False
+    component.unload.assert_not_called()
+    assert residency.release("lm_head", "decode") is True
+    component.unload.assert_called_once_with()
+    assert residency.release("lm_head", "decode") is False
+    component.unload.assert_called_once_with()
+
+
+def test_lm_head_phase_admission_defers_unqualified_mixed_prefill(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(
+        contains=lambda name: name == "lm_head"
+    )
+    first_long = SimpleNamespace(prompt_tokens=98304)
+    short_peer = SimpleNamespace(prompt_tokens=8192)
+    second_long = SimpleNamespace(prompt_tokens=98304)
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [first_long, short_peer, second_long], active={}
+    )
+
+    assert admitted == [first_long, short_peer]
+    assert deferred == [second_long]
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [short_peer, second_long], active={1: {}}
+    )
+
+    assert admitted == [short_peer]
+    assert deferred == [second_long]
+
+
+def test_lm_head_phase_admission_is_unchanged_without_swapped_head():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(contains=lambda _name: False)
+    requests = [SimpleNamespace(prompt_tokens=98304) for _ in range(2)]
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        requests, active={1: {}}
+    )
+
+    assert admitted == requests
+    assert deferred == []
+
+
+def test_lm_head_phase_admission_bounds_short_request_bypass(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS", "1")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(
+        contains=lambda name: name == "lm_head"
+    )
+    long_peer = SimpleNamespace(prompt_tokens=16384, kv_bypass_count=0)
+    short_peer = SimpleNamespace(prompt_tokens=8192, kv_bypass_count=0)
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [long_peer, short_peer], active={1: {}}
+    )
+
+    assert admitted == [short_peer]
+    assert deferred == [long_peer]
+    assert long_peer.kv_bypass_count == 1
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [long_peer, short_peer], active={1: {}}
+    )
+
+    assert admitted == []
+    assert deferred == [long_peer, short_peer]
+    assert long_peer.kv_bypass_count == 1
 
 
 _MUSE_RESPONSE_TEMPLATE = {
@@ -867,6 +953,37 @@ def test_server_initializes_vision_phase_swap(monkeypatch):
     assert gen.vision_phase_swap is phase_swap
 
 
+def test_server_initializes_language_head_phase_swap_for_continuous_batching(
+    monkeypatch,
+):
+    config = SimpleNamespace(eos_token_id=[])
+    language_model = SimpleNamespace(lm_head=object())
+    model = SimpleNamespace(language_model=language_model)
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    phase_swap = SimpleNamespace(load=MagicMock(), unload=MagicMock())
+    gen = _unstarted_response_generator()
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "4")
+    monkeypatch.setenv(
+        "MLX_VLM_LANGUAGE_HEAD_PHASE_SWAP_PATH", "head.safetensors"
+    )
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+    constructor = MagicMock(return_value=phase_swap)
+    monkeypatch.setattr(server_generation, "LanguageHeadPhaseSwap", constructor)
+
+    gen._initialize_model()
+
+    constructor.assert_called_once_with(language_model, "head.safetensors")
+    assert language_model.prefill_head_phase_swap is phase_swap
+    assert language_model.phase_residency_manager is gen.component_residency
+    assert gen.component_residency.contains("lm_head")
+
+
 def test_server_rejects_chunk_local_embeddings_for_unsupported_models(monkeypatch):
     config = SimpleNamespace(model_type="qwen2_vl", eos_token_id=[])
     model = SimpleNamespace()
@@ -1061,6 +1178,88 @@ def test_paged_kv_budget_accounts_for_each_requests_tail_page(monkeypatch):
 
     assert admitted == []
     assert deferred == [one_token]
+
+
+def test_paged_kv_budget_reserves_output_guarantee_not_requested_ceiling(
+    monkeypatch,
+):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "1024")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "128")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    first = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=256,
+        args=server_generation.GenerationArguments(max_tokens=768),
+    )
+    second = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=256,
+        args=server_generation.GenerationArguments(max_tokens=768),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [first, second], active={}
+    )
+
+    assert admitted == [first, second]
+    assert deferred == []
+    assert gen._request_context_budget(first) == 384
+
+
+def test_paged_kv_budget_tracks_elastic_output_already_consumed(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "1024")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "128")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {
+        1: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 300,
+            "context_budget_tokens": 384,
+        }
+    }
+    peer = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=256,
+        args=server_generation.GenerationArguments(max_tokens=768),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission([peer], active=active)
+
+    assert admitted == []
+    assert deferred == [peer]
+
+
+def test_paged_kv_budget_keeps_page_rounded_admission_safety_margin(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "1024")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "128")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_SAFETY_TOKENS", "1")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {
+        1: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 0,
+            "context_budget_tokens": 384,
+        }
+    }
+    peer = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=256,
+        args=server_generation.GenerationArguments(max_tokens=128),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission([peer], active=active)
+
+    assert admitted == []
+    assert deferred == [peer]
 
 
 def test_paged_scheduler_fills_free_lane_with_short_request_behind_long(

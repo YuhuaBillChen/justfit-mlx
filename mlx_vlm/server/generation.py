@@ -55,6 +55,11 @@ from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs, resolve_eos_token_ids
 from .draft_lifecycle import LazyDrafter
+from .language_lifecycle import (
+    ComponentResidencyManager,
+    LanguageEmbeddingPhaseSwap,
+    LanguageHeadPhaseSwap,
+)
 from .runtime import runtime
 from .vision_lifecycle import VisionTowerPhaseSwap
 
@@ -104,6 +109,21 @@ def get_max_num_seqs():
     except ValueError:
         return None
     return n if n > 0 else None
+
+
+def get_lm_head_mixed_prefill_max_tokens() -> int:
+    """Largest prompt allowed to join a phase-swapped active cohort."""
+
+    raw = os.environ.get("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "0")
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS=%r; using 0.",
+            raw,
+        )
+        return 0
+    return max(0, value)
 
 
 def get_batch_kv_slot_budget():
@@ -175,6 +195,39 @@ def get_paged_kv_capacity_tokens() -> Optional[int]:
     if value <= 0:
         raise ValueError("MLX_VLM_PAGED_KV_CAPACITY_TOKENS must be positive")
     return value
+
+
+def _get_nonnegative_env_int(name: str, default: int = 0) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d.", name, raw, default)
+        return default
+    if value < 0:
+        logger.warning("Invalid %s=%r; using %d.", name, raw, default)
+        return default
+    return value
+
+
+def get_paged_output_guarantee_tokens() -> Optional[int]:
+    """Output tokens reserved at admission for each paged request.
+
+    When unset, admission keeps the legacy behavior and reserves the request's
+    complete output ceiling.  A configured value permits output beyond the
+    guarantee to consume shared capacity elastically as it is generated.
+    """
+
+    raw = os.environ.get("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "")
+    if not raw:
+        return None
+    return _get_nonnegative_env_int("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS")
+
+
+def get_paged_kv_safety_tokens() -> int:
+    """Global token headroom withheld from paged admission promises."""
+
+    return _get_nonnegative_env_int("MLX_VLM_PAGED_KV_SAFETY_TOKENS")
 
 
 def make_paged_turboquant_registry(language_model):
@@ -1377,29 +1430,31 @@ class ResponseGenerator:
         self.stop_tokens = stop_tokens
         self.draft_model = draft_model
         self.draft_kind = draft_kind
+        self.component_residency = ComponentResidencyManager()
         vision_component = self.vision_phase_swap_path or os.environ.get(
             "MLX_VLM_VISION_PHASE_SWAP_PATH"
         )
         if vision_component:
             self.vision_phase_swap = VisionTowerPhaseSwap(model, vision_component)
+            self.component_residency.register(
+                "vision_tower", self.vision_phase_swap
+            )
         language_head_component = os.environ.get(
             "MLX_VLM_LANGUAGE_HEAD_PHASE_SWAP_PATH"
         )
         if language_head_component:
-            if get_max_num_seqs() != 1:
-                raise ValueError("Language-head phase swap requires --max-num-seqs 1.")
-            from .language_lifecycle import LanguageHeadPhaseSwap
-
             language_model = getattr(model, "language_model", model)
             language_model.prefill_head_phase_swap = LanguageHeadPhaseSwap(
                 language_model, language_head_component
             )
+            self.component_residency.register(
+                "lm_head", language_model.prefill_head_phase_swap
+            )
+            language_model.phase_residency_manager = self.component_residency
         embedding_component = os.environ.get("MLX_VLM_INPUT_EMBEDDING_PHASE_SWAP_PATH")
         if embedding_component:
             if get_max_num_seqs() != 1:
                 raise ValueError("Embedding phase swap requires --max-num-seqs 1.")
-            from .language_lifecycle import LanguageEmbeddingPhaseSwap
-
             language_model = getattr(model, "language_model", model)
             language_model.prefill_embedding_phase_swap = LanguageEmbeddingPhaseSwap(
                 language_model, embedding_component
@@ -1875,7 +1930,11 @@ class ResponseGenerator:
             getattr(self, "vision_phase_swap", None) if media_uses_vision else None
         )
         if phase_swap is not None:
-            phase_swap.load()
+            residency = getattr(self, "component_residency", None)
+            if residency is not None and residency.contains("vision_tower"):
+                residency.acquire("vision_tower", "media_embedding")
+            else:
+                phase_swap.load()
         # Pass vision cache for image feature caching
         if (
             pixel_values is not None
@@ -1910,7 +1969,11 @@ class ResponseGenerator:
                     mx.eval(arrays)
         finally:
             if phase_swap is not None:
-                phase_swap.unload()
+                residency = getattr(self, "component_residency", None)
+                if residency is not None and residency.contains("vision_tower"):
+                    residency.release("vision_tower", "media_embedding")
+                else:
+                    phase_swap.unload()
         # Remove cache kwargs before passing to BatchGenerator
         data_kwargs.pop("vision_cache", None)
         data_kwargs.pop("_image_key", None)
@@ -2027,6 +2090,59 @@ class ResponseGenerator:
             should_stop = True
         return admitted, should_stop
 
+    def _partition_lm_head_phase_admission(self, pending, active):
+        """Keep unqualified mixed prefills at a safe cohort boundary.
+
+        Paged prefill is B1. Requests collected together therefore become
+        mixed-prefill work after the first row reaches decode. Admit one cold
+        request plus only peers within the explicitly qualified mixed limit.
+        """
+
+        residency = getattr(self, "component_residency", None)
+        if (
+            not pending
+            or residency is None
+            or not residency.contains("lm_head")
+        ):
+            return list(pending), []
+
+        limit = get_lm_head_mixed_prefill_max_tokens()
+        admitted = []
+        deferred = []
+        cold_slot_available = not active
+        fairness_blocked = False
+        admitted_indexes = []
+        for index, request in enumerate(pending):
+            prompt_tokens = max(0, int(getattr(request, "prompt_tokens", 0) or 0))
+            if fairness_blocked:
+                deferred.append(request)
+                continue
+            if cold_slot_available:
+                admitted.append(request)
+                admitted_indexes.append(index)
+                cold_slot_available = False
+            elif prompt_tokens <= limit:
+                admitted.append(request)
+                admitted_indexes.append(index)
+            else:
+                deferred.append(request)
+                if int(getattr(request, "kv_bypass_count", 0)) >= (
+                    get_paged_scheduler_max_bypass()
+                ):
+                    fairness_blocked = True
+
+        if admitted_indexes:
+            last_admitted = max(admitted_indexes)
+            admitted_ids = {id(request) for request in admitted}
+            for index, request in enumerate(pending):
+                if index >= last_admitted:
+                    break
+                if id(request) not in admitted_ids:
+                    request.kv_bypass_count = (
+                        int(getattr(request, "kv_bypass_count", 0)) + 1
+                    )
+        return admitted, deferred
+
     def _admission_capacity(
         self, *, active_count: int, max_num_seqs: Optional[int]
     ) -> Optional[int]:
@@ -2043,9 +2159,25 @@ class ResponseGenerator:
 
     @staticmethod
     def _request_context_budget(request: QueuedGenerationRequest) -> int:
-        return max(0, int(request.prompt_tokens)) + max(
-            0, int(request.args.max_tokens or 0)
-        )
+        requested_output = max(0, int(request.args.max_tokens or 0))
+        output_guarantee = get_paged_output_guarantee_tokens()
+        if paged_turboquant_enabled() and output_guarantee is not None:
+            requested_output = min(requested_output, output_guarantee)
+        return max(0, int(request.prompt_tokens)) + requested_output
+
+    @staticmethod
+    def _active_context_budget(info: dict) -> Optional[int]:
+        """Return an active row's current reservation plus elastic usage."""
+
+        prompt_tokens = info.get("prompt_tokens")
+        output_guarantee = info.get("guaranteed_output_tokens")
+        if prompt_tokens is not None and output_guarantee is not None:
+            generated_tokens = max(0, int(info.get("generated_tokens", 0) or 0))
+            return max(0, int(prompt_tokens)) + max(
+                max(0, int(output_guarantee)), generated_tokens
+            )
+        value = info.get("context_budget_tokens")
+        return None if value is None else max(0, int(value))
 
     def _partition_kv_budget_admission(
         self, pending, active, admission_capacity: Optional[int] = None
@@ -2065,10 +2197,18 @@ class ResponseGenerator:
         )
         if slot_budget is None or not pending:
             return list(pending), []
+        if paged:
+            safety_tokens = get_paged_kv_safety_tokens()
+            safety_tokens = (
+                (safety_tokens + PAGED_TURBOQUANT_PAGE_SIZE - 1)
+                // PAGED_TURBOQUANT_PAGE_SIZE
+                * PAGED_TURBOQUANT_PAGE_SIZE
+            )
+            slot_budget = max(0, slot_budget - safety_tokens)
 
         context_budgets = []
         for info in active.values():
-            value = info.get("context_budget_tokens")
+            value = self._active_context_budget(info)
             if value is None:
                 logger.warning(
                     "Deferring KV-budget admission because an active request "
@@ -2198,6 +2338,7 @@ class ResponseGenerator:
         # uid -> {rqueue, tokens, gen_kwargs}
         active: dict = {}
         last_paged_active_count = None
+        last_phase_deferral_signature = None
         last_kv_deferral_signature = None
         max_num_seqs = get_max_num_seqs()
         phase_cohorts = self._uses_phase_cohort_admission()
@@ -2247,6 +2388,30 @@ class ResponseGenerator:
                     else:
                         live_items.append(item)
                 new_items = live_items
+                collected_items = list(new_items)
+                new_items, phase_deferred_items = (
+                    self._partition_lm_head_phase_admission(new_items, active)
+                )
+                if phase_deferred_items:
+                    phase_deferral_signature = (
+                        len(active),
+                        tuple(
+                            self._request_log_id(item)
+                            for item in phase_deferred_items
+                        ),
+                    )
+                    if phase_deferral_signature != last_phase_deferral_signature:
+                        logger.info(
+                            "LM-head phase admission deferred: active=%d "
+                            "admitted=%d deferred=%d mixed_prefill_limit_tokens=%d",
+                            len(active),
+                            len(new_items),
+                            len(phase_deferred_items),
+                            get_lm_head_mixed_prefill_max_tokens(),
+                        )
+                        last_phase_deferral_signature = phase_deferral_signature
+                else:
+                    last_phase_deferral_signature = None
                 new_items, deferred_items = self._partition_kv_budget_admission(
                     new_items, active, admission_capacity=capacity
                 )
@@ -2269,8 +2434,12 @@ class ResponseGenerator:
                         last_kv_deferral_signature = deferral_signature
                 else:
                     last_kv_deferral_signature = None
-                for item in deferred_items:
-                    self.requests.put(item)
+                deferred_ids = {
+                    id(item) for item in phase_deferred_items + deferred_items
+                }
+                for item in collected_items:
+                    if id(item) in deferred_ids:
+                        self.requests.put(item)
                 if should_stop and not active:
                     break
 
@@ -2467,8 +2636,20 @@ class ResponseGenerator:
                         "prompt_tps": None,
                         "cached_tokens": 0,
                         "cancel_event": request.cancel_event,
-                        "context_budget_tokens": max(0, int(prompt_tokens))
-                        + max(0, int(args.max_tokens or 0)),
+                        "prompt_tokens": max(0, int(prompt_tokens)),
+                        "requested_output_tokens": max(
+                            0, int(args.max_tokens or 0)
+                        ),
+                        "guaranteed_output_tokens": min(
+                            max(0, int(args.max_tokens or 0)),
+                            get_paged_output_guarantee_tokens()
+                            if paged_turboquant_enabled()
+                            and get_paged_output_guarantee_tokens() is not None
+                            else max(0, int(args.max_tokens or 0)),
+                        ),
+                        "context_budget_tokens": self._request_context_budget(
+                            request
+                        ),
                         "spec_snapshot": (
                             speculative_stats_snapshot(self.draft_model)
                             if self.draft_model is not None
