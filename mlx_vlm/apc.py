@@ -3369,6 +3369,60 @@ class APCManager:
             return self._resident_bytes_locked()
 
     # ---------- Public API ----------
+    def peek_exact_prefix_length(
+        self,
+        token_ids: Sequence[int],
+        extra_hash: int = 0,
+        max_prefix_tokens: Optional[int] = None,
+        min_prefix_tokens: int = 0,
+    ) -> int:
+        """Return the longest exact prefix without restoring its KV payload.
+
+        Scheduler admission can use this metadata-only probe to estimate the
+        prompt suffix that still needs model prefill.  It deliberately leaves
+        cache hit statistics and the in-memory LRU unchanged; the subsequent
+        lookup records the real hit if the request is admitted.
+        """
+        if self._exact_cache_max <= 0 and self.disk is None:
+            return 0
+        token_tuple = tuple(int(t) for t in token_ids)
+        max_len = len(token_tuple) - 1
+        if max_prefix_tokens is not None and max_prefix_tokens > 0:
+            max_len = min(max_len, int(max_prefix_tokens))
+        if max_len <= min_prefix_tokens:
+            return 0
+
+        prefix_len = 0
+        with self.lock:
+            if self._exact_cache_max > 0:
+                for entry in self._exact_cache.values():
+                    candidate_len = len(entry.token_ids)
+                    if (
+                        entry.extra_hash != extra_hash
+                        or candidate_len <= min_prefix_tokens
+                        or candidate_len > max_len
+                        or token_tuple[:candidate_len] != entry.token_ids
+                    ):
+                        continue
+                    prefix_len = max(prefix_len, candidate_len)
+
+        disk = self.disk
+        if disk is None or prefix_len >= max_len:
+            return prefix_len
+        if self._disk_min_free_ram_bytes > 0:
+            free_now = _free_ram_bytes()
+            if free_now is not None and free_now < self._disk_min_free_ram_bytes:
+                return prefix_len
+        disk_match = disk.find_exact_prefix(
+            token_tuple,
+            extra_hash=extra_hash,
+            max_prefix_tokens=max_prefix_tokens,
+            min_prefix_tokens=max(min_prefix_tokens, prefix_len),
+        )
+        if disk_match is not None:
+            prefix_len = max(prefix_len, int(disk_match[1]))
+        return prefix_len
+
     def lookup_exact_cache(
         self,
         token_ids: Sequence[int],

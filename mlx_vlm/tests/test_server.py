@@ -155,6 +155,75 @@ def test_lm_head_phase_admission_is_unchanged_without_swapped_head():
     assert deferred == []
 
 
+def test_lm_head_phase_admission_uses_exact_apc_suffix(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
+    manager = SimpleNamespace(peek_exact_prefix_length=MagicMock(return_value=96000))
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(
+        contains=lambda name: name == "lm_head"
+    )
+    gen.apc_manager = manager
+    gen.apc_mode = "exact"
+    warm_peer = SimpleNamespace(
+        prompt_tokens=98304,
+        raw_inputs={"input_ids": list(range(98304))},
+        apc_semantic_hash=17,
+        request_id="warm-peer",
+        images=None,
+        audio=None,
+        videos=None,
+        apc_prefix_tokens_hint=None,
+        apc_prefix_probe_done=False,
+    )
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [warm_peer], active={1: {}}
+    )
+
+    assert admitted == [warm_peer]
+    assert deferred == []
+    assert warm_peer.apc_prefix_tokens_hint == 96000
+    manager.peek_exact_prefix_length.assert_called_once_with(
+        list(range(98304)), extra_hash=17
+    )
+
+    # Reconsidering the same queued request does not rescan the SSD index on
+    # every scheduler turn.
+    gen._partition_lm_head_phase_admission([warm_peer], active={1: {}})
+    manager.peek_exact_prefix_length.assert_called_once()
+
+
+def test_lm_head_phase_admission_keeps_large_apc_suffix_deferred(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(
+        contains=lambda name: name == "lm_head"
+    )
+    gen.apc_manager = SimpleNamespace(
+        peek_exact_prefix_length=MagicMock(return_value=65536)
+    )
+    gen.apc_mode = "exact"
+    warm_peer = SimpleNamespace(
+        prompt_tokens=98304,
+        raw_inputs={"input_ids": list(range(98304))},
+        apc_semantic_hash=0,
+        request_id="warm-peer-large-suffix",
+        images=None,
+        audio=None,
+        videos=None,
+        apc_prefix_tokens_hint=None,
+        apc_prefix_probe_done=False,
+        kv_bypass_count=0,
+    )
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [warm_peer], active={1: {}}
+    )
+
+    assert admitted == []
+    assert deferred == [warm_peer]
+
+
 def test_lm_head_phase_admission_bounds_short_request_bypass(monkeypatch):
     monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
     monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS", "1")

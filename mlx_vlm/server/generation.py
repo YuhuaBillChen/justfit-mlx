@@ -989,6 +989,8 @@ class QueuedGenerationRequest:
     cancel_event: Optional[Event] = None
     queued_at: float = field(default_factory=time.perf_counter)
     kv_bypass_count: int = 0
+    apc_prefix_tokens_hint: Optional[int] = None
+    apc_prefix_probe_done: bool = False
 
 
 @dataclass
@@ -2136,7 +2138,6 @@ class ResponseGenerator:
         fairness_blocked = False
         admitted_indexes = []
         for index, request in enumerate(pending):
-            prompt_tokens = max(0, int(getattr(request, "prompt_tokens", 0) or 0))
             if fairness_blocked:
                 deferred.append(request)
                 continue
@@ -2144,7 +2145,7 @@ class ResponseGenerator:
                 admitted.append(request)
                 admitted_indexes.append(index)
                 cold_slot_available = False
-            elif prompt_tokens <= limit:
+            elif self._request_mixed_prefill_tokens(request) <= limit:
                 admitted.append(request)
                 admitted_indexes.append(index)
             else:
@@ -2165,6 +2166,63 @@ class ResponseGenerator:
                         int(getattr(request, "kv_bypass_count", 0)) + 1
                     )
         return admitted, deferred
+
+    def _request_mixed_prefill_tokens(self, request) -> int:
+        """Estimate model-prefill work after an exact APC prefix match."""
+        prompt_tokens = max(0, int(getattr(request, "prompt_tokens", 0) or 0))
+        if getattr(request, "apc_prefix_probe_done", False):
+            prefix_tokens = int(
+                getattr(request, "apc_prefix_tokens_hint", 0) or 0
+            )
+            return max(0, prompt_tokens - prefix_tokens)
+
+        request.apc_prefix_probe_done = True
+        request.apc_prefix_tokens_hint = 0
+        manager = getattr(self, "apc_manager", None)
+        if (
+            manager is None
+            or getattr(self, "apc_mode", None) != "exact"
+            or not self._is_text_only_request(request)
+        ):
+            return prompt_tokens
+
+        raw_inputs = getattr(request, "raw_inputs", None) or {}
+        input_ids = raw_inputs.get("input_ids")
+        if input_ids is None:
+            return prompt_tokens
+        try:
+            if hasattr(input_ids, "reshape"):
+                input_ids = input_ids.reshape(-1)
+            token_ids = (
+                input_ids.tolist()
+                if hasattr(input_ids, "tolist")
+                else list(input_ids)
+            )
+            if token_ids and isinstance(token_ids[0], (list, tuple)):
+                token_ids = [token for row in token_ids for token in row]
+            prefix_tokens = manager.peek_exact_prefix_length(
+                token_ids,
+                extra_hash=int(getattr(request, "apc_semantic_hash", 0) or 0),
+            )
+        except Exception:
+            logger.exception(
+                "APC prefix admission probe failed: request=%s",
+                self._request_log_id(request),
+            )
+            return prompt_tokens
+
+        prefix_tokens = min(prompt_tokens, max(0, int(prefix_tokens)))
+        request.apc_prefix_tokens_hint = prefix_tokens
+        if prefix_tokens:
+            logger.info(
+                "APC-aware phase admission: request=%s prompt_tokens=%d "
+                "prefix_tokens=%d suffix_tokens=%d",
+                self._request_log_id(request),
+                prompt_tokens,
+                prefix_tokens,
+                prompt_tokens - prefix_tokens,
+            )
+        return max(0, prompt_tokens - prefix_tokens)
 
     def _admission_capacity(
         self, *, active_count: int, max_num_seqs: Optional[int]
