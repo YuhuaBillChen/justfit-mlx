@@ -3991,7 +3991,11 @@ class APCManager:
                 with self.lock:
                     self.stats.exact_stores += 1
             return stored
-        copied = _clone_prompt_cache_for_apc(prompt_cache)
+        copied = (
+            list(prompt_cache)
+            if take_ownership
+            else _clone_prompt_cache_for_apc(prompt_cache)
+        )
         if copied is None:
             types = [type(c).__name__ for c in prompt_cache]
             logger.warning(

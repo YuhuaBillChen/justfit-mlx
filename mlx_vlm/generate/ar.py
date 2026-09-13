@@ -2101,12 +2101,10 @@ class SpeculativeGenerationBatch:
 
         self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
         self.first_tokens = mx.concatenate([self.first_tokens, other.first_tokens])
-        # MTP consumes only the final prompt position from each row.  Prompt
-        # chunks can have different lengths, so normalize before joining the
-        # active and newly-prefetched cohorts.
-        self.hidden = mx.concatenate(
-            [self.hidden[:, -1:, :], other.hidden[:, -1:, :]], axis=0
-        )
+        # The upstream MTP drafter prefills from every target hidden state.
+        # Preserve the full prompt-aligned sequence for newly admitted rows;
+        # an already-active row was rebased to a one-token boundary above.
+        self.hidden = _left_pad_batch_tensor(self.hidden, other.hidden)
         self.shared_kv_states = _merge_speculative_shared_kv(
             self.shared_kv_states or {}, other.shared_kv_states or {}
         )
@@ -2323,7 +2321,8 @@ class SpeculativeGenerationBatch:
                 or self._num_tokens[seq_idx] >= self.max_tokens[seq_idx]
             )
 
-        has_token_controls = any(self.thinking_budget_criteria)
+        thinking_budget_criteria = getattr(self, "thinking_budget_criteria", [])
+        has_token_controls = any(thinking_budget_criteria)
         self._rounds_iter = run_speculative_server_rounds(
             self.model,
             self.draft_model,

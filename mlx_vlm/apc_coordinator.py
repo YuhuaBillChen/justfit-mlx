@@ -216,7 +216,6 @@ class APCCoordinator:
             token_ids,
             snapshot,
             extra_hash=extra_hash,
-            take_ownership=True,
         )
 
     def commit(

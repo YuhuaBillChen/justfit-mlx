@@ -187,7 +187,7 @@ def test_checkpoint_coordinator_consumes_restored_rows(monkeypatch):
     assert captured["kwargs"]["consume_sources"] is True
 
 
-def test_checkpoint_coordinator_transfers_detached_snapshot(monkeypatch):
+def test_checkpoint_coordinator_borrows_snapshot_for_manager(monkeypatch):
     from types import SimpleNamespace
 
     from mlx_vlm import apc
@@ -222,13 +222,13 @@ def test_checkpoint_coordinator_transfers_detached_snapshot(monkeypatch):
     assert calls == [
         (
             (list(range(32)), snapshot),
-            {"extra_hash": 7, "take_ownership": True},
+            {"extra_hash": 7},
         )
     ]
-    assert captured["detach"] is True
+    assert captured["clone"] is False
 
 
-def test_checkpoint_coordinator_borrows_only_for_direct_disk_write(monkeypatch):
+def test_checkpoint_coordinator_borrows_for_any_manager_tier(monkeypatch):
     from types import SimpleNamespace
 
     from mlx_vlm import apc
@@ -252,7 +252,7 @@ def test_checkpoint_coordinator_borrows_only_for_direct_disk_write(monkeypatch):
     coordinator = APCCoordinator(manager, Hybrid())
 
     assert coordinator.store_checkpoint(list(range(32)), [object()])
-    assert captured["detach"] is False
+    assert captured["clone"] is False
 
 
 def test_checkpoint_coordinator_does_not_store_completed_checkpoint():

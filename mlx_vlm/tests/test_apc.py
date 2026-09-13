@@ -83,6 +83,9 @@ def test_hash_chain_and_image_hash_are_deterministic():
 
 
 def test_direct_exact_disk_write_is_explicit_and_borrows_input(monkeypatch):
+    class BorrowedCache:
+        state = ()
+
     class Disk:
         def __init__(self):
             self.saved = None
@@ -90,14 +93,19 @@ def test_direct_exact_disk_write_is_explicit_and_borrows_input(monkeypatch):
         def set_write_callbacks(self, *_args):
             pass
 
-        def save_exact_cache_sync(self, *args):
+        def flush(self):
+            pass
+
+        def save_exact_cache(self, *args, synchronous=False):
+            assert synchronous
             self.saved = args
+            return True
 
     monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "0")
     monkeypatch.setenv("APC_EXACT_DIRECT_DISK_WRITE", "1")
     disk = Disk()
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    source = [Mock(name="borrowed-cache")]
+    source = [BorrowedCache()]
 
     assert manager.direct_disk_writes
     assert manager.store_exact_cache(list(range(16)), source)
@@ -141,6 +149,7 @@ def test_direct_exact_disk_write_roundtrip_is_immediately_visible(
     assert manager.peek_exact_prefix_length(token_ids + [999], extra_hash=18) == 0
     assert manager.stats_snapshot() == stats_before
     manager._disk_min_free_ram_bytes = 0
+    monkeypatch.setattr(apc_module, "_free_ram_bytes", lambda: 1 << 40)
     warm, matched_tokens = manager.lookup_exact_cache(token_ids + [999], extra_hash=17)
 
     assert matched_tokens == len(token_ids)
