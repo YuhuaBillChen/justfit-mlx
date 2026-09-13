@@ -1693,6 +1693,13 @@ class TestBatchGenerator:
     def test_mtp_batch_demotes_to_ar_without_reemitting_last_token(
         self, first_token_sent
     ):
+        class KeepCriteria:
+            def __call__(self, token):
+                return None
+
+            def pop_forced_token_id(self):
+                return None
+
         class Model:
             def __call__(self, inputs, cache=None, **kwargs):
                 del cache, kwargs
@@ -1700,6 +1707,7 @@ class TestBatchGenerator:
                 logits[:, :, 4] = 10
                 return SimpleNamespace(logits=logits)
 
+        criteria = KeepCriteria()
         batch = SpeculativeGenerationBatch(
             model=Model(),
             draft_model=SimpleNamespace(),
@@ -1715,6 +1723,7 @@ class TestBatchGenerator:
             prompt_tokens=mx.array([[1, 2]], dtype=mx.int32),
             greedy_sampling=True,
             paged_cache_factory=object(),
+            thinking_budget_criteria=[criteria],
         )
 
         if first_token_sent:
@@ -1724,7 +1733,7 @@ class TestBatchGenerator:
         ar_batch = batch.to_autoregressive()
         assert ar_batch._paged_cache_factory is batch._paged_cache_factory
         assert ar_batch._rope_deltas.tolist() == [[7]]
-        assert ar_batch.thinking_budget_criteria == [None]
+        assert ar_batch.thinking_budget_criteria == [criteria]
         response = ar_batch.next()
 
         assert [item.token for item in response] == [4 if first_token_sent else 3]
@@ -2006,6 +2015,13 @@ class TestBatchGenerator:
         gen.close()
 
     def test_active_mtp_batch_rebases_and_extends_prefetched_batch(self):
+        class KeepCriteria:
+            def __call__(self, token):
+                return None
+
+            def pop_forced_token_id(self):
+                return None
+
         class BatchCache:
             def __init__(self, value):
                 self.value = mx.array([[value]], dtype=mx.float32)
@@ -2037,6 +2053,8 @@ class TestBatchGenerator:
         draft = SimpleNamespace()
         sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
         stop = lambda token: False
+        active_criteria = KeepCriteria()
+        pending_criteria = KeepCriteria()
         active = SpeculativeGenerationBatch(
             model=model,
             draft_model=draft,
@@ -2055,6 +2073,7 @@ class TestBatchGenerator:
                 )
             },
             prompt_tokens=mx.array([[5, 6]], dtype=mx.int32),
+            thinking_budget_criteria=[active_criteria],
         )
         pending_keys = mx.ones((1, 1, 3, 2))
         pending = SpeculativeGenerationBatch(
@@ -2070,6 +2089,7 @@ class TestBatchGenerator:
             hidden=mx.array([[[20.0, 21.0]]]),
             shared_kv_states={"full": (pending_keys, pending_keys + 100)},
             prompt_tokens=mx.array([[7, 8, 9]], dtype=mx.int32),
+            thinking_budget_criteria=[pending_criteria],
         )
 
         assert [(r.uid, r.token) for r in active.next()] == [(100, 1)]
@@ -2088,6 +2108,7 @@ class TestBatchGenerator:
         assert active.prompt_tokens.tolist() == [[0, 0, 1], [7, 8, 9]]
         assert active.prompt_cache[0].value.tolist() == [[1.0], [2.0]]
         assert active.shared_kv_states["full"][0].shape == (2, 1, 4, 2)
+        assert active.thinking_budget_criteria == [active_criteria, pending_criteria]
         assert [(r.uid, r.token) for r in active.next()] == [(100, 3), (200, 9)]
 
     def test_tiny_qwen_mtp_staggered_join_matches_singletons(self):
