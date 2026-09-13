@@ -148,6 +148,14 @@ def test_direct_exact_disk_write_roundtrip_is_immediately_visible(
     )
     assert manager.peek_exact_prefix_length(token_ids + [999], extra_hash=18) == 0
     assert manager.stats_snapshot() == stats_before
+    assert manager.lookup_exact_cache(token_ids + [999], extra_hash=17) == (None, 0)
+    warm, matched_tokens = manager.lookup_exact_cache(
+        token_ids + [999],
+        extra_hash=17,
+        defer_paged_q4=True,
+    )
+    assert matched_tokens == len(token_ids)
+    assert warm is not None
     manager._disk_min_free_ram_bytes = 0
     monkeypatch.setattr(apc_module, "_free_ram_bytes", lambda: 1 << 40)
     warm, matched_tokens = manager.lookup_exact_cache(token_ids + [999], extra_hash=17)

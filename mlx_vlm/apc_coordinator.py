@@ -200,16 +200,26 @@ class APCCoordinator:
             snapshot_prompt_cache_row,
         )
 
-        # Batch extraction can itself allocate a full row before store_exact_cache
-        # decides whether it can afford another retained snapshot.
-        if _prompt_cache_is_batch_shaped(prompt_cache):
+        direct_disk_write = bool(
+            getattr(self.manager, "direct_disk_writes", False)
+        )
+        batch_shaped = _prompt_cache_is_batch_shaped(prompt_cache)
+        # A detached batch row can allocate a full cache before
+        # store_exact_cache decides whether it can retain it. The explicit
+        # disk-only path instead borrows page views and serializes them
+        # synchronously on this producer thread, so it needs no clone reserve.
+        if batch_shaped and not direct_disk_write:
             if self.manager.disk is not None:
                 self.manager.disk.flush()
             if not self.manager._make_room(_cache_nbytes(prompt_cache)):
                 with self.manager.lock:
                     self.manager.stats.memory_skips += 1
                 return False
-        snapshot = snapshot_prompt_cache_row(prompt_cache, batch_idx or 0, clone=False)
+        snapshot = snapshot_prompt_cache_row(
+            prompt_cache,
+            batch_idx or 0,
+            clone=False,
+        )
         if snapshot is None:
             return False
         return self.manager.store_exact_cache(

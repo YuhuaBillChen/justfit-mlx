@@ -3831,7 +3831,13 @@ class APCManager:
                         )
 
         can_try_disk = disk is not None and prefix_len < max_len
-        if can_try_disk and self._disk_min_free_ram_bytes > 0:
+        # Paged-Q4 restores stream directly into registry-owned pages and do
+        # not require the contiguous host-RAM staging guarded here.
+        if (
+            can_try_disk
+            and not defer_paged_q4
+            and self._disk_min_free_ram_bytes > 0
+        ):
             free_now = _free_ram_bytes()
             if free_now is not None and free_now < self._disk_min_free_ram_bytes:
                 logger.info(
@@ -3857,7 +3863,12 @@ class APCManager:
                     disk.exact_cache_bytes(cache_hash)
                     * max(1, prompt_capacity_tokens / disk_prefix_len)
                 )
-                if not self._make_room(2 * restore_bytes):
+                # A paged-Q4 restore returns lightweight on-disk descriptors;
+                # the paged registry reserves destination pages and streams
+                # one layer/run at a time. Applying the contiguous 2x staging
+                # estimate here would reject the very low-headroom path that
+                # avoids that staging allocation.
+                if not defer_paged_q4 and not self._make_room(2 * restore_bytes):
                     with self.lock:
                         self.stats.memory_skips += 1
                     disk_match = None

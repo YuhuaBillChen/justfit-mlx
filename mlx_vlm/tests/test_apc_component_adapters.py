@@ -201,6 +201,8 @@ def test_checkpoint_coordinator_borrows_snapshot_for_manager(monkeypatch):
     calls = []
     manager = SimpleNamespace(
         direct_disk_writes=False,
+        disk=None,
+        _make_room=lambda _size: True,
         store_exact_cache=lambda *args, **kwargs: calls.append((args, kwargs)) or True,
     )
     snapshot = [object()]
@@ -211,10 +213,12 @@ def test_checkpoint_coordinator_borrows_snapshot_for_manager(monkeypatch):
 
     monkeypatch.setattr(apc, "snapshot_prompt_cache_row", make_snapshot)
     coordinator = APCCoordinator(manager, Hybrid())
+    batch_cache = C.ArraysCache(1)
+    batch_cache[0] = mx.zeros((2, 1))
 
     assert coordinator.store_checkpoint(
         list(range(32)),
-        [object()],
+        [batch_cache],
         extra_hash=7,
         batch_idx=1,
     )
@@ -228,7 +232,7 @@ def test_checkpoint_coordinator_borrows_snapshot_for_manager(monkeypatch):
     assert captured["clone"] is False
 
 
-def test_checkpoint_coordinator_borrows_for_any_manager_tier(monkeypatch):
+def test_checkpoint_coordinator_borrows_only_for_direct_disk_write(monkeypatch):
     from types import SimpleNamespace
 
     from mlx_vlm import apc
