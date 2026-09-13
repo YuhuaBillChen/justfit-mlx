@@ -1643,6 +1643,51 @@ class TestBatchGenerator:
             (200, 11),
         ]
         assert seen["paged_cache_factory"] is factory
+        assert seen["token_observer"] is None
+        assert seen["forced_token_provider"] is None
+
+    def test_speculative_generation_batch_forces_budget_token_per_row(
+        self, monkeypatch
+    ):
+        class ForceAfterFirst:
+            def __init__(self):
+                self.forced_token_id = None
+
+            def __call__(self, token):
+                self.forced_token_id = 3 if token == 5 else None
+
+            def pop_forced_token_id(self):
+                token = self.forced_token_id
+                self.forced_token_id = None
+                return token
+
+        def fake_rounds(*args, **kwargs):
+            del args
+            assert kwargs["forced_token_provider"](0) == 3
+            assert kwargs["forced_token_provider"](1) is None
+            kwargs["token_observer"](0, 3)
+            kwargs["token_observer"](1, 10)
+            yield [3, 10], {"round_pos": 0, "round_len": 1}
+
+        monkeypatch.setattr(ar_module, "run_speculative_server_rounds", fake_rounds)
+        batch = SpeculativeGenerationBatch(
+            model=SimpleNamespace(),
+            draft_model=SimpleNamespace(),
+            draft_kind="mtp",
+            uids=[100, 200],
+            first_tokens=mx.array([5, 9], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[4, 4],
+            hidden=mx.zeros((2, 1, 1)),
+            shared_kv_states=None,
+            prompt_tokens=mx.array([[0], [1]], dtype=mx.int32),
+            thinking_budget_criteria=[ForceAfterFirst(), None],
+        )
+
+        assert [response.token for response in batch.next()] == [5, 9]
+        assert [response.token for response in batch.next()] == [3, 10]
 
     @pytest.mark.parametrize("first_token_sent", [False, True])
     def test_mtp_batch_demotes_to_ar_without_reemitting_last_token(

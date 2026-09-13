@@ -2037,6 +2037,7 @@ class SpeculativeGenerationBatch:
         token_dtype: mx.Dtype = mx.int32,
         greedy_sampling: bool = False,
         paged_cache_factory=None,
+        thinking_budget_criteria: Optional[List[Any]] = None,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -2058,6 +2059,14 @@ class SpeculativeGenerationBatch:
         self.token_dtype = token_dtype
         self.greedy_sampling = greedy_sampling
         self._paged_cache_factory = paged_cache_factory
+        if not thinking_budget_criteria:
+            thinking_budget_criteria = [None] * len(uids)
+        elif len(thinking_budget_criteria) != len(uids):
+            raise ValueError(
+                "thinking_budget_criteria must match the speculative batch size."
+            )
+        self.thinking_budget_criteria = list(thinking_budget_criteria)
+        self._forced_next_tokens: List[Optional[int]] = [None] * len(uids)
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
         self._sent_first = False
@@ -2110,6 +2119,8 @@ class SpeculativeGenerationBatch:
         self._num_tokens.extend(other._num_tokens)
         self._finished.extend(other._finished)
         self._last_tokens.extend(other._last_tokens)
+        self.thinking_budget_criteria.extend(other.thinking_budget_criteria)
+        self._forced_next_tokens.extend(other._forced_next_tokens)
         self._sent_first = False
         self._rounds_iter = None
 
@@ -2155,6 +2166,12 @@ class SpeculativeGenerationBatch:
         self._num_tokens = [self._num_tokens[i] for i in active_slots]
         self._finished = [False] * len(active_slots)
         self._last_tokens = [int(token) for token in first_tokens.tolist()]
+        self.thinking_budget_criteria = [
+            self.thinking_budget_criteria[i] for i in active_slots
+        ]
+        self._forced_next_tokens = [
+            self._forced_next_tokens[i] for i in active_slots
+        ]
         self.first_tokens = first_tokens
         self.hidden = speculative_hidden_state("mtp", output)
         self.shared_kv_states = output.shared_kv_states
@@ -2229,7 +2246,9 @@ class SpeculativeGenerationBatch:
         # GenerationBatch.filter() treats a non-empty criteria list as
         # row-aligned. Preserve that invariant before a subsequently admitted
         # request extends this demoted singleton.
-        batch.thinking_budget_criteria = [None] * len(active_slots)
+        batch.thinking_budget_criteria = [
+            self.thinking_budget_criteria[i] for i in active_slots
+        ]
         rope_deltas = getattr(self, "_rope_deltas", None)
         if rope_deltas is not None:
             batch._rope_deltas = rope_deltas[
@@ -2242,6 +2261,22 @@ class SpeculativeGenerationBatch:
             # this round-boundary transition.
             batch._step()
         return batch
+
+    def _observe_token(self, row: int, token: int) -> bool:
+        criteria = self.thinking_budget_criteria[row]
+        if criteria is None:
+            return False
+        criteria(int(token))
+        forced_token = criteria.pop_forced_token_id()
+        if forced_token is None:
+            return False
+        self._forced_next_tokens[row] = int(forced_token)
+        return True
+
+    def _take_forced_token(self, row: int) -> Optional[int]:
+        token = self._forced_next_tokens[row]
+        self._forced_next_tokens[row] = None
+        return token
 
     def _finish_reason(self, row: int, token: int) -> Optional[str]:
         if self.stop_criteria(token):
@@ -2288,6 +2323,7 @@ class SpeculativeGenerationBatch:
                 or self._num_tokens[seq_idx] >= self.max_tokens[seq_idx]
             )
 
+        has_token_controls = any(self.thinking_budget_criteria)
         self._rounds_iter = run_speculative_server_rounds(
             self.model,
             self.draft_model,
@@ -2308,6 +2344,10 @@ class SpeculativeGenerationBatch:
             initial_emitted=list(self._num_tokens),
             max_tokens_per_row=list(self.max_tokens),
             paged_cache_factory=getattr(self, "_paged_cache_factory", None),
+            token_observer=self._observe_token if has_token_controls else None,
+            forced_token_provider=(
+                self._take_forced_token if has_token_controls else None
+            ),
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -2323,6 +2363,7 @@ class SpeculativeGenerationBatch:
                     continue
                 token = int(token)
                 self._last_tokens[row] = token
+                self._observe_token(row, token)
                 self._num_tokens[row] += 1
                 finish_reason = self._finish_reason(row, token)
                 if finish_reason is not None:
@@ -2998,6 +3039,7 @@ class PromptProcessingBatch:
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,
                 paged_cache_factory=self._paged_cache_factory,
+                thinking_budget_criteria=list(self.thinking_budget_criteria),
             )
             compute_logprobs = False
         else:
