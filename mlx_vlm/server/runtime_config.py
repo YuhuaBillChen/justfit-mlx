@@ -196,6 +196,30 @@ KNOBS: Tuple[
         "Speculative draft kind (auto if unset).",
     ),
     (
+        "spec_defer_draft_model",
+        "bool",
+        False,
+        TEXT_KINDS,
+        None,
+        "Keep MTP drafter weights unloaded until decode begins.",
+    ),
+    (
+        "vision_phase_swap_path",
+        "str_or_none",
+        None,
+        TEXT_KINDS,
+        None,
+        "Standalone vision-tower weights used for request-phase loading.",
+    ),
+    (
+        "chunk_local_input_embeddings",
+        "bool",
+        False,
+        TEXT_KINDS,
+        None,
+        "Build supported-model input embeddings per prefill chunk.",
+    ),
+    (
         "vision_cache_size",
         "int",
         20,
@@ -314,6 +338,9 @@ class RuntimeConfig:
     token_queue_timeout: Optional[float] = DEFAULT_TOKEN_QUEUE_TIMEOUT
     spec_draft_model: Optional[str] = None
     spec_draft_kind: Optional[str] = None
+    spec_defer_draft_model: bool = False
+    vision_phase_swap_path: Optional[str] = None
+    chunk_local_input_embeddings: bool = False
     vision_cache_size: int = 20
 
     _lock: threading.Lock = field(
@@ -371,6 +398,16 @@ class RuntimeConfig:
             token_queue_timeout=_env_token_queue_timeout(),
             spec_draft_model=os.environ.get("MLX_VLM_DRAFT_MODEL") or None,
             spec_draft_kind=os.environ.get("MLX_VLM_DRAFT_KIND") or None,
+            spec_defer_draft_model=os.environ.get(
+                "MLX_VLM_DEFER_DRAFT_MODEL", "0"
+            ).lower()
+            in ("1", "true", "yes"),
+            vision_phase_swap_path=os.environ.get("MLX_VLM_VISION_PHASE_SWAP_PATH")
+            or None,
+            chunk_local_input_embeddings=os.environ.get(
+                "MLX_VLM_CHUNK_LOCAL_INPUT_EMBEDS", "0"
+            ).lower()
+            in ("1", "true", "yes"),
             vision_cache_size=int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20")),
         )
         cfg._env_defaults = {name: getattr(cfg, name) for name in _KNOB_SPEC}

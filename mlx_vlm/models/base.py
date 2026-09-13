@@ -68,7 +68,7 @@ class SequenceClassifierOutput:
 
 @dataclass
 class InputEmbeddingsFeatures:
-    inputs_embeds: mx.array
+    inputs_embeds: Optional[mx.array]
     attention_mask_4d: Optional[mx.array] = None
     visual_pos_masks: Optional[mx.array] = None
     deepstack_visual_embeds: Optional[mx.array] = None
@@ -81,6 +81,7 @@ class InputEmbeddingsFeatures:
     position_ids: Optional[mx.array] = None
     pos_hw: Optional[mx.array] = None
     rope_deltas: Optional[mx.array] = None
+    input_embedding_provider: Optional[Any] = None
 
     def to_dict(self):
         return {
@@ -350,14 +351,12 @@ def _turboquant_attention_applies(cache) -> bool:
     """Whether the fused TurboQuant kernels can serve this cache.
 
     They read the quantized state directly, so they need one contiguous
-    sequence starting at index 0. That always holds for the single-sequence
-    cache; the batch cache qualifies only while it carries a single row with
-    no left padding (padded rows would be attended to as real tokens).
+    sequence per row starting at index 0. That always holds for the
+    single-sequence cache; the batch cache qualifies while every row has no
+    left padding (padded positions would be attended to as real tokens).
     """
     if not isinstance(cache, BatchTurboQuantKVCache):
         return True
-    if not cache.is_single_row():
-        return False
     return cache.fused_attention_eligible
 
 
@@ -370,10 +369,34 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
+    paged_attention = getattr(cache, "paged_attention", None)
+    if callable(paged_attention):
+        return paged_attention(queries, scale=scale, mask=mask, sinks=sinks)
+    segmented_attention = getattr(cache, "segmented_attention", None)
+    if sinks is None and callable(segmented_attention):
+        result = segmented_attention(queries, scale=scale, mask=mask)
+        if result is not None:
+            return result
     if isinstance(cache, (TurboQuantKVCache, BatchTurboQuantKVCache)):
-        # The fused kernels have no sink term, and the batch cache only shares
-        # them when it holds a single unpadded row. Anything else dequantizes,
-        # which is also the only path that can apply sinks.
+        # The fused kernels have no sink term. Ragged batch decode first tries
+        # its packed, left-padding-aware path; unsupported layouts and
+        # sink-bearing calls dequantize so MLX can apply the full semantics.
+        if (
+            sinks is None
+            and isinstance(cache, BatchTurboQuantKVCache)
+            and queries.shape[-2] == 1
+        ):
+            packed_decode = getattr(cache, "packed_decode_attention", None)
+            if callable(packed_decode):
+                result = packed_decode(
+                    queries,
+                    keys_state=keys,
+                    values_state=values,
+                    scale=scale,
+                    mask=mask,
+                )
+                if result is not None:
+                    return result
         if sinks is None and _turboquant_attention_applies(cache):
             if queries.shape[-2] == 1:
                 return cache.decode_attention(
@@ -392,7 +415,9 @@ def scaled_dot_product_attention(
             )
             if result is not None:
                 return result
-        dequantized_keys, dequantized_values = cache.dequantize(keys, values)
+        dequantized_keys, dequantized_values = cache.dequantize_for_attention(
+            keys, values
+        )
         return mx.fast.scaled_dot_product_attention(
             queries,
             dequantized_keys.astype(queries.dtype),

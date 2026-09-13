@@ -887,6 +887,9 @@ def get_cached_model(
         apc_manager=runtime.apc_manager,
         draft_model_path=cfg.spec_draft_model,
         draft_kind=cfg.spec_draft_kind,
+        defer_draft_model=cfg.spec_defer_draft_model,
+        vision_phase_swap_path=cfg.vision_phase_swap_path,
+        chunk_local_input_embeddings=cfg.chunk_local_input_embeddings,
     )
     try:
         model, processor, config = response_generator.wait_until_ready()

@@ -5632,3 +5632,107 @@ def test_laguna_dflash_config_derives_sliding_windows_when_absent():
     config = DFlashConfig.from_dict(params)
 
     assert config.sliding_windows == [512, 512]
+
+
+def test_mtp_batch_finishes_rollback_before_yielding_round(monkeypatch):
+    events = []
+
+    class Draft:
+        def __init__(self):
+            self.config = SimpleNamespace(block_size=3)
+            self.accept_lens = []
+            self.draft_lens = []
+
+        def reset(self, model):
+            events.append("reset")
+
+        def set_shared_kv(self, *args, **kwargs):
+            events.append("bind")
+
+    class LM:
+        def rollback_speculative_cache(self, *args):
+            events.append("rollback")
+
+        def speculative_draft_hidden(self, hidden):
+            return hidden
+
+    verify = mtp_utils._MTPVerifyResult(
+        hidden=mx.zeros((1, 3, 2), dtype=mx.float32),
+        shared_kv_states={},
+        target_tokens=mx.array([[9, 9, 9]], dtype=mx.int32),
+    )
+    monkeypatch.setattr(
+        mtp_utils,
+        "_mtp_draft_block_active",
+        lambda *args, **kwargs: mx.array([[7, 8]], dtype=mx.int32),
+    )
+    monkeypatch.setattr(mtp_utils, "_mtp_verify_target", lambda *args, **kwargs: verify)
+    monkeypatch.setattr(
+        mtp_utils,
+        "_speculative_walk_batch",
+        lambda *args, **kwargs: ([0], [[9]]),
+    )
+
+    rounds = mtp_utils._mtp_rounds_batch(
+        SimpleNamespace(language_model=LM()),
+        Draft(),
+        [SimpleNamespace(offset=mx.array([5]))],
+        mx.zeros((1, 1, 2), dtype=mx.float32),
+        {},
+        first_bonus=mx.array([1], dtype=mx.int32),
+        max_tokens=2,
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        draft_block_size=3,
+        token_dtype=mx.int32,
+        greedy_sampling=True,
+    )
+
+    tokens, metadata = next(rounds)
+
+    assert tokens == [9]
+    assert metadata == {"round_pos": 0, "round_len": 1}
+    assert "rollback" in events
+
+
+def test_qwen3_5_batch_invariant_decode_is_opt_in(monkeypatch):
+    model = qwen_language.LanguageModel(_tiny_qwen3_5_text_config())
+
+    monkeypatch.delenv("MLX_VLM_BATCH_INVARIANT", raising=False)
+    assert not model._supports_batch_invariant_decode()
+
+    monkeypatch.setenv("MLX_VLM_BATCH_INVARIANT", "1")
+    assert model._supports_batch_invariant_decode()
+
+
+def test_qwen3_5_batch_invariant_decode_uses_exact_forward(monkeypatch):
+    model = qwen_language.LanguageModel(_tiny_qwen3_5_text_config())
+    expected = object()
+    calls = []
+
+    class Verifier:
+        def __call__(self, language_model, inputs, **kwargs):
+            calls.append((language_model, inputs, kwargs))
+            return expected
+
+    monkeypatch.setattr(qwen_language, "_EXACT_SPECULATIVE_VERIFIER", Verifier())
+    inputs = mx.array([[1], [2]], dtype=mx.int32)
+    cache = [object()]
+
+    actual = model._batch_invariant_decode(inputs, cache=cache)
+
+    assert actual is expected
+    assert calls == [
+        (
+            model,
+            inputs,
+            {
+                "cache": cache,
+                "inputs_embeds": None,
+                "position_ids": None,
+                "return_hidden": True,
+                "return_shared_kv": True,
+                "return_gdn_states": False,
+                "skip_logits": False,
+            },
+        )
+    ]

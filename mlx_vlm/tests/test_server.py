@@ -35,9 +35,11 @@ from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server.runtime_config import RuntimeConfig
+from mlx_vlm.server.language_lifecycle import ComponentResidencyManager
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 from mlx_vlm.tools import _infer_tool_parser
 from mlx_vlm.tools.parsers import minicpm5
+from mlx_vlm.utils import StoppingCriteria
 
 
 def test_response_generator_prefill_step_override_wins_over_environment(monkeypatch):
@@ -73,6 +75,183 @@ def test_response_generator_clears_worker_streams(monkeypatch):
 
     gen._run_impl.assert_called_once_with()
     clear_streams.assert_called_once_with()
+
+
+def test_response_generator_releases_persistent_paged_pool_at_worker_shutdown(
+    monkeypatch,
+):
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    final_stats = SimpleNamespace(
+        used_layer_pages=0,
+        high_water_layer_pages=12,
+        capacity_layer_pages=64,
+        pool_nbytes=1024,
+    )
+    registry = SimpleNamespace(release=MagicMock(return_value=final_stats))
+    gen._paged_registry = registry
+    gen._run_impl = MagicMock()
+    clear_streams = MagicMock()
+    monkeypatch.setattr(server_generation, "clear_mlx_streams", clear_streams)
+
+    gen._run()
+
+    registry.release.assert_called_once_with()
+    assert gen._paged_registry is None
+    clear_streams.assert_called_once_with()
+
+
+def test_component_residency_waits_for_last_owner_before_unload():
+    component = SimpleNamespace(load=MagicMock(), unload=MagicMock())
+    residency = ComponentResidencyManager()
+    residency.register("lm_head", component)
+
+    residency.acquire("lm_head", "decode")
+    residency.acquire("lm_head", "final_prefill")
+
+    assert residency.owners("lm_head") == frozenset(
+        {"decode", "final_prefill"}
+    )
+    assert residency.unload_if_idle("lm_head") is False
+    assert residency.release("lm_head", "final_prefill") is False
+    component.unload.assert_not_called()
+    assert residency.release("lm_head", "decode") is True
+    component.unload.assert_called_once_with()
+    assert residency.release("lm_head", "decode") is False
+    component.unload.assert_called_once_with()
+
+
+def test_lm_head_phase_admission_defers_unqualified_mixed_prefill(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(
+        contains=lambda name: name == "lm_head"
+    )
+    first_long = SimpleNamespace(prompt_tokens=98304)
+    short_peer = SimpleNamespace(prompt_tokens=8192)
+    second_long = SimpleNamespace(prompt_tokens=98304)
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [first_long, short_peer, second_long], active={}
+    )
+
+    assert admitted == [first_long, short_peer]
+    assert deferred == [second_long]
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [short_peer, second_long], active={1: {}}
+    )
+
+    assert admitted == [short_peer]
+    assert deferred == [second_long]
+
+
+def test_lm_head_phase_admission_is_unchanged_without_swapped_head():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(contains=lambda _name: False)
+    requests = [SimpleNamespace(prompt_tokens=98304) for _ in range(2)]
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        requests, active={1: {}}
+    )
+
+    assert admitted == requests
+    assert deferred == []
+
+
+def test_lm_head_phase_admission_uses_exact_apc_suffix(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
+    manager = SimpleNamespace(peek_exact_prefix_length=MagicMock(return_value=96000))
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(
+        contains=lambda name: name == "lm_head"
+    )
+    gen.apc_manager = manager
+    gen.apc_mode = "exact"
+    warm_peer = SimpleNamespace(
+        prompt_tokens=98304,
+        raw_inputs={"input_ids": list(range(98304))},
+        apc_semantic_hash=17,
+        request_id="warm-peer",
+        images=None,
+        audio=None,
+        videos=None,
+        apc_prefix_tokens_hint=None,
+        apc_prefix_probe_done=False,
+    )
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [warm_peer], active={1: {}}
+    )
+
+    assert admitted == [warm_peer]
+    assert deferred == []
+    assert warm_peer.apc_prefix_tokens_hint == 96000
+    manager.peek_exact_prefix_length.assert_called_once_with(
+        list(range(98304)), extra_hash=17
+    )
+
+    # Reconsidering the same queued request does not rescan the SSD index on
+    # every scheduler turn.
+    gen._partition_lm_head_phase_admission([warm_peer], active={1: {}})
+    manager.peek_exact_prefix_length.assert_called_once()
+
+
+def test_lm_head_phase_admission_keeps_large_apc_suffix_deferred(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(
+        contains=lambda name: name == "lm_head"
+    )
+    gen.apc_manager = SimpleNamespace(
+        peek_exact_prefix_length=MagicMock(return_value=65536)
+    )
+    gen.apc_mode = "exact"
+    warm_peer = SimpleNamespace(
+        prompt_tokens=98304,
+        raw_inputs={"input_ids": list(range(98304))},
+        apc_semantic_hash=0,
+        request_id="warm-peer-large-suffix",
+        images=None,
+        audio=None,
+        videos=None,
+        apc_prefix_tokens_hint=None,
+        apc_prefix_probe_done=False,
+        kv_bypass_count=0,
+    )
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [warm_peer], active={1: {}}
+    )
+
+    assert admitted == []
+    assert deferred == [warm_peer]
+
+
+def test_lm_head_phase_admission_bounds_short_request_bypass(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS", "1")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(
+        contains=lambda name: name == "lm_head"
+    )
+    long_peer = SimpleNamespace(prompt_tokens=16384, kv_bypass_count=0)
+    short_peer = SimpleNamespace(prompt_tokens=8192, kv_bypass_count=0)
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [long_peer, short_peer], active={1: {}}
+    )
+
+    assert admitted == [short_peer]
+    assert deferred == [long_peer]
+    assert long_peer.kv_bypass_count == 1
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [long_peer, short_peer], active={1: {}}
+    )
+
+    assert admitted == []
+    assert deferred == [long_peer, short_peer]
+    assert long_peer.kv_bypass_count == 1
 
 
 _MUSE_RESPONSE_TEMPLATE = {
@@ -639,6 +818,14 @@ def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
     assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
 
 
+def test_speculative_singleton_only_env(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", raising=False)
+    assert not server_generation.speculative_singleton_only()
+
+    monkeypatch.setenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "1")
+    assert server_generation.speculative_singleton_only()
+
+
 def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     class FakeResponseGenerator:
         def __init__(self, model_path, adapter_path=None, **kwargs):
@@ -808,6 +995,10 @@ def _unstarted_response_generator():
     gen.draft_kind = None
     gen.draft_model_path = None
     gen.draft_kind_override = None
+    gen.defer_draft_model = False
+    gen.vision_phase_swap_path = None
+    gen.vision_phase_swap = None
+    gen.chunk_local_input_embeddings = False
     gen.kv_bits = None
     gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
     gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
@@ -823,6 +1014,718 @@ def _unstarted_response_generator():
     gen._cancelled = set()
     gen._cancel_lock = Lock()
     return gen
+
+
+def test_server_defers_compatible_mtp_drafter_until_decode(monkeypatch):
+    target_config = SimpleNamespace(
+        model_type="qwen3_5_text",
+        hidden_size=5120,
+        eos_token_id=[],
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(config=target_config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    drafter_config = SimpleNamespace(
+        model_type="qwen3_5_mtp",
+        backbone_hidden_size=5120,
+    )
+    drafter = SimpleNamespace(config=drafter_config)
+    gen = _unstarted_response_generator()
+    gen.defer_draft_model = True
+
+    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
+    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
+    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "2")
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, target_config),
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.load_drafter",
+        lambda *_args, **_kwargs: (drafter, "mtp"),
+    )
+    monkeypatch.setattr(server_generation.mx, "clear_cache", MagicMock())
+
+    gen._initialize_model()
+
+    assert gen.draft_kind == "mtp"
+    assert isinstance(gen.draft_model, server_generation.LazyDrafter)
+    assert gen.draft_model.config is drafter_config
+    assert not gen.draft_model.loaded
+
+
+def test_server_initializes_vision_phase_swap(monkeypatch):
+    config = SimpleNamespace(eos_token_id=[])
+    model = SimpleNamespace(language_model=SimpleNamespace(), vision_tower=object())
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    phase_swap = object()
+    gen = _unstarted_response_generator()
+    gen.vision_phase_swap_path = "vision.safetensors"
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "2")
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+    constructor = MagicMock(return_value=phase_swap)
+    monkeypatch.setattr(server_generation, "VisionTowerPhaseSwap", constructor)
+
+    gen._initialize_model()
+
+    constructor.assert_called_once_with(model, "vision.safetensors")
+    assert gen.vision_phase_swap is phase_swap
+
+
+def test_server_initializes_language_head_phase_swap_for_continuous_batching(
+    monkeypatch,
+):
+    config = SimpleNamespace(eos_token_id=[])
+    language_model = SimpleNamespace(lm_head=object())
+    model = SimpleNamespace(language_model=language_model)
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    phase_swap = SimpleNamespace(load=MagicMock(), unload=MagicMock())
+    gen = _unstarted_response_generator()
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "4")
+    monkeypatch.setenv(
+        "MLX_VLM_LANGUAGE_HEAD_PHASE_SWAP_PATH", "head.safetensors"
+    )
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+    constructor = MagicMock(return_value=phase_swap)
+    monkeypatch.setattr(server_generation, "LanguageHeadPhaseSwap", constructor)
+
+    gen._initialize_model()
+
+    constructor.assert_called_once_with(language_model, "head.safetensors")
+    assert language_model.prefill_head_phase_swap is phase_swap
+    assert language_model.phase_residency_manager is gen.component_residency
+    assert gen.component_residency.contains("lm_head")
+
+
+def test_server_rejects_chunk_local_embeddings_for_unsupported_models(monkeypatch):
+    config = SimpleNamespace(model_type="qwen2_vl", eos_token_id=[])
+    model = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    gen = _unstarted_response_generator()
+    gen.chunk_local_input_embeddings = True
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+
+    with pytest.raises(ValueError, match="currently support Qwen3.5 only"):
+        gen._initialize_model()
+
+
+@pytest.mark.parametrize(
+    ("draft_kind", "max_num_seqs", "message"),
+    [
+        ("dflash", "1", "supports MTP only"),
+    ],
+)
+def test_server_rejects_unsafe_deferred_drafter_modes(
+    monkeypatch, draft_kind, max_num_seqs, message
+):
+    config = SimpleNamespace(eos_token_id=[])
+    model = SimpleNamespace(language_model=SimpleNamespace(config=config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    drafter = SimpleNamespace(config=SimpleNamespace())
+    gen = _unstarted_response_generator()
+    gen.defer_draft_model = True
+
+    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
+    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", draft_kind)
+    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", max_num_seqs)
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.load_drafter",
+        lambda *_args, **_kwargs: (drafter, draft_kind),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        gen._initialize_model()
+
+
+def test_phase_cohort_admission_waits_for_active_batch_to_drain():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.chunk_local_input_embeddings = True
+    gen.vision_phase_swap = None
+    gen.draft_model = None
+    gen.draft_kind = None
+
+    assert gen._admission_capacity(active_count=0, max_num_seqs=2) == 2
+    assert gen._admission_capacity(active_count=1, max_num_seqs=2) == 1
+    assert gen._admission_capacity(active_count=2, max_num_seqs=2) == 0
+
+    gen.draft_model = object()
+    gen.draft_kind = "dflash"
+    assert gen._admission_capacity(active_count=1, max_num_seqs=2) == 0
+
+    gen.draft_kind = "mtp"
+    assert gen._admission_capacity(active_count=1, max_num_seqs=2) == 1
+
+    gen.chunk_local_input_embeddings = False
+    assert gen._admission_capacity(active_count=1, max_num_seqs=2) == 1
+
+
+def test_batch_kv_slot_budget_env(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_BATCH_KV_SLOT_BUDGET", raising=False)
+    assert server_generation.get_batch_kv_slot_budget() is None
+
+    monkeypatch.setenv("MLX_VLM_BATCH_KV_SLOT_BUDGET", "106496")
+    assert server_generation.get_batch_kv_slot_budget() == 106496
+
+    monkeypatch.setenv("MLX_VLM_BATCH_KV_SLOT_BUDGET", "0")
+    assert server_generation.get_batch_kv_slot_budget() is None
+
+
+def test_paged_registry_uses_token_capacity_and_supported_model_leaves(monkeypatch):
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    class Model:
+        head_dim = 256
+        n_kv_heads = 2
+
+        def make_cache(self):
+            return [ArraysCache(size=2), KVCache(), KVCache()]
+
+    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "2")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "257")
+    registry = server_generation.make_paged_turboquant_registry(Model())
+
+    assert registry.leaf_keys == (1,)
+    assert registry.spec_for(1).capacity_pages == 2
+    assert registry.spec_for(1).kv_heads == 2
+    assert registry.spec_for(1).head_dim == 256
+    registry.release()
+
+
+def test_paged_registry_reads_qwen_geometry_from_model_args(monkeypatch):
+    from mlx_vlm.models.cache import KVCache
+
+    class Model:
+        head_dim = 213
+        args = SimpleNamespace(head_dim=256, num_key_value_heads=4)
+
+        def make_cache(self):
+            return [KVCache(), KVCache()]
+
+    monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "2")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "4096")
+    registry = server_generation.make_paged_turboquant_registry(Model())
+
+    assert registry.spec_for(0).head_dim == 256
+    assert registry.spec_for(0).kv_heads == 4
+    registry.release()
+
+
+def test_paged_registry_requires_explicit_capacity_and_concurrency(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", raising=False)
+    monkeypatch.delenv("MLX_VLM_MAX_NUM_SEQS", raising=False)
+
+    with pytest.raises(ValueError, match="CAPACITY_TOKENS is required"):
+        server_generation.make_paged_turboquant_registry(SimpleNamespace())
+
+
+def test_kv_budget_preserves_oversized_singleton_and_defers_peer(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_BATCH_KV_SLOT_BUDGET", "100")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    long_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=96,
+        args=server_generation.GenerationArguments(max_tokens=8),
+    )
+    short_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=2,
+        args=server_generation.GenerationArguments(max_tokens=8),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [long_request, short_request], active={}
+    )
+
+    assert admitted == [long_request]
+    assert deferred == [short_request]
+
+
+def test_paged_kv_budget_admits_by_useful_tokens_not_dense_rectangle(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "106496")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {1: {"context_budget_tokens": 98_304}}
+    short_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=8_000,
+        args=server_generation.GenerationArguments(max_tokens=8),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [short_request], active=active
+    )
+
+    assert admitted == [short_request]
+    assert deferred == []
+
+
+def test_paged_kv_budget_accounts_for_each_requests_tail_page(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "512")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {1: {"context_budget_tokens": 257}}
+    one_token = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1,
+        args=server_generation.GenerationArguments(max_tokens=0),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [one_token], active=active
+    )
+
+    assert admitted == []
+    assert deferred == [one_token]
+
+
+def test_paged_kv_budget_reserves_output_guarantee_not_requested_ceiling(
+    monkeypatch,
+):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "1024")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "128")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    first = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=256,
+        args=server_generation.GenerationArguments(max_tokens=768),
+    )
+    second = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=256,
+        args=server_generation.GenerationArguments(max_tokens=768),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [first, second], active={}
+    )
+
+    assert admitted == [first, second]
+    assert deferred == []
+    assert gen._request_context_budget(first) == 384
+
+
+def test_paged_kv_budget_tracks_elastic_output_already_consumed(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "1024")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "128")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {
+        1: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 300,
+            "context_budget_tokens": 384,
+        }
+    }
+    peer = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=256,
+        args=server_generation.GenerationArguments(max_tokens=768),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission([peer], active=active)
+
+    assert admitted == []
+    assert deferred == [peer]
+
+
+def test_paged_kv_budget_keeps_page_rounded_admission_safety_margin(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "1024")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "128")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_SAFETY_TOKENS", "1")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {
+        1: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 0,
+            "context_budget_tokens": 384,
+        }
+    }
+    peer = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=256,
+        args=server_generation.GenerationArguments(max_tokens=128),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission([peer], active=active)
+
+    assert admitted == []
+    assert deferred == [peer]
+
+
+def test_elastic_capacity_finishes_largest_surplus_consumer(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "1024")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "128")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {
+        1: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 300,
+            "queued_at": 1.0,
+        },
+        2: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 128,
+            "queued_at": 2.0,
+        },
+    }
+
+    assert gen._elastic_capacity_victims(active) == [1]
+
+
+def test_elastic_capacity_is_disabled_without_output_guarantee(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "512")
+    monkeypatch.delenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", raising=False)
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {
+        1: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 300,
+        }
+    }
+
+    assert gen._elastic_capacity_victims(active) == []
+
+
+def test_elastic_capacity_never_breaks_admission_guarantees(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "768")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "128")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {
+        1: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 127,
+        },
+        2: {
+            "prompt_tokens": 256,
+            "guaranteed_output_tokens": 128,
+            "generated_tokens": 127,
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="guarantees exceed"):
+        gen._elastic_capacity_victims(active)
+
+
+def test_paged_scheduler_fills_free_lane_with_short_request_behind_long(
+    monkeypatch,
+):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "2048")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS", "8")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {1: {"context_budget_tokens": 1024}}
+    long_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1280,
+        args=server_generation.GenerationArguments(max_tokens=1),
+    )
+    short_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=128,
+        args=server_generation.GenerationArguments(max_tokens=1),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [long_request, short_request], active=active, admission_capacity=1
+    )
+
+    assert admitted == [short_request]
+    assert deferred == [long_request]
+    assert long_request.kv_bypass_count == 1
+
+
+def test_paged_scheduler_stops_bypassing_aged_request(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "2048")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS", "1")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {1: {"context_budget_tokens": 1024}}
+    long_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1280,
+        args=server_generation.GenerationArguments(max_tokens=1),
+        kv_bypass_count=1,
+    )
+    short_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=128,
+        args=server_generation.GenerationArguments(max_tokens=1),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [long_request, short_request], active=active, admission_capacity=1
+    )
+
+    assert admitted == []
+    assert deferred == [long_request, short_request]
+    assert long_request.kv_bypass_count == 1
+
+
+def test_deferred_kv_request_does_not_block_singleton_mtp_repromotion(
+    monkeypatch,
+):
+    monkeypatch.setenv("MLX_VLM_MTP_REPROMOTE", "1")
+    monkeypatch.setenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "1")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.requests = Queue()
+    gen.requests.put(object())  # Deferred because its KV reservation cannot fit.
+    batch_gen = SimpleNamespace(has_pending_prompts=False)
+
+    assert gen._can_repromote_singleton_mtp(
+        active={1: {}}, batch_gen=batch_gen, admitted=[]
+    )
+    assert not gen._can_repromote_singleton_mtp(
+        active={1: {}}, batch_gen=batch_gen, admitted=[object()]
+    )
+
+
+def test_paged_scheduler_respects_active_lane_capacity(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "4096")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER", "1")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    pending = [
+        server_generation.QueuedGenerationRequest(
+            rqueue=Queue(),
+            raw_inputs={},
+            prompt_tokens=128,
+            args=server_generation.GenerationArguments(max_tokens=1),
+        )
+        for _ in range(2)
+    ]
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        pending, active={}, admission_capacity=1
+    )
+
+    assert admitted == [pending[0]]
+    assert deferred == [pending[1]]
+
+
+def test_paged_scheduler_drains_large_queue_without_starving_head(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "4096")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS", "8")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    long_request = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=2304,
+        args=server_generation.GenerationArguments(max_tokens=1),
+        request_id="long-head",
+    )
+    waiting = [long_request]
+    waiting.extend(
+        server_generation.QueuedGenerationRequest(
+            rqueue=Queue(),
+            raw_inputs={},
+            prompt_tokens=64 + index,
+            args=server_generation.GenerationArguments(max_tokens=1),
+            request_id=f"short-{index}",
+        )
+        for index in range(99)
+    )
+    active = {1: {"context_budget_tokens": 2048}}
+    completed = []
+    blocked_rounds = 0
+
+    for round_index in range(200):
+        window, tail = waiting[:32], waiting[32:]
+        admitted, deferred = gen._partition_kv_budget_admission(
+            window, active=active, admission_capacity=1
+        )
+        waiting = deferred + tail
+        if admitted:
+            completed.extend(request.request_id for request in admitted)
+        else:
+            blocked_rounds += 1
+        if round_index == 9:
+            active = {}
+        if not waiting:
+            break
+
+    assert len(completed) == 100
+    assert len(set(completed)) == 100
+    assert completed.index("long-head") == 8
+    assert blocked_rounds == 2
+
+
+def test_kv_budget_opportunistically_admits_until_projected_rectangle_is_full(
+    monkeypatch,
+):
+    monkeypatch.setenv("MLX_VLM_BATCH_KV_SLOT_BUDGET", "100")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    active = {1: {"context_budget_tokens": 40}}
+    second = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=12,
+        args=server_generation.GenerationArguments(max_tokens=8),
+    )
+    third = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=2,
+        args=server_generation.GenerationArguments(max_tokens=8),
+    )
+
+    admitted, deferred = gen._partition_kv_budget_admission(
+        [second, third], active=active
+    )
+
+    # B2 projects to 2 * max(40, 20) = 80 slots and fits.  B3 would project
+    # to 3 * 40 = 120, so the third row remains queued.
+    assert admitted == [second]
+    assert deferred == [third]
+
+
+def test_kv_budget_disabled_preserves_existing_unbounded_admission(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_BATCH_KV_SLOT_BUDGET", raising=False)
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    pending = [object(), object()]
+
+    admitted, deferred = gen._partition_kv_budget_admission(pending, active={})
+
+    assert admitted == pending
+    assert deferred == []
+
+
+def test_active_phase_admission_skips_media_and_preserves_it_for_next_cohort():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.requests = Queue()
+    gen._stop = False
+    media = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1,
+        args=server_generation.GenerationArguments(),
+        images=[object()],
+    )
+    text = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1,
+        args=server_generation.GenerationArguments(),
+    )
+    gen.requests.put(media)
+    gen.requests.put(text)
+
+    admitted, should_stop = gen._collect_active_phase_text_requests(capacity=1)
+
+    assert admitted == [text]
+    assert not should_stop
+    assert gen.requests.get_nowait() is media
+
+
+def test_active_phase_admission_drops_cancelled_media_before_vision_load():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.requests = Queue()
+    gen._stop = False
+    cancelled = Event()
+    cancelled.set()
+    media = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1,
+        args=server_generation.GenerationArguments(),
+        images=[object()],
+        cancel_event=cancelled,
+        request_id="cancelled-media",
+    )
+    text = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1,
+        args=server_generation.GenerationArguments(),
+    )
+    gen.requests.put(media)
+    gen.requests.put(text)
+
+    admitted, should_stop = gen._collect_active_phase_text_requests(capacity=1)
+
+    assert admitted == [text]
+    assert not should_stop
+    assert gen.requests.empty()
+
+
+def test_active_phase_text_admission_supports_unbounded_capacity():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.requests = Queue()
+    gen._stop = False
+    media = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1,
+        args=server_generation.GenerationArguments(),
+        images=[object()],
+    )
+    texts = [
+        server_generation.QueuedGenerationRequest(
+            rqueue=Queue(),
+            raw_inputs={},
+            prompt_tokens=1,
+            args=server_generation.GenerationArguments(),
+        )
+        for _ in range(2)
+    ]
+    gen.requests.put(media)
+    for text in texts:
+        gen.requests.put(text)
+
+    admitted, should_stop = gen._collect_active_phase_text_requests(capacity=None)
+
+    assert admitted == texts
+    assert not should_stop
+    assert gen.requests.get_nowait() is media
 
 
 def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
@@ -900,6 +1803,30 @@ def test_server_includes_tokenizer_eos_in_stop_tokens(monkeypatch):
     gen._initialize_model()
 
     assert gen.stop_tokens == {248044, 248046}
+
+
+def test_server_capacity_mode_disables_eos_stopping(monkeypatch):
+    config = SimpleNamespace(eos_token_id=[248044])
+    tokenizer = SimpleNamespace(eos_token_id=248046)
+    stopping_criteria = StoppingCriteria([248044], tokenizer)
+    tokenizer.stopping_criteria = stopping_criteria
+    model = SimpleNamespace(language_model=SimpleNamespace(config=config))
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    gen = _unstarted_response_generator()
+
+    monkeypatch.setenv("MLX_VLM_CAPACITY_IGNORE_EOS", "1")
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+
+    gen._initialize_model()
+
+    assert gen.stop_tokens == set()
+    assert stopping_criteria.eos_token_ids == []
 
 
 def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
@@ -2434,7 +3361,9 @@ def test_stream_endpoints_do_not_clear_mlx_cache_on_close(
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 [
                     server.StreamingToken(
@@ -2639,7 +3568,9 @@ def test_chat_completions_streaming_forwards_explicit_sampling_args(
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             captured["prompt"] = prompt
             captured["images"] = images
             captured["audio"] = audio
@@ -2696,7 +3627,9 @@ def test_chat_completions_streaming_splits_gemma_thinking_channel_content(
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=8), iter(
                 _gemma_thinking_channel_chunks()
             )
@@ -2748,7 +3681,9 @@ def test_chat_completions_streaming_uses_custom_thinking_markers(client, monkeyp
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=8), iter(
                 [
                     server.StreamingToken(
@@ -2814,7 +3749,9 @@ def test_chat_completions_streaming_uses_prompt_opened_thinking_without_flag(
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=8), iter(
                 [
                     server.StreamingToken(
@@ -2896,7 +3833,9 @@ def test_chat_completions_streaming_keeps_plain_output_as_content_when_thinking_
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=8), iter(
                 [
                     server.StreamingToken(
@@ -3342,7 +4281,9 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=10), iter(
                 [
                     server.StreamingToken(
@@ -3422,7 +4363,9 @@ def test_chat_completions_streaming_response_template_tool_calls(client, monkeyp
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=10), iter(
                 [
                     server.StreamingToken(
@@ -3544,6 +4487,64 @@ def test_chat_completions_endpoint_flattens_text_content_parts(client):
             "content": "First text block. Second text block.",
         }
     ]
+
+
+def test_chat_completions_preserves_image_message_origin(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen3_5")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+    image_url = "data:image/png;base64,ZmFrZS1pbWFnZQ=="
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                            {"type": "text", "text": "Inspect this image."},
+                        ],
+                    },
+                    {"role": "assistant", "content": "It contains a meter."},
+                    {"role": "user", "content": "Continue the analysis."},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.args[2] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url"},
+                {"type": "text", "text": "Inspect this image."},
+            ],
+        },
+        {"role": "assistant", "content": "It contains a meter."},
+        {"role": "user", "content": "Continue the analysis."},
+    ]
+    assert mock_template.call_args.kwargs["num_images"] == 1
+    assert mock_generate.call_args.kwargs["image"] == [image_url]
 
 
 def test_chat_completions_endpoint_forwards_native_video_content(client):
@@ -4108,7 +5109,9 @@ def test_anthropic_messages_streaming_uses_anthropic_events(client, monkeypatch)
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 [
                     server.StreamingToken(
@@ -4170,7 +5173,9 @@ def test_anthropic_messages_streaming_splits_gemma_thinking_channel_content(
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 _gemma_thinking_channel_chunks()
             )
@@ -4219,7 +5224,9 @@ def test_anthropic_messages_streaming_uses_custom_thinking_markers(client, monke
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 [
                     server.StreamingToken(
@@ -4282,7 +5289,9 @@ def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch)
         def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, args=None):
+        def generate(
+            self, prompt, images=None, audio=None, args=None, cancel_event=None
+        ):
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 [
                     server.StreamingToken(
@@ -4666,6 +5675,49 @@ class TestResponseGenerator:
         assert gen.requests.empty()
         image_hash.assert_not_called()
 
+    def test_generate_rejects_single_request_over_paged_pool_capacity(
+        self, monkeypatch
+    ):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen.draft_model = None
+        gen.apc_manager = None
+        gen.apc_mode = None
+        gen._preprocess_request = lambda prompt, images, audio, videos: {
+            "input_ids": mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+        }
+        gen.requests = Queue()
+
+        monkeypatch.delenv("MAX_KV_SIZE", raising=False)
+        monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+        monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "256")
+
+        with pytest.raises(
+            server.PromptTooLongError,
+            match=r"257 context tokens.*paged KV pool capacity is 256",
+        ):
+            gen.generate("prompt", args=server.GenerationArguments(max_tokens=252))
+
+        assert gen.requests.empty()
+
+    def test_stream_validation_checks_paged_pool_without_max_kv_size(
+        self, monkeypatch
+    ):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen._preprocess_request = lambda prompt, images, audio, videos: {
+            "input_ids": mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+        }
+
+        monkeypatch.delenv("MAX_KV_SIZE", raising=False)
+        monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+        monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "256")
+
+        with pytest.raises(server.PromptTooLongError, match="paged KV pool"):
+            gen.validate_context_budget(
+                "prompt", args=server.GenerationArguments(max_tokens=252)
+            )
+
     def test_generate_serializes_budget_criteria_with_tokenizer_preprocessing(self):
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         gen.wait_until_ready = lambda: None
@@ -5021,6 +6073,37 @@ class TestResponseGenerator:
             next(token_iter)
 
         assert cancelled == ["req-1"]
+
+    def test_token_iterator_consumes_activity_heartbeat_without_emitting_it(self):
+        cancelled = []
+        token = SimpleNamespace(text="hello")
+        rqueue = Queue()
+        rqueue.put(server_generation._TOKEN_QUEUE_ACTIVITY)
+        rqueue.put(token)
+        token_iter = server_generation._TokenIterator(
+            rqueue,
+            "req-1",
+            cancelled.append,
+            0.01,
+        )
+
+        assert next(token_iter) is token
+        assert cancelled == []
+
+    def test_batch_step_reports_gpu_activity_to_all_active_iterators(self):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        first_queue = Queue()
+        second_queue = Queue()
+        batch_gen = SimpleNamespace(next=lambda **kwargs: ([], []), _prompt_batch=None)
+        active = {
+            1: {"rqueue": first_queue},
+            2: {"rqueue": second_queue},
+        }
+
+        gen._step(batch_gen, active)
+
+        assert first_queue.get_nowait() is server_generation._TOKEN_QUEUE_ACTIVITY
+        assert second_queue.get_nowait() is server_generation._TOKEN_QUEUE_ACTIVITY
 
     def test_token_iterator_close_cancels_while_next_blocks(self):
         cancelled = []
@@ -5883,6 +6966,28 @@ class TestResponseGenerator:
         assert item.cached_tokens == 7
         assert rqueue.get() is None
 
+    def test_step_releases_prefill_inputs_before_deferred_decode(self, monkeypatch):
+        class PromptProgressBatch:
+            def next(self, **kwargs):
+                return [SimpleNamespace(uid=1, prompt_tps=100.0, cached_tokens=0)], []
+
+        clear_cache = MagicMock()
+        monkeypatch.setattr(server_generation.mx, "clear_cache", clear_cache)
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.defer_draft_model = True
+        active = {
+            1: {
+                "gen_kwargs": {"inputs_embeds": object()},
+                "prompt_tps": None,
+                "cached_tokens": 0,
+            }
+        }
+
+        gen._step(PromptProgressBatch(), active)
+
+        assert active[1]["gen_kwargs"] is None
+        clear_cache.assert_called_once_with()
+
     def test_generate_arguments_to_generate_kwargs(self):
         processor = lambda tokens, logits: logits
         args = server.GenerationArguments(
@@ -6476,6 +7581,7 @@ class TestResponseGenerator:
         assert args.thinking_end_token == "</think>"
 
     def test_server_cli_sets_thinking_defaults(self, monkeypatch):
+        previous_runtime_config = server.runtime.config
         for env_var in (
             "MLX_VLM_ENABLE_THINKING",
             "MLX_VLM_PRELOAD_MODEL",
@@ -6491,6 +7597,8 @@ class TestResponseGenerator:
             "MLX_VLM_THINKING_START_TOKEN",
             "MLX_VLM_THINKING_END_TOKEN",
             "MLX_VLM_SERVER_API_KEY",
+            "MLX_VLM_DEFER_DRAFT_MODEL",
+            "MLX_VLM_VISION_PHASE_SWAP_PATH",
             "PREFILL_STEP_SIZE",
             "KV_GROUP_SIZE",
             "KV_QUANT_SCHEME",
@@ -6518,6 +7626,10 @@ class TestResponseGenerator:
                 "reranker-demo",
                 "--model-discovery",
                 "served",
+                "--kv-bits",
+                "4",
+                "--kv-quant-scheme",
+                "turboquant",
                 "--enable-thinking",
                 "--thinking-budget",
                 "128",
@@ -6527,6 +7639,9 @@ class TestResponseGenerator:
                 "<|END_THINKING|>",
                 "--api-key",
                 "admin-token",
+                "--defer-draft-model",
+                "--vision-phase-swap-path",
+                "vision.safetensors",
             ],
         )
         run_calls = []
@@ -6550,8 +7665,13 @@ class TestResponseGenerator:
             assert os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] == "reranker-demo"
             assert os.environ["MLX_VLM_MODEL_DISCOVERY"] == "served"
             assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
+            assert os.environ["MLX_VLM_DEFER_DRAFT_MODEL"] == "1"
+            assert os.environ["MLX_VLM_VISION_PHASE_SWAP_PATH"] == "vision.safetensors"
+            assert server.runtime.config.kv_bits == 4
+            assert server.runtime.config.kv_quant_scheme == "turboquant"
             assert run_calls[0][1]["host"] == "127.0.0.1"
         finally:
+            server.runtime.config = previous_runtime_config
             for env_var in (
                 "MLX_VLM_ENABLE_THINKING",
                 "MLX_VLM_PRELOAD_MODEL",
@@ -6567,6 +7687,13 @@ class TestResponseGenerator:
                 "MLX_VLM_THINKING_START_TOKEN",
                 "MLX_VLM_THINKING_END_TOKEN",
                 "MLX_VLM_SERVER_API_KEY",
+                "MLX_VLM_DEFER_DRAFT_MODEL",
+                "MLX_VLM_VISION_PHASE_SWAP_PATH",
+                "KV_BITS",
+                "KV_GROUP_SIZE",
+                "KV_QUANT_SCHEME",
+                "QUANTIZED_KV_START",
+                "PREFILL_STEP_SIZE",
             ):
                 os.environ.pop(env_var, None)
 
@@ -6732,6 +7859,87 @@ class TestResponseGenerator:
         assert "position_ids" not in gen_kwargs
         assert "rope_deltas" not in gen_kwargs
         assert "_apc_semantic_hash" not in gen_kwargs
+
+    def test_gpu_embed_only_passes_chunked_for_the_opt_in_path(self):
+        class Embed:
+            input_embedding_provider = None
+
+            def to_dict(self):
+                return {"inputs_embeds": mx.zeros((1, 2, 4))}
+
+        class StrictModel:
+            def get_input_embeddings(self, input_ids, pixel_values, mask=None):
+                return Embed()
+
+        response_generator = SimpleNamespace(
+            model=StrictModel(), vision_cache=None, chunk_local_input_embeddings=False
+        )
+
+        _, gen_kwargs = server.ResponseGenerator._gpu_embed(
+            response_generator,
+            {"input_ids": mx.array([[1, 2]])},
+        )
+
+        assert gen_kwargs["inputs_embeds"].shape == (1, 2, 4)
+
+    def test_gpu_embed_forwards_chunk_local_provider(self):
+        provider = object()
+
+        class Embed:
+            input_embedding_provider = provider
+
+            def to_dict(self):
+                return {"inputs_embeds": None}
+
+        class Model:
+            def get_input_embeddings(
+                self, input_ids, pixel_values, mask=None, *, chunked=False
+            ):
+                assert chunked is True
+                return Embed()
+
+        response_generator = SimpleNamespace(
+            model=Model(), vision_cache=None, chunk_local_input_embeddings=True
+        )
+
+        _, gen_kwargs = server.ResponseGenerator._gpu_embed(
+            response_generator,
+            {"input_ids": mx.array([[1, 2]])},
+        )
+
+        assert gen_kwargs["input_embedding_provider"] is provider
+
+    def test_gpu_embed_unloads_phase_swapped_vision_after_materialization(
+        self, monkeypatch
+    ):
+        class Embed:
+            def to_dict(self):
+                return {"inputs_embeds": mx.zeros((1, 2, 4))}
+
+        class Model:
+            def get_input_embeddings(
+                self, input_ids, pixel_values, mask=None, **kwargs
+            ):
+                return Embed()
+
+        phase_swap = SimpleNamespace(load=MagicMock(), unload=MagicMock())
+        response_generator = SimpleNamespace(
+            model=Model(), vision_cache=None, vision_phase_swap=phase_swap
+        )
+        eval_arrays = MagicMock()
+        monkeypatch.setattr(server_generation.mx, "eval", eval_arrays)
+
+        server.ResponseGenerator._gpu_embed(
+            response_generator,
+            {
+                "input_ids": mx.array([[1, 2]]),
+                "pixel_values": mx.ones((1, 1, 1, 1)),
+            },
+        )
+
+        phase_swap.load.assert_called_once_with()
+        phase_swap.unload.assert_called_once_with()
+        eval_arrays.assert_called_once()
 
     def test_gpu_embed_uses_precomputed_semantic_hash(self):
         class Embed:
@@ -7513,6 +8721,9 @@ class TestRuntimeConfigAdditions:
             "token_queue_timeout",
             "spec_draft_model",
             "spec_draft_kind",
+            "spec_defer_draft_model",
+            "vision_phase_swap_path",
+            "chunk_local_input_embeddings",
         ):
             assert name in spec
             assert spec[name]["reload_kinds"] == ["text_generation"]
@@ -7570,10 +8781,21 @@ class TestRuntimeConfigAdditions:
         monkeypatch.setattr(server.runtime, "apc_manager", None)
         monkeypatch.setattr(server.runtime.config, "spec_draft_model", "draft-x")
         monkeypatch.setattr(server.runtime.config, "spec_draft_kind", "auto")
+        monkeypatch.setattr(server.runtime.config, "spec_defer_draft_model", True)
+        monkeypatch.setattr(
+            server.runtime.config, "vision_phase_swap_path", "vision.safetensors"
+        )
+        monkeypatch.setattr(server.runtime.config, "chunk_local_input_embeddings", True)
 
         server.get_cached_model("demo-model")
         assert FakeResponseGenerator.last_kwargs["draft_model_path"] == "draft-x"
         assert FakeResponseGenerator.last_kwargs["draft_kind"] == "auto"
+        assert FakeResponseGenerator.last_kwargs["defer_draft_model"] is True
+        assert (
+            FakeResponseGenerator.last_kwargs["vision_phase_swap_path"]
+            == "vision.safetensors"
+        )
+        assert FakeResponseGenerator.last_kwargs["chunk_local_input_embeddings"] is True
 
     def test_settings_patch_replace_semantics(self, client, monkeypatch):
         monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())

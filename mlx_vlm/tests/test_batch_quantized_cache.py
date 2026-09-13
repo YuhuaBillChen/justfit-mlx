@@ -269,6 +269,15 @@ class TestShouldQuantizeKvLayerPolicy:
         assert should_quantize_kv_layer(26, 28) is True
         assert should_quantize_kv_layer(27, 28) is False
 
+    def test_explicit_last_layer_quantization(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_QUANTIZE_LAST_KV_LAYER", "1")
+        assert [should_quantize_kv_layer(i, 4) for i in range(4)] == [
+            True,
+            True,
+            True,
+            True,
+        ]
+
 
 class TestMakeCache:
     """Test that _make_cache creates BatchQuantizedKVCache when kv_bits is set."""

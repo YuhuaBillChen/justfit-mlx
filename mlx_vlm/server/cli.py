@@ -18,7 +18,8 @@ from .generation import (
     get_server_thinking_end_token,
     get_server_thinking_start_token,
 )
-from .runtime import MODEL_DISCOVERY_ENV, MODEL_DISCOVERY_MODES
+from .runtime import MODEL_DISCOVERY_ENV, MODEL_DISCOVERY_MODES, runtime
+from .runtime_config import RuntimeConfig
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -251,6 +252,31 @@ def main():
         help="Override the drafter's configured block size.",
     )
     parser.add_argument(
+        "--defer-draft-model",
+        action="store_true",
+        help=(
+            "Release MTP drafter weights after startup and reload them when "
+            "decode begins. Requires --max-num-seqs 1."
+        ),
+    )
+    parser.add_argument(
+        "--vision-phase-swap-path",
+        type=str,
+        default=None,
+        help=(
+            "Standalone vision-tower safetensors file to load only while "
+            "media embeddings are built. Requires --max-num-seqs 1."
+        ),
+    )
+    parser.add_argument(
+        "--chunk-local-input-embeddings",
+        action="store_true",
+        help=(
+            "Build supported-model input embeddings one prefill chunk at a time. "
+            "Requires --max-num-seqs 1."
+        ),
+    )
+    parser.add_argument(
         "--max-num-seqs",
         type=int,
         default=None,
@@ -318,6 +344,12 @@ def main():
         os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
     if args.draft_block_size is not None:
         os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
+    if args.defer_draft_model:
+        os.environ["MLX_VLM_DEFER_DRAFT_MODEL"] = "1"
+    if args.vision_phase_swap_path:
+        os.environ["MLX_VLM_VISION_PHASE_SWAP_PATH"] = args.vision_phase_swap_path
+    if args.chunk_local_input_embeddings:
+        os.environ["MLX_VLM_CHUNK_LOCAL_INPUT_EMBEDS"] = "1"
     if args.max_num_seqs is not None:
         os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
     if args.prefill_step_size:
@@ -352,6 +384,11 @@ def main():
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
     if args.api_key:
         os.environ["MLX_VLM_SERVER_API_KEY"] = args.api_key
+
+    # ``python -m mlx_vlm.server`` imports the package (and constructs the
+    # shared runtime) before this CLI has translated arguments into environment
+    # variables. Refresh the snapshot so startup uses the requested settings.
+    runtime.config = RuntimeConfig.from_env()
 
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(

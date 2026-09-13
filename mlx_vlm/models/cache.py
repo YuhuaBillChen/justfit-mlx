@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -16,6 +17,12 @@ def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
     unquantized — it is sensitive to quantization (see gemma-4-class models).
     Shallow stacks (``num_layers <= 2``) quantize every layer when kv-bits is on.
     """
+    if os.environ.get("MLX_VLM_QUANTIZE_LAST_KV_LAYER", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return True
     if num_layers <= 2:
         return True
     return layer_idx < num_layers - 1
@@ -1410,8 +1417,51 @@ class BatchKVCache(_BaseCache):
         self._idx = 0
 
         self._right_padding = None
+        self._segments = None
+        self.segment_on_extend = False
+
+    @property
+    def is_segmented(self):
+        return self._segments is not None
+
+    def _sync_segment_metadata(self):
+        offsets = [int(segment.offset) for segment in self._segments]
+        self._idx = max(offsets, default=0)
+        self.offset = mx.array(offsets)
+        self.left_padding = mx.array([self._idx - offset for offset in offsets])
+
+    def _activate_segments(self):
+        if self._segments is not None:
+            return
+        segments = []
+        for row in range(self.batch_size):
+            if self.keys is None:
+                segment = KVCache()
+            elif self.batch_size == 1 and int(self.left_padding[0].item()) == 0:
+                segment = KVCache()
+                segment.keys = self.keys
+                segment.values = self.values
+                segment.offset = int(self.offset[0].item())
+            else:
+                segment = self.extract(row)
+            segments.append(segment)
+        self._segments = segments
+        self.keys = None
+        self.values = None
+        self._sync_segment_metadata()
 
     def update_and_fetch(self, keys, values):
+        if self._segments is not None:
+            key_states = []
+            value_states = []
+            for row, segment in enumerate(self._segments):
+                row_keys, row_values = segment.update_and_fetch(
+                    keys[row : row + 1], values[row : row + 1]
+                )
+                key_states.append(row_keys)
+                value_states.append(row_values)
+            self._sync_segment_metadata()
+            return key_states, value_states
         prev = self._idx
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
             B, n_kv_heads, _, k_head_dim = keys.shape
@@ -1466,6 +1516,8 @@ class BatchKVCache(_BaseCache):
 
     @property
     def state(self):
+        if self._segments is not None:
+            return [segment.state for segment in self._segments]
         k, v = self.keys, self.values
         if self._idx < k.shape[2]:
             k = k[..., : self._idx, :]
@@ -1481,6 +1533,10 @@ class BatchKVCache(_BaseCache):
         return True
 
     def trim(self, n):
+        if self._segments is not None:
+            trimmed = [segment.trim(n) for segment in self._segments]
+            self._sync_segment_metadata()
+            return min(trimmed, default=0)
         n = min(self._idx, n)
         self._idx -= n
         self.offset -= n
@@ -1495,6 +1551,11 @@ class BatchKVCache(_BaseCache):
         """
         In-place filter to keep just the given indices in the cache.
         """
+        if self._segments is not None:
+            keep = [int(index) for index in batch_indices.tolist()]
+            self._segments = [self._segments[index] for index in keep]
+            self._sync_segment_metadata()
+            return
         if self.keys is not None:
             self.keys = self.keys[batch_indices]
             self.values = self.values[batch_indices]
@@ -1516,6 +1577,16 @@ class BatchKVCache(_BaseCache):
         """
         In-place extend this cache with the other cache.
         """
+        if (
+            self.segment_on_extend
+            or getattr(other, "segment_on_extend", False)
+            or os.environ.get("MLX_VLM_SEGMENTED_BATCH_KV") == "1"
+        ):
+            self._activate_segments()
+            other._activate_segments()
+            self._segments.extend(other._segments)
+            self._sync_segment_metadata()
+            return
         if self.keys is None and other.keys is None:
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])
@@ -1558,10 +1629,27 @@ class BatchKVCache(_BaseCache):
         self._idx = max_idx
 
     def extract(self, idx):
+        if self._segments is not None:
+            return self._segments[idx]
         cache = KVCache()
         padding = self.left_padding[idx].item()
         cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
         cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
+        cache.offset = cache.keys.shape[2]
+        return cache
+
+    def extract_view(self, idx):
+        """Borrow one row for synchronous exact-cache serialization."""
+        if self._segments is not None:
+            return self._segments[idx]
+        if self.keys is None:
+            return KVCache()
+        if self.keys.shape[0] != 1 or int(idx) != 0:
+            return self.extract(idx)
+        cache = KVCache()
+        padding = max(0, int(self.left_padding[0].item()))
+        cache.keys = self.keys[:, :, padding : self._idx]
+        cache.values = self.values[:, :, padding : self._idx]
         cache.offset = cache.keys.shape[2]
         return cache
 
@@ -1601,10 +1689,14 @@ class BatchKVCache(_BaseCache):
         return self._idx
 
     def empty(self):
+        if self._segments is not None:
+            return all(segment.empty() for segment in self._segments)
         return self.keys is None
 
     @property
     def batch_size(self):
+        if self._segments is not None:
+            return len(self._segments)
         if self.keys is not None:
             return int(self.keys.shape[0])
         return int(self.left_padding.shape[0])
@@ -1614,9 +1706,46 @@ class BatchKVCache(_BaseCache):
 
     @property
     def nbytes(self):
+        if self._segments is not None:
+            return sum(segment.nbytes for segment in self._segments)
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+    @property
+    def physical_token_capacity(self):
+        if self._segments is not None:
+            return sum(
+                segment.keys.shape[2] if segment.keys is not None else 0
+                for segment in self._segments
+            )
+        return self.batch_size * (self.keys.shape[2] if self.keys is not None else 0)
+
+    def segmented_attention(self, queries, *, scale, mask=None):
+        if self._segments is None:
+            return None
+        outputs = []
+        for row, segment in enumerate(self._segments):
+            keys = segment.keys[..., : segment.offset, :]
+            values = segment.values[..., : segment.offset, :]
+            row_mask = mask
+            if isinstance(mask, mx.array):
+                if mask.ndim >= 3 and int(mask.shape[0]) == len(self._segments):
+                    row_mask = mask[row : row + 1]
+                # Dense batch masks are keyed to the longest logical row.
+                # Segments contain no left padding, so retain only this row's
+                # right-aligned real-token columns.
+                row_mask = row_mask[..., -segment.offset :]
+            outputs.append(
+                mx.fast.scaled_dot_product_attention(
+                    queries[row : row + 1],
+                    keys.astype(queries.dtype),
+                    values.astype(queries.dtype),
+                    scale=scale,
+                    mask=row_mask,
+                )
+            )
+        return mx.concatenate(outputs, axis=0)
 
 
 class BatchRotatingKVCache(_BaseCache):

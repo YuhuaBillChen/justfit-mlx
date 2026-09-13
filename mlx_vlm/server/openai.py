@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from threading import Event as ThreadEvent
 from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
@@ -941,6 +942,7 @@ async def responses_endpoint(request: Request):
             async def stream_generator():
                 token_iterator = None
                 token_iter = None  # For ResponseGenerator cleanup
+                pre_context_cancel = ThreadEvent()
                 metrics_finalized = False
                 metrics = GenerationMetrics()
                 finish_reason = None
@@ -1026,6 +1028,7 @@ async def responses_endpoint(request: Request):
                             images if images else None,
                             None,  # audio
                             gen_args,
+                            cancel_event=pre_context_cancel,
                         )
                         usage_stats["input_tokens"] = ctx.prompt_tokens
 
@@ -1298,6 +1301,7 @@ async def responses_endpoint(request: Request):
                     yield f"data: {error_data}\n\n"
 
                 finally:
+                    pre_context_cancel.set()
                     if token_iter is not None:
                         try:
                             token_iter.close()
@@ -1544,6 +1548,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             if isinstance(message.content, str):
                 msg["content"] = message.content
             elif isinstance(message.content, list):
+                image_markers = []
                 if message.role == "user":
                     for item in message.content:
                         if not isinstance(item, dict):
@@ -1551,15 +1556,29 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         item_type = item.get("type")
                         if item_type == "input_image":
                             images.append(item["image_url"])
+                            image_markers.append({"type": item_type})
                         elif item_type == "image_url":
                             images.append(item["image_url"]["url"])
+                            image_markers.append({"type": item_type})
                         elif item_type == "input_audio":
                             audio.append(_decode_input_audio_data(item["input_audio"]))
                         elif item_type in ("input_video", "video_url", "video"):
                             video = _extract_video_reference(item)
                             if video:
                                 videos.append(video)
-                msg["content"] = extract_text_from_content(message.content)
+                text_content = extract_text_from_content(message.content)
+                if image_markers:
+                    # Keep lightweight markers on their originating message so
+                    # apply_chat_template can allocate the global image side
+                    # channel without moving earlier-turn images to the last
+                    # user message. URLs/data remain out of the rendered prompt.
+                    msg["content"] = list(image_markers)
+                    if text_content:
+                        msg["content"].append(
+                            {"type": "text", "text": text_content}
+                        )
+                else:
+                    msg["content"] = text_content
             else:
                 msg["content"] = message.content
 
@@ -1682,6 +1701,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             async def stream_generator():
                 token_iterator = None
                 token_iter = None  # For ResponseGenerator cleanup
+                pre_context_cancel = ThreadEvent()
                 metrics_finalized = False
                 metrics = GenerationMetrics()
                 finish_reason = None
@@ -1698,7 +1718,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
                     if runtime.response_generator is not None:
                         # generate() does blocking Queue.get — run off event loop
-                        generate_kwargs = {"args": gen_args}
+                        generate_kwargs = {
+                            "args": gen_args,
+                            "cancel_event": pre_context_cancel,
+                        }
                         if videos:
                             generate_kwargs["videos"] = videos
                         ctx, token_iter = await asyncio.to_thread(
@@ -1998,6 +2021,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     yield f"data: {error_data}\n\n"
 
                 finally:
+                    pre_context_cancel.set()
                     # Close the token iterator to trigger cleanup (important for ResponseGenerator)
                     if token_iter is not None:
                         try:

@@ -1,3 +1,4 @@
+import contextlib
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
@@ -40,6 +41,13 @@ class _MTPVerifyResult:
         commit_speculative_round(
             model, caches, self.rollback_state, accepted, block_size
         )
+
+
+def _paged_append_reservation(factory, prompt_cache, token_count: int):
+    reserve = getattr(factory, "reserve_append", None)
+    if callable(reserve):
+        return reserve(prompt_cache, token_count)
+    return contextlib.nullcontext()
 
 
 def _mtp_shared_kv_from_prompt_cache(
@@ -885,6 +893,9 @@ def _mtp_rounds_batch(
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
+    initial_emitted: Optional[List[int]] = None,
+    max_tokens_per_row: Optional[List[int]] = None,
+    paged_cache_factory=None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
 
@@ -961,13 +972,18 @@ def _mtp_rounds_batch(
     )
 
     b = first_bonus.tolist()
-    emitted = [1] * B
+    emitted = [1] * B if initial_emitted is None else list(initial_emitted)
+    token_limits = (
+        [max_tokens] * B if max_tokens_per_row is None else list(max_tokens_per_row)
+    )
+    if len(emitted) != B or len(token_limits) != B:
+        raise ValueError("MTP row budgets must match the speculative batch size.")
     finished = [False] * B
     active_idx = list(range(B))
 
     while len(active_idx) > 0:
         remaining = [
-            max(1, max_tokens - emitted[active_idx[j]] + 1)
+            max(1, token_limits[active_idx[j]] - emitted[active_idx[j]] + 1)
             for j in range(len(active_idx))
         ]
         bs = _mtp_next_block_size(
@@ -1001,19 +1017,25 @@ def _mtp_rounds_batch(
             )
 
             # Verify
-            with mx.stream(generation_stream):
-                verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
-                verify = _mtp_verify_target(
-                    lm,
-                    verify_input,
-                    prompt_cache,
-                    sampler,
-                    sample_target_tokens=greedy_sampling,
-                )
-                hidden_full = verify.hidden  # [B_active, bs, H]
+            with _paged_append_reservation(paged_cache_factory, prompt_cache, bs):
+                with mx.stream(generation_stream):
+                    verify_input = mx.concatenate(
+                        [b_arr[:, None], draft_tokens], axis=1
+                    )
+                    verify = _mtp_verify_target(
+                        lm,
+                        verify_input,
+                        prompt_cache,
+                        sampler,
+                        sample_target_tokens=greedy_sampling,
+                    )
+                    hidden_full = verify.hidden  # [B_active, bs, H]
 
             # Walk per-row
-            budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
+            budgets = [
+                token_limits[active_idx[j]] - emitted[active_idx[j]]
+                for j in range(n_active)
+            ]
             if verify.target_tokens is not None:
                 sampler_rng.target_eval(verify.target_tokens, hidden_full)
                 accepted_list, new_tokens_list = _speculative_walk_batch(
@@ -1103,8 +1125,10 @@ def _mtp_rounds_batch(
             hidden = hidden_full[:, -1:, :]
         hidden = _mtp_draft_hidden(lm, hidden)
 
-        # Emit (map active slots back to original indices)
+        # Buffer emissions until rollback/filter/rebind finishes. The server
+        # treats returning from next() as a safe speculative-round boundary.
         max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
+        round_tokens: List[List[Optional[int]]] = []
         for pos in range(max_new):
             tokens_out: List[Optional[int]] = [None] * B
             for j in range(n_active):
@@ -1113,13 +1137,13 @@ def _mtp_rounds_batch(
                     tok = new_tokens_list[j][pos]
                     tokens_out[orig] = tok
                     emitted[orig] += 1
-                    if emitted[orig] >= max_tokens:
+                    if emitted[orig] >= token_limits[orig]:
                         finished[orig] = True
                     if eos_token_ids is not None and tok in eos_token_ids:
                         finished[orig] = True
                     if stop_check is not None and stop_check(orig, tok):
                         finished[orig] = True
-            yield tokens_out, {"round_pos": pos, "round_len": max_new}
+            round_tokens.append(tokens_out)
 
         # Update bonus tokens and per-row positions
         for j in range(n_active):
@@ -1172,9 +1196,8 @@ def _mtp_rounds_batch(
         # in the batch and just stop emitting for finished rows. End the
         # round-loop when every row has finished.
         cache_filterable = all(hasattr(c, "filter") for c in prompt_cache)
-        if all(finished[active_idx[j]] for j in range(n_active)):
-            break
-        if cache_filterable:
+        all_active_finished = all(finished[active_idx[j]] for j in range(n_active))
+        if not all_active_finished and cache_filterable:
             keep_slots = [j for j in range(n_active) if not finished[active_idx[j]]]
             if len(keep_slots) < n_active:
                 keep_mx = mx.array(keep_slots, dtype=mx.int32)
@@ -1189,16 +1212,24 @@ def _mtp_rounds_batch(
                     next_shared_kv[k] = (K_next[keep_mx], V_next[keep_mx])
                 active_idx = [active_idx[j] for j in keep_slots]
 
-        # Re-bind drafter with new shared_kv and per-row positions.
-        positions_active = [positions[active_idx[j]] for j in range(len(active_idx))]
-        new_kv_offset = max(positions_active) if positions_active else 0
-        draft_model.set_shared_kv(
-            next_shared_kv,
-            kv_offset=new_kv_offset,
-            position=_mtp_draft_position(mx.array(positions_active)),
-            kv_valid_len=mx.array(positions_active),
-            left_padding=_batch_cache_left_padding(prompt_cache),
-        )
+        if not all_active_finished:
+            positions_active = [
+                positions[active_idx[j]] for j in range(len(active_idx))
+            ]
+            new_kv_offset = max(positions_active) if positions_active else 0
+            draft_model.set_shared_kv(
+                next_shared_kv,
+                kv_offset=new_kv_offset,
+                position=_mtp_draft_position(mx.array(positions_active)),
+                kv_valid_len=mx.array(positions_active),
+                left_padding=_batch_cache_left_padding(prompt_cache),
+            )
+
+        for pos, tokens_out in enumerate(round_tokens):
+            yield tokens_out, {"round_pos": pos, "round_len": max_new}
+
+        if all_active_finished:
+            break
 
         if sum(emitted) % 256 == 0:
             mx.clear_cache()

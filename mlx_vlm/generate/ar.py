@@ -60,6 +60,169 @@ logger = logging.getLogger("mlx_vlm.generate")
 
 DEFAULT_TOP_N_SIGMA = 0.0
 DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
+DEFAULT_PREFILL_SCHEDULE_INTERVAL = 1
+
+
+def _batch_invariant_enabled() -> bool:
+    return os.environ.get("MLX_VLM_BATCH_INVARIANT", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _cache_leaves(prompt_cache):
+    """Yield cache entries without forcing composite cache state."""
+    pending = list(prompt_cache)
+    while pending:
+        entry = pending.pop(0)
+        if isinstance(entry, cache.CacheList):
+            pending[0:0] = entry.caches
+        else:
+            yield entry
+
+
+def _cache_eval_targets(prompt_cache):
+    """Return cheap cache evaluation targets, synchronizing when supported."""
+    targets = []
+    for entry in _cache_leaves(prompt_cache):
+        synchronize = getattr(entry, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
+            continue
+        try:
+            state = entry.eval_state
+        except (AttributeError, TypeError):
+            try:
+                state = entry.state
+            except (AttributeError, TypeError):
+                continue
+        if state is not None:
+            targets.append(state)
+    return targets
+
+
+def _release_cache_resources(prompt_cache):
+    """Release cache-owned external resources before dropping references."""
+    for entry in _cache_leaves(prompt_cache):
+        release = getattr(entry, "release", None)
+        if callable(release):
+            release()
+
+
+def _paged_append_reservation(factory, prompt_cache, token_count: int):
+    reserve = getattr(factory, "reserve_append", None)
+    if callable(reserve):
+        return reserve(prompt_cache, token_count)
+    return contextlib.nullcontext()
+
+
+def _reserve_turboquant_decode_capacity(prompt_cache, max_tokens: int) -> int:
+    """Pre-grow TurboQuant caches one layer at a time before decode."""
+    if os.environ.get("MLX_VLM_TQ_RESERVE_DECODE") != "1":
+        return 0
+    max_tokens = max(0, int(max_tokens))
+    if max_tokens == 0:
+        return 0
+    reserved = 0
+    fixed_capacity = 0
+    started = time.perf_counter()
+    pending = list(prompt_cache)
+    cache_types = []
+    while pending:
+        cache_entry = pending.pop(0)
+        cache_types.append(type(cache_entry).__name__)
+        if getattr(cache_entry, "decode_capacity_is_fixed", False):
+            fixed_capacity += 1
+            continue
+        reserve = getattr(cache_entry, "reserve_for_append", None)
+        if not callable(reserve):
+            if isinstance(cache_entry, cache.CacheList):
+                pending[0:0] = cache_entry.caches
+            continue
+        reserve(max_tokens)
+        reserved += 1
+        mx.clear_cache()
+    if reserved:
+        logger.info(
+            "TurboQuant decode reserve completed: layers=%d tokens=%d elapsed=%.3fs",
+            reserved,
+            max_tokens,
+            time.perf_counter() - started,
+        )
+    elif fixed_capacity:
+        logger.info(
+            "TurboQuant decode reserve skipped for fixed-capacity caches: layers=%d",
+            fixed_capacity,
+        )
+    else:
+        logger.warning(
+            "TurboQuant decode reserve requested but no cache supports it: types=%s",
+            sorted(set(cache_types)),
+        )
+    return reserved
+
+
+def _reserve_warm_prompt_capacity(prompt_cache, tokens: int) -> int:
+    """Grow restored packed caches layerwise before the next prefill forward."""
+    tokens = max(0, int(tokens))
+    if tokens == 0:
+        return 0
+    entries = []
+    pending = list(prompt_cache)
+    while pending:
+        cache_entry = pending.pop(0)
+        if isinstance(cache_entry, cache.CacheList):
+            pending[0:0] = cache_entry.caches
+            continue
+        entries.append(cache_entry)
+
+    # A preceding chunk may still have an async graph holding every layer's
+    # old packed storage.  Only at an actual capacity boundary, finish that
+    # graph before allocating replacements so old and new full-cache
+    # generations cannot overlap.
+    if any(
+        callable(needs_reserve := getattr(entry, "prefix_cache_needs_reserve", None))
+        and needs_reserve(int(getattr(entry, "_idx", 0) or 0) + tokens)
+        for entry in entries
+    ):
+        states = _cache_eval_targets(entries)
+        if states:
+            mx.eval(states)
+            mx.clear_cache()
+
+    grown = 0
+    for cache_entry in entries:
+        reserve = getattr(cache_entry, "prefix_cache_reserve", None)
+        if not callable(reserve):
+            continue
+        current = int(getattr(cache_entry, "_idx", 0) or 0)
+        targets = reserve(current + tokens)
+        if not targets:
+            continue
+        mx.eval(targets)
+        mx.clear_cache()
+        grown += 1
+    return grown
+
+
+def _warm_prompt_reserve_tokens(chunk_tokens: int, remaining_tokens: int) -> int:
+    """Choose rolling or exact-suffix packed-cache reservation."""
+    if os.environ.get("MLX_VLM_TQ_RESERVE_WARM_FULL_SUFFIX") == "1":
+        return max(0, int(remaining_tokens))
+    return max(0, int(chunk_tokens))
+
+
+def _warm_prefill_step_for_context(
+    step: int, cached_tokens: List[int], processed_columns: int
+) -> int:
+    """Optionally cap only the extreme-context tail of warm prefill."""
+    threshold = int(os.environ.get("MLX_VLM_WARM_PREFILL_TAIL_THRESHOLD", "0"))
+    tail_step = int(os.environ.get("MLX_VLM_WARM_PREFILL_TAIL_STEP", "0"))
+    if threshold <= 0 or tail_step <= 0 or not cached_tokens:
+        return step
+    context = max(int(value) for value in cached_tokens) + int(processed_columns)
+    return min(step, tail_step) if context >= threshold else step
 
 
 def _get_batch_cache_eval_interval() -> int:
@@ -71,6 +234,28 @@ def _get_batch_cache_eval_interval() -> int:
     except ValueError:
         logger.warning("Ignoring invalid MLX_VLM_BATCH_CACHE_EVAL_INTERVAL=%r", raw)
         return DEFAULT_BATCH_CACHE_EVAL_INTERVAL
+
+
+def _get_prefill_schedule_interval() -> int:
+    raw = os.environ.get("MLX_VLM_PREFILL_SCHEDULE_INTERVAL")
+    if raw is None:
+        return DEFAULT_PREFILL_SCHEDULE_INTERVAL
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning("Ignoring invalid MLX_VLM_PREFILL_SCHEDULE_INTERVAL=%r", raw)
+        return DEFAULT_PREFILL_SCHEDULE_INTERVAL
+
+
+def _get_mixed_prefill_step_size() -> int:
+    raw = os.environ.get("MLX_VLM_MIXED_PREFILL_STEP_SIZE")
+    if raw is None:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("Ignoring invalid MLX_VLM_MIXED_PREFILL_STEP_SIZE=%r", raw)
+        return 0
 
 
 def _position_seed(seed: int, row_id: int, position: int) -> int:
@@ -504,7 +689,9 @@ def generate_step(
                     speculative_prefill.append(chunk_output)
                     del chunk_output
                     quantize_cache_fn(prompt_cache)
-                    mx.eval([c.state for c in prompt_cache])
+                    cache_targets = _cache_eval_targets(prompt_cache)
+                    if cache_targets:
+                        mx.eval(cache_targets)
                     processed_tokens += n_to_process
                     if checkpoint_lengths and processed_tokens == checkpoint_lengths[0]:
                         prompt_cache_checkpoint(processed_tokens, prompt_cache)
@@ -623,6 +810,78 @@ APC_PRIVATE_PROMPT_KEYS = (
     "_apc_image_hash",
     "_apc_semantic_hash",
 )
+
+INPUT_EMBEDDING_PROVIDER_KEY = "input_embedding_provider"
+
+
+class _BatchedInputEmbeddingProvider:
+    """Combine row-local embedding providers for a padded prompt batch."""
+
+    def __init__(self, providers, lengths, *, left_padded: bool):
+        if len(providers) != len(lengths) or not providers:
+            raise ValueError("providers and lengths must describe the same batch")
+        if any(provider is None for provider in providers):
+            raise ValueError("every prompt row must provide chunk-local embeddings")
+        self.providers = list(providers)
+        self.lengths = [int(length) for length in lengths]
+        self.max_length = max(self.lengths)
+        self.left_padded = bool(left_padded)
+
+    def __call__(self, input_ids: mx.array, *, start: int) -> mx.array:
+        stop = start + input_ids.shape[1]
+        rows = []
+        materialized = []
+        for row_idx, (provider, length) in enumerate(zip(self.providers, self.lengths)):
+            real_start = self.max_length - length if self.left_padded else 0
+            real_stop = real_start + length
+            overlap_start = max(start, real_start)
+            overlap_stop = min(stop, real_stop)
+            if overlap_start >= overlap_stop:
+                rows.append(None)
+                continue
+            chunk_start = overlap_start - start
+            chunk_stop = overlap_stop - start
+            row = provider(
+                input_ids[row_idx : row_idx + 1, chunk_start:chunk_stop],
+                start=overlap_start - real_start,
+            )
+            rows.append((row, chunk_start, chunk_stop))
+            materialized.append(row)
+
+        if not materialized:
+            raise RuntimeError("embedding batch chunk contains padding only")
+        dtype = materialized[0].dtype
+        hidden_size = materialized[0].shape[-1]
+        output_rows = []
+        for row in rows:
+            if row is None:
+                output_rows.append(
+                    mx.zeros((1, input_ids.shape[1], hidden_size), dtype=dtype)
+                )
+                continue
+            embeds, chunk_start, chunk_stop = row
+            parts = []
+            if chunk_start:
+                parts.append(mx.zeros((1, chunk_start, hidden_size), dtype=dtype))
+            parts.append(embeds)
+            if chunk_stop < input_ids.shape[1]:
+                parts.append(
+                    mx.zeros(
+                        (1, input_ids.shape[1] - chunk_stop, hidden_size),
+                        dtype=dtype,
+                    )
+                )
+            output_rows.append(
+                parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=1)
+            )
+        return mx.concatenate(output_rows, axis=0)
+
+    def cleanup(self) -> None:
+        for provider in self.providers:
+            cleanup = getattr(provider, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
+        self.providers = []
 
 
 def _is_mrope_position_ids_prompt_kwarg(key: str, v: mx.array) -> bool:
@@ -805,10 +1064,22 @@ def _merge_prefill_prompt_kwargs(
     lengths = [len(ids) for ids in input_ids]
     max_length = max(lengths)
 
+    providers = [
+        kw.get(INPUT_EMBEDDING_PROVIDER_KEY) if kw else None
+        for kw in prompt_kwargs_list
+    ]
+    if any(provider is not None for provider in providers):
+        if not all(provider is not None for provider in providers):
+            raise ValueError(
+                "batched prefill cannot mix chunk-local and materialized embeddings"
+            )
+
     row_embeds: List[mx.array] = []
     embed_dtype = None
     embed_dim = None
     for kw, length in zip(prompt_kwargs_list, lengths):
+        if providers[0] is not None:
+            continue
         if not kw or kw.get("inputs_embeds") is None:
             raise ValueError("inputs_embeds is required")
         embeds = kw["inputs_embeds"]  # [1, length, D]
@@ -821,7 +1092,9 @@ def _merge_prefill_prompt_kwargs(
             )
             embeds = mx.concatenate([pad, embeds], axis=1)
         row_embeds.append(embeds)
-    inputs_embeds = mx.concatenate(row_embeds, axis=0)
+    inputs_embeds = (
+        None if providers[0] is not None else mx.concatenate(row_embeds, axis=0)
+    )
 
     merged_kwargs: dict = {}
     per_row_keys: dict = {}
@@ -830,7 +1103,10 @@ def _merge_prefill_prompt_kwargs(
         if not kw:
             continue
         for k, v in kw.items():
-            if k == "inputs_embeds" or k in APC_PRIVATE_PROMPT_KEYS:
+            if (
+                k in ("inputs_embeds", INPUT_EMBEDDING_PROVIDER_KEY)
+                or k in APC_PRIVATE_PROMPT_KEYS
+            ):
                 continue
             if isinstance(v, mx.array) and _prompt_kwarg_batch_size(k, v) >= 1:
                 row_v = _prompt_kwarg_row(k, v, i, batch_size)
@@ -843,6 +1119,12 @@ def _merge_prefill_prompt_kwargs(
                 merged_kwargs[k] = v
     for k, vs in per_row_keys.items():
         merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
+    if providers[0] is not None:
+        merged_kwargs[INPUT_EMBEDDING_PROVIDER_KEY] = _BatchedInputEmbeddingProvider(
+            providers, lengths, left_padded=True
+        )
+        for prompt_kwargs in prompt_kwargs_list:
+            prompt_kwargs.pop(INPUT_EMBEDDING_PROVIDER_KEY, None)
 
     return inputs_embeds, merged_kwargs
 
@@ -873,6 +1155,39 @@ def _extend_cache(cache_a, cache_b):
     return extended
 
 
+def _left_pad_batch_tensor(
+    a: mx.array, b: mx.array, *, sequence_axis: int = -2
+) -> mx.array:
+    """Concatenate batched sequence tensors after left-padding one axis."""
+    axis = sequence_axis % a.ndim
+    if b.ndim != a.ndim or axis == 0:
+        raise ValueError("Batched sequence tensors must have matching ranks.")
+    target = max(a.shape[axis], b.shape[axis])
+
+    def pad(value):
+        amount = target - value.shape[axis]
+        if amount <= 0:
+            return value
+        widths = [(0, 0)] * value.ndim
+        widths[axis] = (amount, 0)
+        return mx.pad(value, widths)
+
+    return mx.concatenate([pad(a), pad(b)], axis=0)
+
+
+def _merge_speculative_shared_kv(first: dict, second: dict) -> dict:
+    """Merge per-layer MTP shared K/V snapshots along their batch axis."""
+    if set(first) != set(second):
+        raise ValueError("Cannot extend MTP batches with different shared-KV layouts.")
+    return {
+        name: (
+            _left_pad_batch_tensor(first[name][0], second[name][0]),
+            _left_pad_batch_tensor(first[name][1], second[name][1]),
+        )
+        for name in first
+    }
+
+
 def _make_cache(
     model,
     left_padding,
@@ -885,6 +1200,7 @@ def _make_cache(
     kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start=0,
     prefill_length=0,
+    paged_cache_factory=None,
 ):
     """
     Convert a list of regular caches into their corresponding
@@ -935,7 +1251,29 @@ def _make_cache(
             lp, group_size=kv_group_size, bits=int(kv_bits)
         )
 
-    def to_batch_cache(c, quantize=True):
+    def new_paged_cache(layer_key):
+        create = getattr(paged_cache_factory, "new_cache", None)
+        if callable(create):
+            return create(layer_key)
+        if callable(paged_cache_factory):
+            return paged_cache_factory(layer_key)
+        raise TypeError("paged_cache_factory must be callable or expose new_cache()")
+
+    paged_q4 = (
+        paged_cache_factory is not None
+        and use_turbo
+        and not defer_turbo
+        and float(kv_bits) == 4.0
+        and (kv_key_bits is None or float(kv_key_bits) == 4.0)
+        and (kv_value_bits is None or float(kv_value_bits) == 4.0)
+    )
+    if (
+        paged_cache_factory is not None
+        and tuple(int(x) for x in left_padding) != (0,)
+    ):
+        raise ValueError("paged TurboQuant requires one cold, unpadded prefill row")
+
+    def to_batch_cache(c, quantize=True, layer_key=None):
         # Caches that ship their own batch-conversion (e.g. MiniMax M3 sparse
         # index-key side cache) know how to build the correct batch cache.
         if hasattr(c, "to_batch"):
@@ -948,16 +1286,28 @@ def _make_cache(
             return c.to_batch(left_padding)
         if isinstance(c, cache.KVCache):
             if kv_bits is not None and quantize:
+                if paged_q4:
+                    return new_paged_cache(layer_key)
                 return _make_quant_cache(left_padding)
-            return cache.BatchKVCache(left_padding)
+            batch_cache = cache.BatchKVCache(left_padding)
+            batch_cache.segment_on_extend = paged_cache_factory is not None
+            return batch_cache
         elif isinstance(c, cache.ChunkedKVCache):
             if kv_bits is not None and quantize:
+                if paged_q4:
+                    return new_paged_cache(layer_key)
                 return _make_quant_cache(left_padding)
-            return cache.BatchKVCache(left_padding)
+            batch_cache = cache.BatchKVCache(left_padding)
+            batch_cache.segment_on_extend = paged_cache_factory is not None
+            return batch_cache
         elif isinstance(c, cache.SimpleKVCache):
             if kv_bits is not None and quantize:
+                if paged_q4:
+                    return new_paged_cache(layer_key)
                 return _make_quant_cache(left_padding)
-            return cache.BatchKVCache(left_padding)
+            batch_cache = cache.BatchKVCache(left_padding)
+            batch_cache.segment_on_extend = paged_cache_factory is not None
+            return batch_cache
         elif isinstance(c, cache.ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
@@ -968,9 +1318,27 @@ def _make_cache(
                 raise ValueError("RotatingKVCache with keep tokens is not supported.")
             return cache.BatchRotatingKVCache(c.max_size, left_padding)
         elif isinstance(c, cache.CacheList):
-            return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
+            return cache.CacheList(
+                *(
+                    to_batch_cache(
+                        sub_c,
+                        quantize=quantize,
+                        layer_key=(layer_key, child_index),
+                    )
+                    for child_index, sub_c in enumerate(c.caches)
+                )
+            )
         elif isinstance(c, tuple):
-            return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c))
+            return cache.CacheList(
+                *(
+                    to_batch_cache(
+                        sub_c,
+                        quantize=quantize,
+                        layer_key=(layer_key, child_index),
+                    )
+                    for child_index, sub_c in enumerate(c)
+                )
+            )
         else:
             raise ValueError(f"{type(c)} does not yet support batching")
 
@@ -978,7 +1346,11 @@ def _make_cache(
         model_cache = model.make_cache()
         n = len(model_cache)
         return [
-            to_batch_cache(c, quantize=cache.should_quantize_kv_layer(i, n))
+            to_batch_cache(
+                c,
+                quantize=cache.should_quantize_kv_layer(i, n),
+                layer_key=i,
+            )
             for i, c in enumerate(model_cache)
         ]
     else:
@@ -1094,6 +1466,7 @@ class GenerationBatch:
             List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
         ] = None,
         thinking_budget_criteria: Optional[List[Any]] = None,
+        paged_cache_factory=None,
     ):
         self.model = model
         self._language_model = getattr(model, "language_model", model)
@@ -1108,6 +1481,7 @@ class GenerationBatch:
         self.greedy_sampling = greedy_sampling
         self.logits_processors = logits_processors or []
         self.thinking_budget_criteria = thinking_budget_criteria or []
+        self._paged_cache_factory = paged_cache_factory
         self.token_context = [list(ctx) for ctx in (token_context or [])]
         self._ensure_token_context()
 
@@ -1120,12 +1494,17 @@ class GenerationBatch:
 
         # Per-sequence MRoPE delta
         self._rope_deltas = None
+        # Populated only after singleton MTP was demoted for peer admission.
+        # The most recent AR target step can then become a fresh MTP boundary
+        # without moving or reconstructing the page-backed KV cache.
+        self._mtp_repromotion = None
+        self._mtp_repromotion_state = None
 
     def __len__(self):
         return len(self.uids)
 
     def cache_states(self):
-        return [c.state for c in self.prompt_cache if hasattr(c, "state")]
+        return _cache_eval_targets(self.prompt_cache)
 
     def _ensure_logits_processor_slots(self, *, force: bool = False):
         if not (force or (self.logits_processors and any(self.logits_processors))):
@@ -1186,7 +1565,51 @@ class GenerationBatch:
         if self._rope_deltas is not None:
             fwd_kwargs["rope_deltas"] = self._rope_deltas
 
-        sampled = self._fused_greedy_step(inputs, fwd_kwargs)
+        capture_mtp = self._mtp_repromotion is not None
+        capture_argmax = getattr(
+            self._language_model, "speculative_argmax_from_hidden", None
+        )
+        fast_capture = bool(
+            capture_mtp
+            and self.greedy_sampling
+            and not self.compute_logprobs
+            and self.top_logprobs_k <= 0
+            and not (self.logits_processors and any(self.logits_processors))
+            and callable(capture_argmax)
+        )
+        if capture_mtp:
+            fwd_kwargs.update(speculative_prefill_kwargs("mtp", None))
+        if fast_capture:
+            fwd_kwargs["skip_logits"] = True
+
+        with _paged_append_reservation(
+            self._paged_cache_factory, self.prompt_cache, 1
+        ):
+            sampled = (
+                None
+                if capture_mtp
+                else self._fused_greedy_step(inputs, fwd_kwargs)
+            )
+            if sampled is None:
+                output = self._language_model(
+                    inputs[:, None], cache=self.prompt_cache, **fwd_kwargs
+                )
+        if capture_mtp:
+            hidden = speculative_hidden_state("mtp", output)
+            self._mtp_repromotion_state = {
+                "hidden": hidden,
+                "shared_kv_states": output.shared_kv_states,
+                "prompt_tokens": inputs[:, None],
+            }
+            if fast_capture:
+                sampled = capture_argmax(hidden)
+                if sampled is None:
+                    raise RuntimeError(
+                        "MTP re-promotion fast capture could not sample target "
+                        "hidden state."
+                    )
+                if sampled.ndim == 2 and sampled.shape[1] == 1:
+                    sampled = sampled[:, 0]
         if sampled is not None:
             self._next_tokens = sampled
             self._next_lps = None
@@ -1196,9 +1619,6 @@ class GenerationBatch:
             mx.eval(inputs)
             return inputs.tolist(), None, None, None
 
-        output = self._language_model(
-            inputs[:, None], cache=self.prompt_cache, **fwd_kwargs
-        )
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits[:, -1, :]
 
@@ -1297,11 +1717,7 @@ class GenerationBatch:
                 self._rope_deltas,
             )
         )
-        for c in self.prompt_cache:
-            try:
-                append_arrays(c.state)
-            except (AttributeError, TypeError):
-                pass
+        append_arrays(_cache_eval_targets(self.prompt_cache))
 
         if targets:
             mx.eval(*targets)
@@ -1309,9 +1725,21 @@ class GenerationBatch:
     def extend(self, other: "GenerationBatch"):
         """Extend this batch with another generation batch."""
         self_was_empty = len(self.uids) == 0
+        if self_was_empty:
+            self._paged_cache_factory = other._paged_cache_factory
+        elif len(other.uids) > 0 and (
+            self._paged_cache_factory is not other._paged_cache_factory
+        ):
+            raise RuntimeError(
+                "Cannot combine generation batches from different paged cache "
+                "registries."
+            )
         if not self_was_empty and len(other.uids) > 0:
             self._eval_pending_state()
             other._eval_pending_state()
+            # A captured boundary predates the newly joined row. The next AR
+            # step will replace it with row-aligned state for the full batch.
+            self._mtp_repromotion_state = None
 
         self_has_processors = self.logits_processors and any(self.logits_processors)
         other_has_processors = other.logits_processors and any(other.logits_processors)
@@ -1401,6 +1829,7 @@ class GenerationBatch:
             ]
 
         if not keep:
+            _release_cache_resources(self.prompt_cache)
             self.prompt_cache.clear()
             self._current_tokens = None
             self._current_lps = None
@@ -1412,6 +1841,7 @@ class GenerationBatch:
             self.token_context = []
             self.logits_processors = []
             self.thinking_budget_criteria = []
+            self._mtp_repromotion_state = None
         else:
             keep_arr = mx.array(keep, mx.int32)
             for c in self.prompt_cache:
@@ -1425,6 +1855,60 @@ class GenerationBatch:
                 self._next_top_lp = self._next_top_lp[keep_arr]
             if self._rope_deltas is not None:
                 self._rope_deltas = self._rope_deltas[keep_arr]
+            if self._mtp_repromotion_state is not None:
+                state = self._mtp_repromotion_state
+                state["hidden"] = state["hidden"][keep_arr]
+                state["prompt_tokens"] = state["prompt_tokens"][keep_arr]
+                state["shared_kv_states"] = {
+                    name: (keys[keep_arr], values[keep_arr])
+                    for name, (keys, values) in (
+                        state["shared_kv_states"] or {}
+                    ).items()
+                }
+
+    def enable_mtp_repromotion(self, draft_model, *, draft_block_size=None):
+        """Capture AR boundaries so a surviving singleton can resume MTP."""
+        self._mtp_repromotion = {
+            "draft_model": draft_model,
+            "draft_block_size": draft_block_size,
+        }
+        self._mtp_repromotion_state = None
+
+    def to_speculative_mtp(self) -> Optional["SpeculativeGenerationBatch"]:
+        """Reuse this singleton's cache and latest AR boundary for MTP."""
+        if len(self.uids) != 1 or self._mtp_repromotion is None:
+            return None
+        if self._mtp_repromotion_state is None or self._next_tokens is None:
+            return None
+        if self.logits_processors and any(self.logits_processors):
+            return None
+        if self.thinking_budget_criteria and any(self.thinking_budget_criteria):
+            return None
+
+        state = self._mtp_repromotion_state
+        config = self._mtp_repromotion
+        batch = SpeculativeGenerationBatch(
+            model=self.model,
+            draft_model=config["draft_model"],
+            draft_kind="mtp",
+            uids=list(self.uids),
+            first_tokens=self._next_tokens,
+            prompt_cache=self.prompt_cache,
+            sampler=self.sampler,
+            stop_criteria=self.stop_criteria,
+            max_tokens=list(self.max_tokens),
+            hidden=state["hidden"],
+            shared_kv_states=state["shared_kv_states"],
+            prompt_tokens=state["prompt_tokens"],
+            draft_block_size=config["draft_block_size"],
+            token_dtype=self._next_tokens.dtype,
+            greedy_sampling=self.greedy_sampling,
+            paged_cache_factory=self._paged_cache_factory,
+        )
+        batch._num_tokens = list(self._num_tokens)
+        if self._rope_deltas is not None:
+            batch._rope_deltas = self._rope_deltas
+        return batch
 
     def next(self) -> List[Response]:
         """Generate the next batch of tokens."""
@@ -1522,6 +2006,9 @@ class GenerationBatch:
         batch._next_top_idx = None
         batch._next_top_lp = None
         batch._rope_deltas = None
+        batch._paged_cache_factory = None
+        batch._mtp_repromotion = None
+        batch._mtp_repromotion_state = None
         return batch
 
 
@@ -1549,9 +2036,13 @@ class SpeculativeGenerationBatch:
         draft_block_size: Optional[int] = None,
         token_dtype: mx.Dtype = mx.int32,
         greedy_sampling: bool = False,
+        paged_cache_factory=None,
     ):
         self.model = model
         self.draft_model = draft_model
+        # Keep the stable lifecycle owner even when a lazy wrapper later
+        # materializes and ``draft_model`` is replaced with its loaded model.
+        self._draft_owner = draft_model
         self.draft_kind = draft_kind
         self.uids = list(uids)
         self._all_uids = list(uids)
@@ -1566,10 +2057,12 @@ class SpeculativeGenerationBatch:
         self.draft_block_size = draft_block_size
         self.token_dtype = token_dtype
         self.greedy_sampling = greedy_sampling
+        self._paged_cache_factory = paged_cache_factory
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
         self._sent_first = False
         self._rounds_iter = None
+        self._last_tokens = [int(token) for token in first_tokens.tolist()]
 
     def __len__(self):
         return sum(not done for done in self._finished)
@@ -1583,7 +2076,97 @@ class SpeculativeGenerationBatch:
         if len(self) == 0:
             self.__dict__.update(other.__dict__)
             return
-        raise RuntimeError("Cannot extend an active speculative generation batch.")
+        if self.draft_kind != "mtp" or other.draft_kind != "mtp":
+            raise RuntimeError(
+                "Dynamic speculative admission currently supports MTP only."
+            )
+        if other._sent_first or other._rounds_iter is not None:
+            raise RuntimeError("Only a newly prefetched MTP batch can be admitted.")
+        if self.model is not other.model:
+            raise RuntimeError("Cannot combine MTP batches from different targets.")
+        if self._draft_owner is not other._draft_owner:
+            raise RuntimeError("Cannot combine MTP batches from different drafters.")
+
+        if self._sent_first:
+            self._rebase_mtp_for_extend()
+
+        self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
+        self.first_tokens = mx.concatenate([self.first_tokens, other.first_tokens])
+        # MTP consumes only the final prompt position from each row.  Prompt
+        # chunks can have different lengths, so normalize before joining the
+        # active and newly-prefetched cohorts.
+        self.hidden = mx.concatenate(
+            [self.hidden[:, -1:, :], other.hidden[:, -1:, :]], axis=0
+        )
+        self.shared_kv_states = _merge_speculative_shared_kv(
+            self.shared_kv_states or {}, other.shared_kv_states or {}
+        )
+        self.prompt_tokens = _left_pad_batch_tensor(
+            self.prompt_tokens, other.prompt_tokens, sequence_axis=-1
+        )
+        self._all_uids.extend(other._all_uids)
+        self.uids.extend(other.uids)
+        self.max_tokens.extend(other.max_tokens)
+        self._num_tokens.extend(other._num_tokens)
+        self._finished.extend(other._finished)
+        self._last_tokens.extend(other._last_tokens)
+        self._sent_first = False
+        self._rounds_iter = None
+
+        mx.eval(
+            self.first_tokens,
+            self.hidden,
+            self.shared_kv_states,
+            _cache_eval_targets(self.prompt_cache),
+        )
+
+    def _rebase_mtp_for_extend(self) -> None:
+        """Turn the current round's bonus into a fresh MTP prefill boundary."""
+        if self._rounds_iter is not None:
+            close = getattr(self._rounds_iter, "close", None)
+            if callable(close):
+                close()
+            self._rounds_iter = None
+
+        active_slots = [i for i, done in enumerate(self._finished) if not done]
+        active_tokens = mx.array(
+            [[self._last_tokens[i]] for i in active_slots], dtype=self.token_dtype
+        )
+        with _paged_append_reservation(
+            self._paged_cache_factory, self.prompt_cache, 1
+        ):
+            output = self.model(
+                active_tokens,
+                cache=self.prompt_cache,
+                **speculative_prefill_kwargs("mtp", self.draft_model),
+            )
+        logits = output.logits[:, -1, :]
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        first_tokens = _sample_with_positions(
+            self.sampler,
+            logprobs,
+            row_ids=[0] * len(active_slots),
+            positions=[self._num_tokens[i] for i in active_slots],
+        )
+
+        self._all_uids = [self._all_uids[i] for i in active_slots]
+        self.uids = list(self._all_uids)
+        self.max_tokens = [self.max_tokens[i] for i in active_slots]
+        self._num_tokens = [self._num_tokens[i] for i in active_slots]
+        self._finished = [False] * len(active_slots)
+        self._last_tokens = [int(token) for token in first_tokens.tolist()]
+        self.first_tokens = first_tokens
+        self.hidden = speculative_hidden_state("mtp", output)
+        self.shared_kv_states = output.shared_kv_states
+        self.prompt_tokens = active_tokens
+        self._sent_first = False
+
+        mx.eval(
+            self.first_tokens,
+            self.hidden,
+            self.shared_kv_states,
+            _cache_eval_targets(self.prompt_cache),
+        )
 
     def filter(self, keep: List[int]):
         keep_uids = {self.uids[idx] for idx in keep}
@@ -1593,7 +2176,72 @@ class SpeculativeGenerationBatch:
         self._refresh_uids()
 
     def cache_states(self):
-        return [c.state for c in self.prompt_cache if hasattr(c, "state")]
+        return _cache_eval_targets(self.prompt_cache)
+
+    def to_autoregressive(self) -> GenerationBatch:
+        """Continue an MTP cohort with ordinary autoregressive decoding.
+
+        ``next()`` drains a complete speculative round before returning, so
+        the target cache is at a safe rollback boundary here. The cache does
+        not yet contain the final emitted bonus token; prime one AR step when
+        that token has already been sent, then resume without duplicating it.
+        """
+        if self.draft_kind != "mtp":
+            raise RuntimeError("Only MTP batches can be demoted to AR decoding.")
+
+        if self._rounds_iter is not None:
+            close = getattr(self._rounds_iter, "close", None)
+            if callable(close):
+                close()
+            self._rounds_iter = None
+
+        active_slots = [i for i, done in enumerate(self._finished) if not done]
+        if not active_slots:
+            return GenerationBatch.empty(
+                self.model,
+                self.sampler,
+                self.stop_criteria,
+                compute_logprobs=False,
+                greedy_sampling=self.greedy_sampling,
+            )
+
+        inputs = (
+            mx.array(
+                [self._last_tokens[i] for i in active_slots],
+                dtype=self.token_dtype,
+            )
+            if self._sent_first
+            else self.first_tokens[mx.array(active_slots, dtype=mx.int32)]
+        )
+        batch = GenerationBatch(
+            model=self.model,
+            uids=[self._all_uids[i] for i in active_slots],
+            inputs=inputs,
+            prompt_cache=self.prompt_cache,
+            sampler=self.sampler,
+            stop_criteria=self.stop_criteria,
+            max_tokens=[self.max_tokens[i] for i in active_slots],
+            greedy_sampling=self.greedy_sampling,
+            paged_cache_factory=getattr(self, "_paged_cache_factory", None),
+        )
+        batch.compute_logprobs = False
+        batch._num_tokens = [self._num_tokens[i] for i in active_slots]
+        # GenerationBatch.filter() treats a non-empty criteria list as
+        # row-aligned. Preserve that invariant before a subsequently admitted
+        # request extends this demoted singleton.
+        batch.thinking_budget_criteria = [None] * len(active_slots)
+        rope_deltas = getattr(self, "_rope_deltas", None)
+        if rope_deltas is not None:
+            batch._rope_deltas = rope_deltas[
+                mx.array(active_slots, dtype=mx.int32)
+            ]
+
+        if self._sent_first:
+            # Append the already-emitted bonus token and prepare its successor.
+            # Discard the returned token because the server emitted it before
+            # this round-boundary transition.
+            batch._step()
+        return batch
 
     def _finish_reason(self, row: int, token: int) -> Optional[str]:
         if self.stop_criteria(token):
@@ -1611,6 +2259,7 @@ class SpeculativeGenerationBatch:
             if token is None or self._finished[row]:
                 continue
             token = int(token)
+            self._last_tokens[row] = token
             self._num_tokens[row] += 1
             finish_reason = self._finish_reason(row, token)
             if finish_reason is not None:
@@ -1627,6 +2276,10 @@ class SpeculativeGenerationBatch:
     def _start_rounds(self):
         if self._rounds_iter is not None:
             return
+
+        materialize = getattr(self.draft_model, "materialize", None)
+        if callable(materialize):
+            self.draft_model = materialize()
 
         def stop_check(seq_idx, token_id):
             return (
@@ -1652,6 +2305,9 @@ class SpeculativeGenerationBatch:
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
             row_ids=[0] * len(self._all_uids),
+            initial_emitted=list(self._num_tokens),
+            max_tokens_per_row=list(self.max_tokens),
+            paged_cache_factory=getattr(self, "_paged_cache_factory", None),
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -1666,6 +2322,7 @@ class SpeculativeGenerationBatch:
                 if self._finished[row]:
                     continue
                 token = int(token)
+                self._last_tokens[row] = token
                 self._num_tokens[row] += 1
                 finish_reason = self._finish_reason(row, token)
                 if finish_reason is not None:
@@ -1754,6 +2411,7 @@ class PromptProcessingBatch:
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
         greedy_sampling: bool = False,
+        paged_cache_factory=None,
     ):
         self.model = model
         self.uids = uids
@@ -1765,6 +2423,7 @@ class PromptProcessingBatch:
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling
+        self._paged_cache_factory = paged_cache_factory
 
         lengths = [len(ids) for ids in input_ids]
         max_length = max(lengths)
@@ -1799,10 +2458,14 @@ class PromptProcessingBatch:
         )
         self._inputs_embeds = inputs_embeds
         self._prompt_kwargs = prompt_kwargs or {}
+        self._input_embedding_provider = self._prompt_kwargs.pop(
+            INPUT_EMBEDDING_PROVIDER_KEY, None
+        )
+        self._embedding_phase_swap_pending = False
         self._prompt_length_aware_keys: List[str] = []
-        if self._prompt_kwargs and self._inputs_embeds is not None:
-            prompt_batch = self._inputs_embeds.shape[0]
-            prompt_len = self._inputs_embeds.shape[1]
+        if self._prompt_kwargs:
+            prompt_batch = self._input_ids.shape[0]
+            prompt_len = self._input_ids.shape[1]
             for k, v in self._prompt_kwargs.items():
                 if (
                     isinstance(v, mx.array)
@@ -1831,6 +2494,31 @@ class PromptProcessingBatch:
             )
             self._cached_tokens_per_row.append(prefix_len)
 
+        spill_directory = os.environ.get("MLX_VLM_INPUT_EMBEDDING_SPILL_DIR")
+        embedding_phase_swap = getattr(self.model, "prefill_embedding_phase_swap", None)
+        if (
+            spill_directory
+            and embedding_phase_swap is not None
+            and any(self._cached_tokens_per_row)
+            and self._inputs_embeds is None
+            and self._input_embedding_provider is not None
+        ):
+            spill = getattr(self._input_embedding_provider, "spill_to_disk", None)
+            if not callable(spill):
+                raise ValueError(
+                    "Embedding phase swap requires a spill-capable input provider"
+                )
+            head_phase_swap = getattr(self.model, "prefill_head_phase_swap", None)
+            if head_phase_swap is not None:
+                head_phase_swap.unload()
+            provider = spill(self._input_ids, spill_directory)
+            self._input_embedding_provider = provider
+            # The caller that assembled this batch can still hold the original
+            # provider until this constructor returns.  Defer the actual table
+            # release to the first prompt step, after those temporary owner
+            # references are gone and before any model forward is submitted.
+            self._embedding_phase_swap_pending = True
+
         if warm_cache is not None:
             self.prompt_cache = warm_cache
         elif draft_model is not None and draft_kind is not None:
@@ -1851,6 +2539,7 @@ class PromptProcessingBatch:
                     kv_quant_scheme=kv_quant_scheme,
                     quantized_kv_start=quantized_kv_start,
                     prefill_length=max_length,
+                    paged_cache_factory=paged_cache_factory,
                 ),
             )
         elif (
@@ -1873,6 +2562,7 @@ class PromptProcessingBatch:
                 kv_quant_scheme=kv_quant_scheme,
                 quantized_kv_start=quantized_kv_start,
                 prefill_length=max_length,
+                paged_cache_factory=paged_cache_factory,
             )
 
         # Declare per-row right-padding on each cache so finalize() can roll
@@ -1926,13 +2616,13 @@ class PromptProcessingBatch:
 
     def needs_processing(self):
         """True if prompt needs chunked processing before generate()."""
-        if self._inputs_embeds is None or self.prefill_step_size is None:
+        if self.prefill_step_size is None:
             return self._next_apc_checkpoint_column() is not None
         if self._next_apc_checkpoint_column() is not None:
             return True
         # See the note in stream_generate: prompts at or below prefill_step_size
         # would otherwise skip chunking and materialize the full logits tensor.
-        return self._inputs_embeds.shape[1] > 1
+        return self._input_ids.shape[1] > 1
 
     def _apc_checkpoint_column_for_meta(
         self, batch_idx: int, meta: dict
@@ -1970,11 +2660,10 @@ class PromptProcessingBatch:
             self._apc_manager is None
             or not self._apc_uses_checkpoints()
             or not self._apc_meta
-            or self._inputs_embeds is None
         ):
             return None
         start = self._processed_prompt_columns
-        end = start + self._inputs_embeds.shape[1]
+        end = start + self._input_ids.shape[1]
         next_col: Optional[int] = None
         for batch_idx, meta in enumerate(self._apc_meta):
             if meta is None:
@@ -2018,8 +2707,8 @@ class PromptProcessingBatch:
                 stored = coordinator.store_checkpoint(
                     meta["full_input_ids"][:checkpoint_len],
                     self.prompt_cache,
-                    batch_idx=batch_idx,
                     extra_hash=meta.get("extra_hash", 0),
+                    batch_idx=batch_idx,
                 )
             else:
                 prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
@@ -2029,6 +2718,7 @@ class PromptProcessingBatch:
                     meta["full_input_ids"][:checkpoint_len],
                     prompt_cache,
                     extra_hash=meta.get("extra_hash", 0),
+                    take_ownership=True,
                 )
             meta["checkpoint_stored"] = checkpoint_len
             meta["checkpoint_saved"] = meta.get("checkpoint_saved", False) or stored
@@ -2051,8 +2741,19 @@ class PromptProcessingBatch:
         if not self.needs_processing():
             return 0
 
-        step = self.prefill_step_size or self._inputs_embeds.shape[1]
-        n = min(step, self._inputs_embeds.shape[1] - 1)
+        if self._embedding_phase_swap_pending:
+            embedding_phase_swap = getattr(
+                self.model, "prefill_embedding_phase_swap", None
+            )
+            if embedding_phase_swap is not None:
+                embedding_phase_swap.unload()
+            self._embedding_phase_swap_pending = False
+
+        step = self.prefill_step_size or self._input_ids.shape[1]
+        step = _warm_prefill_step_for_context(
+            step, self._cached_tokens_per_row, self._processed_prompt_columns
+        )
+        n = min(step, self._input_ids.shape[1] - 1)
         # Finish shorter right-padded rows at a chunk boundary so we can keep
         # their last real token's logits before subsequent chunks consume pad.
         # Some models only return the final column's logits during prefill.
@@ -2071,13 +2772,45 @@ class PromptProcessingBatch:
             **self._prompt_kwargs_for_step(n),
             **self._speculative_prefill.kwargs,
         }
-        output = self.model(
-            self._input_ids[:, :n],
-            cache=self.prompt_cache,
-            inputs_embeds=self._inputs_embeds[:, :n],
-            n_to_process=n,
-            **prompt_kwargs,
-        )
+        phase_swap = getattr(self.model, "prefill_head_phase_swap", None)
+        if phase_swap is not None:
+            residency = getattr(self.model, "phase_residency_manager", None)
+            if (
+                residency is not None
+                and residency.contains("lm_head") is True
+            ):
+                residency.unload_if_idle("lm_head")
+            else:
+                phase_swap.unload()
+        if any(self._cached_tokens_per_row):
+            _reserve_warm_prompt_capacity(
+                self.prompt_cache,
+                _warm_prompt_reserve_tokens(n, self._input_ids.shape[1]),
+            )
+        if (
+            getattr(self.model, "supports_skip_logits", False)
+            and self._right_pad_per_row is None
+        ):
+            prompt_kwargs = dict(prompt_kwargs)
+            prompt_kwargs["skip_logits"] = True
+        if self._inputs_embeds is not None:
+            inputs_embeds = self._inputs_embeds[:, :n]
+        elif self._input_embedding_provider is not None:
+            inputs_embeds = self._input_embedding_provider(
+                self._input_ids[:, :n], start=self._processed_prompt_columns
+            )
+        else:
+            inputs_embeds = None
+        with _paged_append_reservation(
+            self._paged_cache_factory, self.prompt_cache, n
+        ):
+            output = self.model(
+                self._input_ids[:, :n],
+                cache=self.prompt_cache,
+                inputs_embeds=inputs_embeds,
+                n_to_process=n,
+                **prompt_kwargs,
+            )
         self._speculative_prefill.append(output)
         if self._right_pad_per_row is not None:
             end = self._processed_prompt_columns + n
@@ -2087,12 +2820,28 @@ class PromptProcessingBatch:
             logits = output.logits if hasattr(output, "logits") else output
             for i in finished_rows:
                 self._finished_prompt_logits[i] = mx.contiguous(mx.array(logits[i, -1]))
-        eval_targets = [c.state for c in self.prompt_cache]
-        eval_targets.extend(self._finished_prompt_logits[i] for i in finished_rows)
-        mx.async_eval(eval_targets)
+        cache_states = _cache_eval_targets(self.prompt_cache)
+        cache_states.extend(self._finished_prompt_logits[i] for i in finished_rows)
+        direct_checkpoint = bool(
+            checkpoint_col is not None
+            and self._processed_prompt_columns + n == checkpoint_col
+            and self._apc_manager is not None
+            and getattr(self._apc_manager, "direct_disk_writes", False)
+        )
+        if direct_checkpoint:
+            # The direct disk writer borrows live cache views. Finish the final
+            # prefill graph and release chunk-local inputs before serialization
+            # so their activation lifetime does not overlap the checkpoint.
+            if cache_states:
+                mx.eval(cache_states)
+            del inputs_embeds, prompt_kwargs
+            mx.clear_cache()
+        elif cache_states:
+            mx.async_eval(cache_states)
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
-        self._inputs_embeds = self._inputs_embeds[:, n:]
+        if self._inputs_embeds is not None:
+            self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
         for k in self._prompt_length_aware_keys:
             self._prompt_kwargs[k] = _slice_sequence_aligned_prompt_kwarg(
@@ -2126,18 +2875,43 @@ class PromptProcessingBatch:
         self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
     ) -> GenerationBatch:
         """Process final tokens and transition to GenerationBatch."""
+        phase_swap = getattr(self.model, "prefill_head_phase_swap", None)
+        if phase_swap is not None:
+            residency = getattr(self.model, "phase_residency_manager", None)
+            if (
+                residency is not None
+                and residency.contains("lm_head") is True
+            ):
+                residency.acquire("lm_head", "generation")
+            else:
+                phase_swap.load()
         call_kwargs = dict(self._prompt_kwargs)
         if self.draft_model is not None and self.draft_kind is not None:
             call_kwargs.update(
                 speculative_prefill_kwargs(self.draft_kind, self.draft_model)
             )
 
-        output = self.model(
-            self._input_ids,
-            cache=self.prompt_cache,
-            inputs_embeds=self._inputs_embeds,
-            **call_kwargs,
-        )
+        with _paged_append_reservation(
+            self._paged_cache_factory,
+            self.prompt_cache,
+            int(self._input_ids.shape[1]),
+        ):
+            output = self.model(
+                self._input_ids,
+                cache=self.prompt_cache,
+                inputs_embeds=(
+                    self._inputs_embeds
+                    if self._inputs_embeds is not None
+                    else (
+                        self._input_embedding_provider(
+                            self._input_ids, start=self._processed_prompt_columns
+                        )
+                        if self._input_embedding_provider is not None
+                        else None
+                    )
+                ),
+                **call_kwargs,
+            )
         output = self._speculative_prefill.finish(output)
         logits = output.logits if hasattr(output, "logits") else output
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
@@ -2223,6 +2997,7 @@ class PromptProcessingBatch:
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,
+                paged_cache_factory=self._paged_cache_factory,
             )
             compute_logprobs = False
         else:
@@ -2239,6 +3014,7 @@ class PromptProcessingBatch:
                 token_context=[list(ctx) for ctx in self._token_context],
                 logits_processors=list(self.logits_processors),
                 thinking_budget_criteria=list(self.thinking_budget_criteria),
+                paged_cache_factory=self._paged_cache_factory,
             )
         gen_batch.compute_logprobs = compute_logprobs
 
@@ -2266,12 +3042,7 @@ class PromptProcessingBatch:
         # Final prefill produces the first generated token and mutates the
         # prompt cache. Materialize that boundary before the decode loop so
         # the first decode step does not inherit the full lazy prefill graph.
-        cache_states = []
-        for c in self.prompt_cache:
-            try:
-                cache_states.append(c.state)
-            except (AttributeError, TypeError):
-                pass
+        cache_states = _cache_eval_targets(self.prompt_cache)
         eval_targets = [first_tokens]
         if cache_states:
             eval_targets.append(cache_states)
@@ -2308,6 +3079,7 @@ class PromptProcessingBatch:
                         coordinator.commit(
                             self.prompt_cache,
                             meta["full_input_ids"],
+                            checkpoint_stored=bool(meta.get("checkpoint_done")),
                             batch_idx=batch_idx,
                             extra_hash=meta.get("extra_hash", 0),
                             skip_first_n_tokens=meta.get("prefix_len", 0),
@@ -2320,6 +3092,7 @@ class PromptProcessingBatch:
                                 meta["full_input_ids"],
                                 prompt_cache,
                                 extra_hash=meta.get("extra_hash", 0),
+                                take_ownership=True,
                             )
                         self._apc_manager.release(meta.get("apc_blocks", []))
                     else:
@@ -2338,6 +3111,18 @@ class PromptProcessingBatch:
                 for meta in self._apc_meta:
                     if meta is not None:
                         self._apc_manager.release(meta.get("apc_blocks", []))
+
+        _reserve_turboquant_decode_capacity(
+            self.prompt_cache, max(self.max_tokens, default=0)
+        )
+
+        embedding_phase_swap = getattr(self.model, "prefill_embedding_phase_swap", None)
+        if embedding_phase_swap is not None:
+            embedding_phase_swap.load()
+        cleanup_provider = getattr(self._input_embedding_provider, "cleanup", None)
+        if callable(cleanup_provider):
+            cleanup_provider()
+        self._input_embedding_provider = None
 
         self.uids = []
         self.prompt_cache = []
@@ -2432,6 +3217,8 @@ class BatchGenerator:
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
         greedy_sampling: bool = False,
+        paged_cache_factory=None,
+        owns_paged_cache_factory: bool = True,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -2451,6 +3238,27 @@ class BatchGenerator:
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling or sampler is None
+        self._paged_cache_factory = None
+        if paged_cache_factory is not None:
+            if prefill_batch_size != 1:
+                raise ValueError("paged TurboQuant requires prefill_batch_size=1")
+            if draft_model is not None and (
+                draft_kind != "mtp"
+                or os.environ.get("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "0").lower()
+                not in ("1", "true", "yes")
+            ):
+                raise ValueError(
+                    "paged TurboQuant speculation requires singleton-only MTP"
+                )
+            if quantized_kv_start != 0:
+                raise ValueError("paged TurboQuant requires quantized_kv_start=0")
+            if (
+                not turboquant_enabled(kv_bits, kv_quant_scheme)
+                or float(kv_bits) != 4.0
+            ):
+                raise ValueError("paged TurboQuant runtime requires Q4 TurboQuant KV")
+        self._paged_cache_factory = paged_cache_factory
+        self._owns_paged_cache_factory = bool(owns_paged_cache_factory)
         if self.draft_model is not None:
             compute_logprobs = False
             top_logprobs_k = 0
@@ -2494,9 +3302,116 @@ class BatchGenerator:
         self._gen_tokens_counter = 0
         self._steps_counter = 0
         self._cache_eval_interval = _get_batch_cache_eval_interval()
+        self._prefill_schedule_interval = _get_prefill_schedule_interval()
+        self._mixed_prefill_step_size = _get_mixed_prefill_step_size()
+        self._decode_prefill_cadence_step = 0
+        if self._prefill_schedule_interval > 1:
+            logger.info(
+                "Prefill cadence enabled: one mixed prefill step per %d "
+                "active decode steps.",
+                self._prefill_schedule_interval,
+            )
+        if self._mixed_prefill_step_size > 0:
+            logger.info(
+                "Mixed prefill chunk cap enabled: %d tokens while decode is active.",
+                self._mixed_prefill_step_size,
+            )
 
         self._wire_stack = contextlib.ExitStack()
         self._wire_stack.enter_context(wired_limit(model, [self._stream]))
+
+    def _sync_generation_head_residency(self) -> None:
+        model = getattr(self, "model", None)
+        residency = getattr(model, "phase_residency_manager", None)
+        if residency is None or residency.contains("lm_head") is not True:
+            return
+        generation_batch = getattr(self, "_generation_batch", ())
+        if len(generation_batch) > 0:
+            residency.acquire("lm_head", "generation")
+        else:
+            residency.release("lm_head", "generation")
+
+    def _draft_for_prompt_batch(self, batch_size: int):
+        # Batch-invariant mode compares the same AR execution across cohort
+        # sizes. Singleton MTP is a different decoding algorithm and would
+        # make a B1 request change trajectory as soon as a peer is admitted.
+        if _batch_invariant_enabled():
+            return None, None, None
+        singleton_only = os.environ.get(
+            "MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "0"
+        ).lower() in ("1", "true", "yes")
+        generation_batch = getattr(self, "_generation_batch", ())
+        if singleton_only and (
+            batch_size != 1
+            or len(generation_batch) > 0
+            or bool(getattr(self, "_unprocessed_sequences", ()))
+        ):
+            return None, None, None
+        return (
+            getattr(self, "draft_model", None),
+            getattr(self, "draft_kind", None),
+            getattr(self, "draft_block_size", None),
+        )
+
+    def _suppress_stale_singleton_mtp(self, prompt_batch) -> bool:
+        """Drop a prompt's stale MTP choice when a peer arrived mid-prefill."""
+
+        singleton_only = os.environ.get(
+            "MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "0"
+        ).lower() in ("1", "true", "yes")
+        if not (
+            singleton_only
+            and getattr(prompt_batch, "draft_kind", None) == "mtp"
+            and bool(self._unprocessed_sequences)
+        ):
+            return False
+        prompt_batch.draft_model = None
+        prompt_batch.draft_kind = None
+        prompt_batch.draft_block_size = None
+        logger.info(
+            "Suppressed stale singleton MTP at prefill boundary because a "
+            "cold peer arrived during prefill."
+        )
+        return True
+
+    def demote_mtp_to_ar(self) -> bool:
+        """Switch an active MTP cohort to AR at a completed round boundary."""
+        current = self._generation_batch
+        if not isinstance(current, SpeculativeGenerationBatch):
+            return False
+        if current.draft_kind != "mtp":
+            return False
+        batch = current.to_autoregressive()
+        if os.environ.get("MLX_VLM_MTP_REPROMOTE", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            batch.enable_mtp_repromotion(
+                current._draft_owner,
+                draft_block_size=current.draft_block_size,
+            )
+        # The stable owner is a LazyDrafter in the phase-swap runtime. Release
+        # its materialized weights as soon as the cohort switches to AR; the
+        # same owner can materialize them again when a singleton re-promotes.
+        unload = getattr(current._draft_owner, "unload", None)
+        if callable(unload):
+            unload()
+        self._generation_batch = batch
+        return True
+
+    def promote_ar_singleton_to_mtp(self) -> bool:
+        """Resume singleton MTP after its admitted AR peers have departed."""
+        if _batch_invariant_enabled():
+            return False
+        current = self._generation_batch
+        if not isinstance(current, GenerationBatch):
+            return False
+        promoted = current.to_speculative_mtp()
+        if promoted is None:
+            return False
+        self._generation_batch = promoted
+        return True
 
     # ---------------- APC integration helpers ----------------
     # Keys that are APC-only metadata; stripped from ``prompt_kwargs`` before
@@ -2595,6 +3510,8 @@ class BatchGenerator:
             "prefix_has_media": lambda pl: self._apc_prefix_has_media_tokens(
                 ids_list, pl
             ),
+            "defer_paged_q4": getattr(self, "_paged_cache_factory", None)
+            is not None,
         }
         if coordinator is not None:
             return coordinator.lookup(ids_list, **lookup_kwargs)
@@ -2641,22 +3558,54 @@ class BatchGenerator:
         max_suffix_len = max(suffix_lens)
         right_pad_per_row = [max_suffix_len - s for s in suffix_lens]
 
-        # Source inputs_embeds: every row's prompt_kwargs holds the full-prompt
-        # embeddings. Slice to suffix per-row, right-pad to max_suffix_len, stack.
-        suffix_embeds_per_row: List[mx.array] = []
-        for i, kw in enumerate(prompt_kwargs_list):
-            if kw is None or kw.get("inputs_embeds") is None:
-                raise ValueError("APC mixed prefill requires precomputed inputs_embeds")
-            full = kw["inputs_embeds"]  # [1, full_len, D]
-            suff = full[:, prefix_lens[i] :, :]
-            pad = right_pad_per_row[i]
-            if pad > 0:
-                pad_emb = mx.zeros(
-                    (suff.shape[0], pad, suff.shape[-1]), dtype=suff.dtype
+        providers = [
+            kw.get(INPUT_EMBEDDING_PROVIDER_KEY) if kw else None
+            for kw in prompt_kwargs_list
+        ]
+        suffix_provider = None
+        if any(provider is not None for provider in providers):
+            if not all(provider is not None for provider in providers):
+                raise ValueError(
+                    "batched APC restore cannot mix chunk-local and materialized embeddings"
                 )
-                suff = mx.concatenate([suff, pad_emb], axis=1)
-            suffix_embeds_per_row.append(suff)
-        inputs_embeds = mx.concatenate(suffix_embeds_per_row, axis=0)
+            suffix_providers = []
+            for provider, prefix_len in zip(providers, prefix_lens):
+                slice_from = getattr(provider, "slice_from", None)
+                if callable(slice_from):
+                    suffix_providers.append(slice_from(prefix_len))
+                    continue
+
+                def offset_provider(input_ids, *, start=0, _p=provider, _n=prefix_len):
+                    return _p(input_ids, start=_n + start)
+
+                suffix_providers.append(offset_provider)
+            suffix_provider = _BatchedInputEmbeddingProvider(
+                suffix_providers,
+                suffix_lens,
+                left_padded=False,
+            )
+
+            inputs_embeds = None
+        else:
+            # Source inputs_embeds: every row's prompt_kwargs holds the
+            # full-prompt embeddings. Slice to suffix per-row, right-pad to
+            # max_suffix_len, stack.
+            suffix_embeds_per_row: List[mx.array] = []
+            for i, kw in enumerate(prompt_kwargs_list):
+                if kw is None or kw.get("inputs_embeds") is None:
+                    raise ValueError(
+                        "APC mixed prefill requires precomputed inputs_embeds"
+                    )
+                full = kw["inputs_embeds"]  # [1, full_len, D]
+                suff = full[:, prefix_lens[i] :, :]
+                pad = right_pad_per_row[i]
+                if pad > 0:
+                    pad_emb = mx.zeros(
+                        (suff.shape[0], pad, suff.shape[-1]), dtype=suff.dtype
+                    )
+                    suff = mx.concatenate([suff, pad_emb], axis=1)
+                suffix_embeds_per_row.append(suff)
+            inputs_embeds = mx.concatenate(suffix_embeds_per_row, axis=0)
 
         # Merge prompt-side kwargs (excluding inputs_embeds, which we've just
         # rebuilt). Per-batch tensors get concatenated across rows; scalars
@@ -2673,7 +3622,10 @@ class BatchGenerator:
             prefix_len = prefix_lens[i]
             right_pad = right_pad_per_row[i]
             for k, v in kw.items():
-                if k == "inputs_embeds" or k in self._APC_PRIVATE_KEYS:
+                if (
+                    k in ("inputs_embeds", INPUT_EMBEDDING_PROVIDER_KEY)
+                    or k in self._APC_PRIVATE_KEYS
+                ):
                     continue
                 if isinstance(v, mx.array) and _prompt_kwarg_batch_size(k, v) >= 1:
                     row_v = _prompt_kwarg_row(k, v, i, batch_size)
@@ -2692,6 +3644,8 @@ class BatchGenerator:
                     merged_kwargs[k] = v
         for k, vs in per_row_keys.items():
             merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
+        if suffix_provider is not None:
+            merged_kwargs[INPUT_EMBEDDING_PROVIDER_KEY] = suffix_provider
 
         apc_mode = getattr(self, "apc_mode", "block")
         # bits + group_size + scheme so warm restore matches live _make_cache
@@ -2715,13 +3669,18 @@ class BatchGenerator:
             )
         elif apc_mode == "exact":
             row_caches = [
-                p["warm_cache"] if p is not None else self.model.make_cache()
+                (
+                    list(p.pop("warm_cache"))
+                    if p is not None
+                    else list(self.model.make_cache())
+                )
                 for p in picks
             ]
             warm_cache, _ = _apc.make_warm_batch_exact_cache_multi(
                 row_caches,
                 prefix_lens,
                 kv_quant_config=_quant_cfg,
+                consume_sources=True,
             )
         else:
             num_layers = (
@@ -2736,6 +3695,20 @@ class BatchGenerator:
             )
         if warm_cache is None:
             return None
+        paged_factory = getattr(self, "_paged_cache_factory", None)
+        if paged_factory is not None:
+            if len(sequences) != 1:
+                raise ValueError("paged APC restore requires singleton prefill")
+            try:
+                warm_cache = paged_factory.restore_cache_list(warm_cache)
+            except (OSError, TypeError, ValueError) as exc:
+                logger.warning(
+                    "Paged exact APC restore failed; falling back to cold "
+                    "prefill: %s",
+                    exc,
+                )
+                _release_cache_resources(warm_cache)
+                return None
 
         apc_meta = [
             {
@@ -2756,7 +3729,10 @@ class BatchGenerator:
         prompt_batch_cls = _generate_module_override(
             "PromptProcessingBatch", PromptProcessingBatch
         )
-        return prompt_batch_cls(
+        draft_model, draft_kind, draft_block_size = self._draft_for_prompt_batch(
+            len(sequences)
+        )
+        prompt_batch = prompt_batch_cls(
             model=self.model,
             uids=uids,
             input_ids=suffix_ids_list,
@@ -2783,11 +3759,21 @@ class BatchGenerator:
             right_pad_per_row=right_pad_per_row,
             suffix_lens=suffix_lens,
             apc_mode=apc_mode,
-            draft_model=getattr(self, "draft_model", None),
-            draft_kind=getattr(self, "draft_kind", None),
-            draft_block_size=getattr(self, "draft_block_size", None),
+            draft_model=draft_model,
+            draft_kind=draft_kind,
+            draft_block_size=draft_block_size,
             greedy_sampling=getattr(self, "greedy_sampling", False),
+            paged_cache_factory=getattr(self, "_paged_cache_factory", None),
         )
+        if suffix_provider is not None:
+            # PromptProcessingBatch now owns either the suffix view or its
+            # disk-backed replacement.  Drop the queued request's full-prompt
+            # provider so it cannot keep the embedding table alive during
+            # warm prefill.
+            for prompt_kwargs in prompt_kwargs_list:
+                if prompt_kwargs is not None:
+                    prompt_kwargs.pop(INPUT_EMBEDDING_PROVIDER_KEY, None)
+        return prompt_batch
 
     def _build_apc_meta_for_cold(
         self,
@@ -2820,9 +3806,48 @@ class BatchGenerator:
     def stream(self):
         return self._stream
 
+    def paged_pool_stats(self):
+        """Return a cheap host-side snapshot for operational logging."""
+        paged_factory = getattr(self, "_paged_cache_factory", None)
+        stats = getattr(paged_factory, "stats", None)
+        return stats() if callable(stats) else None
+
     def close(self):
-        if self._wire_stack is not None:
-            self._wire_stack.close()
+        prompt_batch = getattr(self, "_prompt_batch", None)
+        if prompt_batch is not None:
+            prompt_cache = getattr(prompt_batch, "prompt_cache", [])
+            _release_cache_resources(prompt_cache)
+            if hasattr(prompt_batch, "prompt_cache"):
+                prompt_batch.prompt_cache = []
+            self._prompt_batch = None
+        generation_batch = getattr(self, "_generation_batch", None)
+        if generation_batch is not None:
+            _release_cache_resources(getattr(generation_batch, "prompt_cache", []))
+        model = getattr(self, "model", None)
+        residency = getattr(model, "phase_residency_manager", None)
+        if (
+            residency is not None
+            and residency.contains("lm_head") is True
+        ):
+            residency.release("lm_head", "generation")
+        paged_factory = getattr(self, "_paged_cache_factory", None)
+        release_factory = getattr(paged_factory, "release", None)
+        if callable(release_factory) and getattr(
+            self, "_owns_paged_cache_factory", True
+        ):
+            final_stats = release_factory()
+            logger.info(
+                "Paged TurboQuant pool closed: used_pages=%s "
+                "high_water_pages=%s capacity_pages=%s pool_bytes=%s",
+                getattr(final_stats, "used_layer_pages", None),
+                getattr(final_stats, "high_water_layer_pages", None),
+                getattr(final_stats, "capacity_layer_pages", None),
+                getattr(final_stats, "pool_nbytes", None),
+            )
+            self._paged_cache_factory = None
+        wire_stack = getattr(self, "_wire_stack", None)
+        if wire_stack is not None:
+            wire_stack.close()
             self._wire_stack = None
 
     def __del__(self):
@@ -2893,6 +3918,7 @@ class BatchGenerator:
             if self._prompt_batch is not None and uid in self._prompt_batch.uids:
                 if len(self._prompt_batch.uids) == 1:
                     self._prompt_batch.uids = []
+                    _release_cache_resources(self._prompt_batch.prompt_cache)
                     self._prompt_batch.prompt_cache = []
                     self._prompt_batch = None
                     mx.clear_cache()
@@ -2903,6 +3929,7 @@ class BatchGenerator:
                 idx = self._generation_batch.uids.index(uid)
                 keep = [i for i in range(len(self._generation_batch.uids)) if i != idx]
                 self._generation_batch.filter(keep)
+                self._sync_generation_head_residency()
                 return True
 
             return False
@@ -2953,11 +3980,58 @@ class BatchGenerator:
             return progress()
         return []
 
+    def _advance_prompt_batch(self, prompt_batch) -> int:
+        """Advance prefill with a smaller transient chunk beside active decode."""
+
+        original_step = getattr(prompt_batch, "prefill_step_size", None)
+        cap = getattr(self, "_mixed_prefill_step_size", 0)
+        should_cap = len(self._generation_batch) > 0 and cap > 0 and original_step
+        if should_cap:
+            prompt_batch.prefill_step_size = min(int(original_step), cap)
+        try:
+            return prompt_batch.prompt_step()
+        finally:
+            if should_cap:
+                prompt_batch.prefill_step_size = original_step
+
     def _extend_generation_batch(self, gen_batch) -> None:
         if len(self._generation_batch) == 0:
             self._generation_batch = gen_batch
         else:
+            # With singleton-only speculation, a peer can begin cold prefill
+            # while the first request is already decoding with MTP.  The peer
+            # is intentionally prefetched as AR, so demote the active MTP
+            # cohort before joining the two GenerationBatch instances.
+            if isinstance(
+                self._generation_batch, SpeculativeGenerationBatch
+            ) and isinstance(gen_batch, GenerationBatch):
+                if not self.demote_mtp_to_ar():
+                    raise RuntimeError(
+                        "Cannot admit an autoregressive peer into the active "
+                        "speculative generation batch."
+                    )
+                logger.info(
+                    "Demoted active MTP cohort to AR before cold peer admission."
+                )
             self._generation_batch.extend(gen_batch)
+        if (
+            isinstance(self._generation_batch, GenerationBatch)
+            and self._generation_batch._mtp_repromotion is None
+            and self.draft_model is not None
+            and self.draft_kind == "mtp"
+            and os.environ.get("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "0").lower()
+            in ("1", "true", "yes")
+            and os.environ.get("MLX_VLM_MTP_REPROMOTE", "0").lower()
+            in ("1", "true", "yes")
+            and not _batch_invariant_enabled()
+        ):
+            # An initial multi-request cohort starts in AR because paged
+            # prefill is intentionally B1. Preserve the lazy drafter owner so
+            # the final surviving row can switch to MTP without KV migration.
+            self._generation_batch.enable_mtp_repromotion(
+                self.draft_model,
+                draft_block_size=self.draft_block_size,
+            )
 
     def _next(self, **kwargs):
         generation_responses = []
@@ -2973,37 +4047,62 @@ class BatchGenerator:
             generation_responses = self._generation_batch.next()
             self._gen_tokens_counter += len(generation_responses)
             self._steps_counter += 1
+            if len(self._generation_batch) > 0:
+                self._decode_prefill_cadence_step += 1
+            else:
+                self._decode_prefill_cadence_step = 0
+            self._sync_generation_head_residency()
             if (
                 self._cache_eval_interval > 0
                 and self._steps_counter % self._cache_eval_interval == 0
             ):
                 cache_states = getattr(self._generation_batch, "cache_states", None)
                 if callable(cache_states):
-                    mx.eval(cache_states())
+                    cache_targets = cache_states()
                 else:
-                    mx.eval([c.state for c in self._generation_batch.prompt_cache])
+                    cache_targets = _cache_eval_targets(
+                        self._generation_batch.prompt_cache
+                    )
+                if cache_targets:
+                    mx.eval(cache_targets)
                 mx.clear_cache()
             if yield_after_decode:
                 return prompt_responses, generation_responses
+        else:
+            self._decode_prefill_cadence_step = 0
 
         if (
             getattr(self._generation_batch, "is_speculative", False)
             and len(self._generation_batch) > 0
+            and getattr(self._generation_batch, "draft_kind", None) != "mtp"
         ):
             return prompt_responses, generation_responses
 
         if len(self._generation_batch) >= self.completion_batch_size:
             return prompt_responses, generation_responses
 
+        # Decode latency takes priority while a cold/warm prompt is waiting.
+        # N=1 preserves the original behavior. For N>1, exactly one out of
+        # every N active decode forwards may also advance one prefill chunk.
+        if (
+            len(self._generation_batch) > 0
+            and self._prefill_schedule_interval > 1
+            and self._decode_prefill_cadence_step
+            % self._prefill_schedule_interval
+            != 0
+        ):
+            return prompt_responses, generation_responses
+
         if self._prompt_batch is not None:
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
-                self._prompt_batch.prompt_step()
+                self._advance_prompt_batch(self._prompt_batch)
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
                 return prompt_responses, generation_responses
 
+            self._suppress_stale_singleton_mtp(self._prompt_batch)
             tic = time.perf_counter()
             gen_batch = self._prompt_batch.generate(
                 self.sampler,
@@ -3045,11 +4144,12 @@ class BatchGenerator:
                 self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
                 if self._prompt_batch.needs_processing():
                     tic = time.perf_counter()
-                    nstep = self._prompt_batch.prompt_step()
+                    nstep = self._advance_prompt_batch(self._prompt_batch)
                     elapsed = time.perf_counter() - tic
                     self._prompt_time_counter += elapsed
                     self._record_prompt_batch_time(self._prompt_batch, elapsed)
                 else:
+                    self._suppress_stale_singleton_mtp(self._prompt_batch)
                     tic = time.perf_counter()
                     gen_batch = self._prompt_batch.generate(
                         self.sampler,
@@ -3085,6 +4185,9 @@ class BatchGenerator:
             prompt_batch_cls = _generate_module_override(
                 "PromptProcessingBatch", PromptProcessingBatch
             )
+            draft_model, draft_kind, draft_block_size = self._draft_for_prompt_batch(
+                len(sequences)
+            )
             self._prompt_batch = prompt_batch_cls(
                 model=self.model,
                 uids=uids,
@@ -3109,16 +4212,17 @@ class BatchGenerator:
                 apc_manager=self.apc_manager,
                 apc_coordinator=getattr(self, "apc", None),
                 apc_mode=self.apc_mode,
-                draft_model=getattr(self, "draft_model", None),
-                draft_kind=getattr(self, "draft_kind", None),
-                draft_block_size=getattr(self, "draft_block_size", None),
+                draft_model=draft_model,
+                draft_kind=draft_kind,
+                draft_block_size=draft_block_size,
                 greedy_sampling=getattr(self, "greedy_sampling", False),
+                paged_cache_factory=getattr(self, "_paged_cache_factory", None),
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
-                n = self._prompt_batch.prompt_step()
+                n = self._advance_prompt_batch(self._prompt_batch)
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)

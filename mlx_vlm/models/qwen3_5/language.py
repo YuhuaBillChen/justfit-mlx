@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache, partial
 from typing import Any, List, Optional
 
@@ -791,6 +792,11 @@ def _qwen3_5_left_padded_attention(
     scale: float,
     mask: Optional[mx.array],
 ) -> Optional[mx.array]:
+    segmented_attention = getattr(cache, "segmented_attention", None)
+    if callable(segmented_attention):
+        output = segmented_attention(queries, scale=scale, mask=mask)
+        if output is not None:
+            return output
     if hasattr(cache, "bits") or queries.ndim != 4 or keys.ndim != 4:
         return None
 
@@ -1369,6 +1375,7 @@ class Qwen3_5Model(nn.Module):
 
 class LanguageModel(nn.Module):
     requires_uniform_batch_acceptance = True
+    supports_skip_logits = True
 
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
@@ -1381,6 +1388,40 @@ class LanguageModel(nn.Module):
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def _batch_invariant_decode(
+        self,
+        inputs,
+        *,
+        cache,
+        inputs_embeds=None,
+        position_ids=None,
+        skip_logits=False,
+    ):
+        return _EXACT_SPECULATIVE_VERIFIER(
+            self,
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            return_hidden=True,
+            return_shared_kv=True,
+            return_gdn_states=False,
+            skip_logits=skip_logits,
+        )
+
+    def _supports_batch_invariant_decode(self):
+        if os.environ.get("MLX_VLM_BATCH_INVARIANT", "0").lower() not in (
+            "1",
+            "true",
+            "yes",
+        ):
+            return False
+        if self.args.tie_word_embeddings:
+            return not isinstance(self.model.embed_tokens, nn.QuantizedEmbedding)
+        return not isinstance(
+            self.lm_head, nn.QuantizedLinear
+        ) or _EXACT_SPECULATIVE_VERIFIER.can_quantized_head(self.lm_head)
 
     def chunked_prefill_policy(
         self,

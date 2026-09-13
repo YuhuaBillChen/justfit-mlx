@@ -65,6 +65,7 @@ class APCCoordinator:
         safe_lookup_min: int,
         suffix_is_text_only: Callable[[int], bool],
         prefix_has_media: Callable[[int], bool],
+        defer_paged_q4: bool = False,
     ) -> Optional[dict]:
         if not self.enabled:
             return None
@@ -78,6 +79,7 @@ class APCCoordinator:
             safe_lookup_min=safe_lookup_min,
             suffix_is_text_only=suffix_is_text_only,
             prefix_has_media=prefix_has_media,
+            defer_paged_q4=defer_paged_q4,
         )
         if hit is not None:
             hit["cache_plan"] = self.plan
@@ -145,13 +147,18 @@ class APCCoordinator:
 
         if self.is_checkpoint:
             row_caches = [
-                pick["warm_cache"] if pick is not None else self.fresh_cache()
+                (
+                    list(pick.pop("warm_cache"))
+                    if pick is not None
+                    else self.fresh_cache()
+                )
                 for pick in picks
             ]
             return make_warm_batch_exact_cache_multi(
                 row_caches,
                 prefix_lens,
                 kv_quant_config=kv_quant_config,
+                consume_sources=True,
             )
         return make_warm_batch_kv_cache_multi(
             list(picks),
@@ -206,7 +213,10 @@ class APCCoordinator:
         if snapshot is None:
             return False
         return self.manager.store_exact_cache(
-            token_ids, snapshot, extra_hash=extra_hash
+            token_ids,
+            snapshot,
+            extra_hash=extra_hash,
+            take_ownership=True,
         )
 
     def commit(
@@ -214,6 +224,7 @@ class APCCoordinator:
         prompt_cache: Sequence[Any],
         token_ids: Sequence[int],
         *,
+        checkpoint_stored: bool = False,
         batch_idx: Optional[int] = None,
         extra_hash: int = 0,
         skip_first_n_tokens: int = 0,
@@ -224,6 +235,8 @@ class APCCoordinator:
             return False
         if self.is_checkpoint:
             try:
+                if checkpoint_stored:
+                    return True
                 return self.store_checkpoint(
                     token_ids,
                     prompt_cache,

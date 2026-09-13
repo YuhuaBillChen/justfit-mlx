@@ -734,6 +734,9 @@ class TestBatchTurboQuantParity:
         cloned = _clone_prompt_cache_for_apc(row)
         assert cloned is not None
         assert isinstance(cloned[0], TurboQuantKVCache)
+        assert cloned[0].keys is not row[0].keys
+        assert cloned[0].values is not row[0].values
+        assert cloned[0].meta_state == row[0].meta_state
 
     def test_layer_kv_for_apc_batch_turbo(self):
         from mlx_vlm.apc import layer_kv_for_apc

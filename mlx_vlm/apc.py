@@ -624,6 +624,115 @@ class APCExactCacheEntry:
 
 
 @dataclass(frozen=True)
+class PagedTurboQuantDiskRestore:
+    """Lazy page-run source for an exact APC restore into a paged pool.
+
+    Keeping only safetensors descriptors here is intentional: materializing
+    every Q4 layer during lookup would recreate a long-context contiguous
+    staging cache before :class:`PagedTurboQuantPoolRegistry` can consume it.
+    The registry reads and releases one layer/run at a time instead.
+    """
+
+    path: Path
+    data_start: int
+    run_entries: Tuple[Tuple[dict, dict, dict, dict], ...]
+    offset: int
+    bits: float
+    key_bits: float
+    value_bits: float
+    seed: int
+    head_dim: int
+
+    @property
+    def state(self) -> tuple:
+        """No resident MLX tensors exist until the paged pool consumes us."""
+
+        return ()
+
+    def prefix_cache_merge(self, entries, prefix_lens):
+        """Pass through the only layout supported by paged APC: one row."""
+
+        if (
+            len(entries) != 1
+            or entries[0] is not self
+            or len(prefix_lens) != 1
+            or int(prefix_lens[0]) != self.offset
+        ):
+            return None
+        return self
+
+    def iter_packed_page_runs(self):
+        """Read physical page runs lazily in their on-disk page-major layout."""
+
+        for entries in self.run_entries:
+            values = tuple(
+                _read_safetensors_tensor(self.path, self.data_start, entry)
+                for entry in entries
+            )
+            if any(value is None for value in values):
+                raise OSError(f"failed to read paged APC payload from {self.path}")
+            yield values
+            # The consumer evaluates the destination write before requesting
+            # the next run. Drop our reference first so allocator cleanup does
+            # not make adjacent disk runs overlap in memory.
+            values = None
+            mx.clear_cache()
+
+    def materialize_contiguous(self, eval_targets: List[mx.array]):
+        """Compatibility path for consumers without a paged pool."""
+
+        from .turboquant import TurboQuantKVCache, TurboQuantMSEState
+
+        cache = TurboQuantKVCache(
+            bits=self.bits,
+            seed=self.seed,
+            key_bits=self.key_bits,
+            value_bits=self.value_bits,
+        )
+        if self.offset == 0:
+            return cache
+
+        def logical_chunk(value: mx.array) -> mx.array:
+            if value.ndim == 3:
+                pages, heads, width = value.shape
+                return mx.transpose(value, (1, 0, 2)).reshape(
+                    1, heads, pages * width
+                )
+            if value.ndim == 4:
+                pages, heads, width, packed = value.shape
+                return mx.transpose(value, (1, 0, 2, 3)).reshape(
+                    1, heads, pages * width, packed
+                )
+            raise ValueError("invalid paged APC tensor rank")
+
+        key_norms = []
+        key_indices = []
+        value_norms = []
+        value_indices = []
+        for kn, ki, vn, vi in self.iter_packed_page_runs():
+            eval_targets.extend((kn, ki, vn, vi))
+            key_norms.append(logical_chunk(kn))
+            key_indices.append(logical_chunk(ki))
+            value_norms.append(logical_chunk(vn))
+            value_indices.append(logical_chunk(vi))
+        keys = TurboQuantMSEState(
+            mx.concatenate(key_norms, axis=2)[..., : self.offset],
+            mx.concatenate(key_indices, axis=2)[:, :, : self.offset, :],
+        )
+        values = TurboQuantMSEState(
+            mx.concatenate(value_norms, axis=2)[..., : self.offset],
+            mx.concatenate(value_indices, axis=2)[:, :, : self.offset, :],
+        )
+        dummy = mx.zeros((1, 1, 1, self.head_dim), dtype=mx.bfloat16)
+        cache._ensure_codecs(dummy, dummy)
+        cache.keys = keys
+        cache.values = values
+        cache.offset = self.offset
+        eval_targets.extend((keys.norms, keys.indices, values.norms, values.indices))
+        return cache
+
+
+@dataclass(frozen=True)
 class _DiskLayerMajorBlock:
     """Per-block metadata for a direct layer-major disk write."""
 
@@ -927,6 +1036,79 @@ def _decode_checkpoint_tree(structure: dict, load_array) -> Any:
     raise ValueError(f"unsupported checkpoint tree node: {kind!r}")
 
 
+def _encode_turboquant_state(
+    value: Any,
+    tensor_prefix: str,
+    arrays: Dict[str, mx.array],
+    counter: List[int],
+) -> Optional[dict]:
+    """Encode a packed TurboQuant state while preserving NamedTuple types."""
+    if isinstance(value, mx.array):
+        name = f"{tensor_prefix}_t{counter[0]}"
+        counter[0] += 1
+        arrays[name] = value
+        return {"kind": "array", "name": name}
+    if value is None:
+        return {"kind": "none"}
+    if isinstance(value, tuple):
+        from . import turboquant as tq
+
+        state_types = {
+            cls.__name__
+            for cls in (
+                tq.TurboQuantMSEState,
+                tq.TurboQuantProdState,
+                tq.TurboQuantPolarState,
+                tq.TurboQuantPolarProdState,
+                tq.TurboQuantSplitState,
+            )
+        }
+        items = [
+            _encode_turboquant_state(item, tensor_prefix, arrays, counter)
+            for item in value
+        ]
+        if any(item is None for item in items):
+            return None
+        type_name = type(value).__name__
+        if type_name not in state_types:
+            return None
+        return {"kind": "state", "type": type_name, "items": items}
+    return None
+
+
+def _decode_turboquant_state(structure: dict, load_array) -> Any:
+    """Decode a packed TurboQuant state produced by its exact-APC schema."""
+    kind = structure.get("kind")
+    if kind == "array":
+        return load_array(structure["name"])
+    if kind == "none":
+        return None
+    if kind != "state":
+        raise ValueError(f"unsupported TurboQuant state node: {kind!r}")
+
+    from . import turboquant as tq
+
+    state_types = {
+        cls.__name__: cls
+        for cls in (
+            tq.TurboQuantMSEState,
+            tq.TurboQuantProdState,
+            tq.TurboQuantPolarState,
+            tq.TurboQuantPolarProdState,
+            tq.TurboQuantSplitState,
+        )
+    }
+    state_type = state_types.get(structure.get("type"))
+    if state_type is None:
+        raise ValueError("unknown TurboQuant state type")
+    return state_type(
+        *(
+            _decode_turboquant_state(item, load_array)
+            for item in structure.get("items", ())
+        )
+    )
+
+
 def _resolve_checkpoint_class(module_name: str, qualname: str) -> Optional[type]:
     """Resolve an importable cache class recorded by the local disk tier."""
     if not module_name.startswith("mlx_vlm.") or "<locals>" in qualname:
@@ -989,6 +1171,9 @@ def _mlx_array_from_safetensors_bytes(buf, entry: dict) -> Optional[mx.array]:
         return None
     _, buffer_format, mlx_dtype, bitcast_to = dtype_info
     try:
+        # F16/BF16 enter through a raw uint16 host view and are bitcast below.
+        # This avoids the inconsistently supported memoryview ``e`` format
+        # without numerically converting the stored IEEE-754 bit patterns.
         view = memoryview(buf).cast(buffer_format)
         if len(view) != _numel(shape):
             return None
@@ -1583,6 +1768,7 @@ class DiskBlockStore:
         wait_in_flight_ms: float = 0.0,
         min_capacity_tokens: Optional[int] = None,
         prefix_len: Optional[int] = None,
+        defer_paged_q4: bool = False,
     ) -> Optional[Tuple[Tuple[int, ...], int, List[Any]]]:
         with self._index_lock:
             path = self._exact_index.get(cache_hash)
@@ -1596,7 +1782,10 @@ class DiskBlockStore:
             if path is None:
                 return None
         return self._load_exact_cache_file(
-            path, min_capacity_tokens=min_capacity_tokens, prefix_len=prefix_len
+            path,
+            min_capacity_tokens=min_capacity_tokens,
+            prefix_len=prefix_len,
+            defer_paged_q4=defer_paged_q4,
         )
 
     def exact_cache_bytes(self, cache_hash: int) -> int:
@@ -1625,6 +1814,7 @@ class DiskBlockStore:
         *,
         min_capacity_tokens: Optional[int],
         prefix_len: Optional[int] = None,
+        defer_paged_q4: bool = False,
     ) -> Optional[Tuple[Tuple[int, ...], int, List[Any]]]:
         parsed = self._open_shard_header(path)
         if parsed is None:
@@ -1668,6 +1858,7 @@ class DiskBlockStore:
                 min_capacity_tokens=min_capacity_tokens,
                 eval_targets=eval_targets,
                 prefix_len=trim_len,
+                defer_paged_q4=defer_paged_q4,
             )
             if loaded is None:
                 return None
@@ -1691,10 +1882,104 @@ class DiskBlockStore:
         min_capacity_tokens: Optional[int],
         eval_targets: List[mx.array],
         prefix_len: Optional[int] = None,
+        defer_paged_q4: bool = False,
     ) -> Optional[Any]:
         from .models import cache as lm_cache
 
         kind = metadata.get(f"{prefix}_kind")
+        if kind == "paged_turboquant_q4":
+            try:
+                bits = float(metadata[f"{prefix}_bits"])
+                key_bits = float(metadata[f"{prefix}_key_bits"])
+                value_bits = float(metadata[f"{prefix}_value_bits"])
+                seed = int(metadata.get(f"{prefix}_seed", "0"))
+                offset = int(metadata.get(f"{prefix}_offset", "0"))
+                head_dim = int(metadata[f"{prefix}_head_dim"])
+                run_count = int(metadata.get(f"{prefix}_run_count", "0"))
+            except (KeyError, TypeError, ValueError):
+                return None
+            if offset < 0 or run_count < 0 or (offset > 0 and run_count == 0):
+                return None
+            run_entries = []
+            for run in range(run_count):
+                entries = tuple(
+                    tensor_entries.get(f"{prefix}_r{run}_{suffix}")
+                    for suffix in ("kn", "ki", "vn", "vi")
+                )
+                if any(entry is None for entry in entries):
+                    return None
+                run_entries.append(entries)
+            lazy_restore = PagedTurboQuantDiskRestore(
+                path=path,
+                data_start=data_start,
+                run_entries=tuple(run_entries),
+                offset=offset,
+                bits=bits,
+                key_bits=key_bits,
+                value_bits=value_bits,
+                seed=seed,
+                head_dim=head_dim,
+            )
+            if defer_paged_q4:
+                return lazy_restore
+            try:
+                return lazy_restore.materialize_contiguous(eval_targets)
+            except (OSError, TypeError, ValueError, AttributeError):
+                return None
+
+        if kind == "turboquant_kv":
+            from .turboquant import TurboQuantKVCache
+
+            try:
+                bits = float(metadata[f"{prefix}_bits"])
+                key_bits = float(metadata[f"{prefix}_key_bits"])
+                value_bits = float(metadata[f"{prefix}_value_bits"])
+                seed = int(metadata.get(f"{prefix}_seed", "0"))
+                offset = int(metadata.get(f"{prefix}_offset", "0"))
+            except (KeyError, TypeError, ValueError):
+                return None
+            cache = TurboQuantKVCache(
+                bits=bits,
+                seed=seed,
+                key_bits=key_bits,
+                value_bits=value_bits,
+            )
+            if metadata.get(f"{prefix}_empty", "0") == "1":
+                return cache
+            try:
+                head_dim = int(metadata[f"{prefix}_head_dim"])
+                key_tree = json.loads(metadata[f"{prefix}_keys"])
+                value_tree = json.loads(metadata[f"{prefix}_values"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if head_dim <= 0:
+                return None
+
+            loaded_arrays: List[mx.array] = []
+
+            def load_array(name: str) -> mx.array:
+                entry = tensor_entries.get(name)
+                if entry is None:
+                    raise KeyError(name)
+                array = _read_safetensors_tensor(path, data_start, entry)
+                if array is None:
+                    raise ValueError(name)
+                loaded_arrays.append(array)
+                return array
+
+            try:
+                keys = _decode_turboquant_state(key_tree, load_array)
+                values = _decode_turboquant_state(value_tree, load_array)
+                dummy = mx.zeros((1, 1, 1, head_dim), dtype=mx.bfloat16)
+                cache._ensure_codecs(dummy, dummy)
+                cache.keys = keys
+                cache.values = values
+                cache.offset = offset
+            except (KeyError, TypeError, ValueError, AttributeError):
+                return None
+            eval_targets.extend(loaded_arrays)
+            return cache
+
         if kind == "ring_kv":
             from .models.unlimited_ocr.language import RingSlidingKVCache
 
@@ -2537,6 +2822,30 @@ class DiskBlockStore:
         )
         return self._enqueue_exact_snapshot(snapshot, synchronous=synchronous)
 
+    def save_exact_cache_sync(
+        self,
+        cache_hash: int,
+        token_ids: Sequence[int],
+        extra_hash: int,
+        prompt_cache: Sequence[Any],
+    ) -> None:
+        """Serialize borrowed cache views before generation can mutate them."""
+        token_tuple = tuple(int(t) for t in token_ids)
+        if not token_tuple or not prompt_cache:
+            return
+        snapshot = _DiskExactCacheSnapshot(
+            cache_hash=int(cache_hash),
+            token_ids=token_tuple,
+            extra_hash=int(extra_hash),
+            prompt_cache=list(prompt_cache),
+        )
+        path = self._shard_path(self._exact_id_for(int(cache_hash)))
+        if path.exists():
+            with self._index_lock:
+                self._exact_index.setdefault(int(cache_hash), path)
+            return
+        self._write_exact_cache_snapshot(path, snapshot)
+
     def save_layer_major_blocks(
         self,
         blocks: List[_DiskLayerMajorBlock],
@@ -2718,6 +3027,61 @@ class DiskBlockStore:
         metadata: dict[str, str],
     ) -> bool:
         from .models import cache as lm_cache
+
+        try:
+            from .turboquant import TurboQuantKVCache, _slice_state
+        except ImportError:
+            TurboQuantKVCache = ()
+
+        page_runs = getattr(c, "apc_page_runs", None)
+        if callable(page_runs):
+            owner = getattr(c, "cache", None)
+            storage = getattr(owner, "storage", None)
+            if storage is None:
+                return False
+            offset = int(getattr(c, "sequence_length", 0) or 0)
+            metadata[f"{prefix}_kind"] = "paged_turboquant_q4"
+            metadata[f"{prefix}_offset"] = str(offset)
+            metadata[f"{prefix}_bits"] = str(float(owner.bits))
+            metadata[f"{prefix}_key_bits"] = str(float(owner.key_bits))
+            metadata[f"{prefix}_value_bits"] = str(float(owner.value_bits))
+            metadata[f"{prefix}_seed"] = str(int(owner.seed))
+            metadata[f"{prefix}_head_dim"] = str(
+                int(getattr(owner.key_codec, "dim", 0) or 0)
+            )
+            runs = tuple(page_runs())
+            metadata[f"{prefix}_run_count"] = str(len(runs))
+            for run, (start, stop) in enumerate(runs):
+                arrays[f"{prefix}_r{run}_kn"] = storage.keys.norms[start:stop]
+                arrays[f"{prefix}_r{run}_ki"] = storage.keys.indices[start:stop]
+                arrays[f"{prefix}_r{run}_vn"] = storage.values.norms[start:stop]
+                arrays[f"{prefix}_r{run}_vi"] = storage.values.indices[start:stop]
+            return offset == 0 or bool(runs)
+
+        if isinstance(c, TurboQuantKVCache):
+            offset = int(getattr(c, "offset", 0) or 0)
+            metadata[f"{prefix}_kind"] = "turboquant_kv"
+            metadata[f"{prefix}_offset"] = str(offset)
+            metadata[f"{prefix}_bits"] = str(float(c.bits))
+            metadata[f"{prefix}_key_bits"] = str(float(c.key_bits))
+            metadata[f"{prefix}_value_bits"] = str(float(c.value_bits))
+            metadata[f"{prefix}_seed"] = str(int(c.seed))
+            if c.keys is None or c.values is None or offset <= 0:
+                metadata[f"{prefix}_empty"] = "1"
+                return True
+            head_dim = getattr(getattr(c, "key_codec", None), "dim", 0)
+            if not head_dim:
+                return False
+            keys = _slice_state(c.keys, offset)
+            values = _slice_state(c.values, offset)
+            key_tree = _encode_turboquant_state(keys, f"{prefix}_k", arrays, [0])
+            value_tree = _encode_turboquant_state(values, f"{prefix}_v", arrays, [0])
+            if key_tree is None or value_tree is None:
+                return False
+            metadata[f"{prefix}_head_dim"] = str(int(head_dim))
+            metadata[f"{prefix}_keys"] = json.dumps(key_tree, separators=(",", ":"))
+            metadata[f"{prefix}_values"] = json.dumps(value_tree, separators=(",", ":"))
+            return True
 
         if (
             type(c).__name__ == "RingSlidingKVCache"
@@ -3189,6 +3553,16 @@ class APCManager:
         self._prefill_reserve_bytes = 0
         self._prefill_tokens = 0
 
+    @property
+    def disk_only(self) -> bool:
+        """Whether exact checkpoints persist only in the disk tier."""
+        return self.disk is not None and self._exact_cache_max <= 0
+
+    @property
+    def direct_disk_writes(self) -> bool:
+        """Whether disk-only exact APC may synchronously borrow live views."""
+        return self.disk_only and _env_truthy("APC_EXACT_DIRECT_DISK_WRITE")
+
     def _record_disk_writes(self, count: int) -> None:
         with self.lock:
             self.stats.disk_writes += int(count)
@@ -3345,12 +3719,63 @@ class APCManager:
         self._make_room()
 
     # ---------- Public API ----------
+    def peek_exact_prefix_length(
+        self,
+        token_ids: Sequence[int],
+        extra_hash: int = 0,
+        max_prefix_tokens: Optional[int] = None,
+        min_prefix_tokens: int = 0,
+    ) -> int:
+        """Return the longest exact prefix without restoring its KV payload.
+
+        Scheduler admission can use this metadata-only probe to estimate the
+        prompt suffix that still needs model prefill.  It deliberately leaves
+        cache hit statistics and the in-memory LRU unchanged; the subsequent
+        lookup records the real hit if the request is admitted.
+        """
+        if self._exact_cache_max <= 0 and self.disk is None:
+            return 0
+        token_tuple = tuple(int(t) for t in token_ids)
+        max_len = len(token_tuple) - 1
+        if max_prefix_tokens is not None and max_prefix_tokens > 0:
+            max_len = min(max_len, int(max_prefix_tokens))
+        if max_len <= min_prefix_tokens:
+            return 0
+
+        prefix_len = 0
+        with self.lock:
+            if self._exact_cache_max > 0:
+                for entry in self._exact_cache.values():
+                    candidate_len = len(entry.token_ids)
+                    if (
+                        entry.extra_hash != extra_hash
+                        or candidate_len <= min_prefix_tokens
+                        or candidate_len > max_len
+                        or token_tuple[:candidate_len] != entry.token_ids
+                    ):
+                        continue
+                    prefix_len = max(prefix_len, candidate_len)
+
+        disk = self.disk
+        if disk is None or prefix_len >= max_len:
+            return prefix_len
+        disk_match = disk.find_exact_prefix(
+            token_tuple,
+            extra_hash=extra_hash,
+            max_prefix_tokens=max_prefix_tokens,
+            min_prefix_tokens=max(min_prefix_tokens, prefix_len),
+        )
+        if disk_match is not None:
+            prefix_len = max(prefix_len, int(disk_match[1]))
+        return prefix_len
+
     def lookup_exact_cache(
         self,
         token_ids: Sequence[int],
         extra_hash: int = 0,
         max_prefix_tokens: Optional[int] = None,
         min_prefix_tokens: int = 0,
+        defer_paged_q4: bool = False,
     ) -> Tuple[Optional[List[Any]], int]:
         """Return the longest restorable prefix from prompt-cache snapshots.
 
@@ -3442,6 +3867,7 @@ class APCManager:
                     cache_hash,
                     min_capacity_tokens=prompt_capacity_tokens,
                     prefix_len=disk_prefix_len,
+                    defer_paged_q4=defer_paged_q4,
                 )
                 if loaded is not None:
                     stored_tokens, stored_extra_hash, prompt_cache = loaded
@@ -3526,8 +3952,14 @@ class APCManager:
         prompt_cache: Sequence[Any],
         *,
         extra_hash: int = 0,
+        take_ownership: bool = False,
     ) -> bool:
-        """Store a full prompt-cache snapshot for exact-prefix reuse."""
+        """Store a full prompt-cache snapshot for exact-prefix reuse.
+
+        By default the manager defensively clones the supplied cache. Callers
+        may set *take_ownership* only when every entry is already a detached
+        snapshot that they will not access or mutate after this call.
+        """
         if len(token_ids) < self.exact_cache_min_tokens:
             return False
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
@@ -4311,11 +4743,17 @@ def _collect_mx_arrays(x: Any, out: List[mx.array]) -> None:
 def _merge_exact_cache_entries(
     entries: Sequence[Any],
     prefix_lens: Sequence[int],
+    *,
+    consume_sources: bool = False,
 ) -> Any:
     """Merge single-row exact snapshots via the registered cache adapter."""
     from .apc_adapters import merge_cache_entries
 
-    return merge_cache_entries(entries, prefix_lens)
+    return merge_cache_entries(
+        entries,
+        prefix_lens,
+        consume_sources=consume_sources,
+    )
 
 
 def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> Any:
@@ -4340,6 +4778,33 @@ def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> 
     )
 
 
+def _align_exact_batch_cache_to_kv_policy(
+    cache: Any,
+    kv_quant_config: dict,
+    *,
+    layer_idx: int,
+    num_layers: int,
+) -> Any:
+    """Align one exact-restored layer with the live KV policy."""
+    from .models.cache import BatchKVCache, should_quantize_kv_layer
+
+    if not should_quantize_kv_layer(layer_idx, num_layers) or not isinstance(
+        cache, BatchKVCache
+    ):
+        return cache
+    left_padding = [int(x) for x in cache.left_padding.tolist()]
+    if cache.keys is None or int(cache._idx) == 0:
+        return _empty_quant_batch_cache(left_padding, kv_quant_config)
+    return _fill_batch_layer_cache(
+        cache.keys[..., : int(cache._idx), :],
+        cache.values[..., : int(cache._idx), :],
+        left_padding=left_padding,
+        offset=[int(x) for x in cache.offset.tolist()],
+        quantize=True,
+        kv_quant_config=kv_quant_config,
+    )
+
+
 def _align_exact_batch_caches_to_kv_policy(
     caches: List[Any],
     kv_quant_config: dict,
@@ -4350,46 +4815,32 @@ def _align_exact_batch_caches_to_kv_policy(
     and pass through unchanged. Older float snapshots still need conversion
     so continuous-batching joins use the same per-layer types as cold rows.
     """
-    from .models.cache import BatchKVCache, should_quantize_kv_layer
-
-    n = len(caches)
-    out: List[Any] = []
-    for layer_idx, c in enumerate(caches):
-        quantize = should_quantize_kv_layer(layer_idx, n)
-        if not quantize or not isinstance(c, BatchKVCache):
-            out.append(c)
-            continue
-        left_padding = [int(x) for x in c.left_padding.tolist()]
-        if c.keys is None or int(c._idx) == 0:
-            out.append(_empty_quant_batch_cache(left_padding, kv_quant_config))
-            continue
-        merged_k = c.keys[..., : int(c._idx), :]
-        merged_v = c.values[..., : int(c._idx), :]
-        offset = [int(x) for x in c.offset.tolist()]
-        out.append(
-            _fill_batch_layer_cache(
-                merged_k,
-                merged_v,
-                left_padding=left_padding,
-                offset=offset,
-                quantize=True,
-                kv_quant_config=kv_quant_config,
-            )
+    return [
+        _align_exact_batch_cache_to_kv_policy(
+            cache,
+            kv_quant_config,
+            layer_idx=layer_idx,
+            num_layers=len(caches),
         )
-    return out
+        for layer_idx, cache in enumerate(caches)
+    ]
 
 
 def make_warm_batch_exact_cache_multi(
     row_caches: Sequence[Sequence[Any]],
     prefix_lens: Sequence[int],
     kv_quant_config: Optional[dict] = None,
+    *,
+    consume_sources: bool = False,
 ) -> Tuple[Optional[List[Any]], int]:
     """Merge single-row exact-cache snapshots into batch-aware caches.
 
     Native quantized rows are merged in their packed representation. When
     *kv_quant_config* is provided, legacy float ``BatchKVCache`` snapshots are
     converted to match live ``_make_cache``. Hybrid non-KV entries are
-    unchanged.
+    unchanged. When *consume_sources* is true, each row must be a list; its
+    entries are cleared as their materialized batch layers take ownership of
+    the restored state.
     """
 
     if not row_caches:
@@ -4399,44 +4850,71 @@ def make_warm_batch_exact_cache_multi(
     num_entries = len(row_caches[0])
     if any(len(row) != num_entries for row in row_caches):
         return None, 0
+    if consume_sources and any(not isinstance(row, list) for row in row_caches):
+        raise TypeError("consume_sources requires mutable cache-row lists")
 
     out: List[Any] = []
     for entry_idx in range(num_entries):
         merged = _merge_exact_cache_entries(
             [row[entry_idx] for row in row_caches],
             prefix_lens,
+            consume_sources=consume_sources,
         )
         if merged is None:
             return None, 0
+        if consume_sources and kv_quant_config is not None:
+            merged = _align_exact_batch_cache_to_kv_policy(
+                merged,
+                kv_quant_config,
+                layer_idx=entry_idx,
+                num_layers=num_entries,
+            )
         out.append(merged)
+        if consume_sources:
+            eval_targets: List[mx.array] = []
+            _collect_mx_arrays(merged.state, eval_targets)
+            if eval_targets:
+                mx.eval(eval_targets)
+            for row in row_caches:
+                if not isinstance(row, list):  # Guarded above; narrows the type.
+                    raise TypeError("consume_sources requires mutable cache-row lists")
+                row[entry_idx] = None
+            mx.clear_cache()
 
-    if kv_quant_config is not None:
-        out = _align_exact_batch_caches_to_kv_policy(out, kv_quant_config)
-
-    eval_targets: List[mx.array] = []
-    for c in out:
-        _collect_mx_arrays(c.state, eval_targets)
-    if eval_targets:
-        mx.eval(eval_targets)
+    if not consume_sources:
+        if kv_quant_config is not None:
+            out = _align_exact_batch_caches_to_kv_policy(out, kv_quant_config)
+        eval_targets: List[mx.array] = []
+        for cache in out:
+            _collect_mx_arrays(cache.state, eval_targets)
+        if eval_targets:
+            mx.eval(eval_targets)
     return out, max(prefix_lens) if prefix_lens else 0
 
 
 def extract_prompt_cache_from_batch(
     batch_caches: Sequence[Any],
     batch_idx: int,
+    *,
+    detach: bool = True,
 ) -> Optional[List[Any]]:
     """Extract one row from batch-aware caches as single-row cache objects."""
 
     out: List[Any] = []
     eval_targets: List[mx.array] = []
     for c in batch_caches:
-        extract = getattr(c, "extract", None)
+        extract = (
+            getattr(c, "extract", None)
+            if detach
+            else getattr(c, "extract_view", getattr(c, "extract", None))
+        )
         if not callable(extract):
             return None
         extracted = extract(batch_idx)
         out.append(extracted)
-        _collect_mx_arrays(extracted.state, eval_targets)
-    if eval_targets:
+        if detach:
+            _collect_mx_arrays(extracted.state, eval_targets)
+    if detach and eval_targets:
         mx.eval(eval_targets)
     return out
 
@@ -4649,6 +5127,7 @@ def apc_lookup_plan(
     safe_lookup_min: int,
     suffix_is_text_only,
     prefix_has_media,
+    defer_paged_q4: bool = False,
 ) -> Optional[dict]:
     """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
     n = len(ids_list)
@@ -4657,7 +5136,10 @@ def apc_lookup_plan(
 
     if apc_mode == "exact":
         exact_cache, exact_prefix_len = manager.lookup_exact_cache(
-            ids_list, extra_hash=extra_hash, min_prefix_tokens=safe_lookup_min
+            ids_list,
+            extra_hash=extra_hash,
+            min_prefix_tokens=safe_lookup_min,
+            defer_paged_q4=defer_paged_q4,
         )
         if exact_cache is not None and 0 < exact_prefix_len < n:
             if not suffix_is_text_only(exact_prefix_len):
@@ -4683,6 +5165,7 @@ def apc_lookup_plan(
             ids_list,
             extra_hash=extra_hash,
             min_prefix_tokens=max(prefix_len, safe_lookup_min),
+            defer_paged_q4=defer_paged_q4,
         )
     warm_cache = None
     disk_prefix_len = 0

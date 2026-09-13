@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from functools import lru_cache
 from typing import NamedTuple, Optional, Tuple
 
@@ -12,6 +13,24 @@ from .models.cache import _BaseCache, create_attention_mask, create_causal_mask
 DEFAULT_TURBOQUANT_SEED = 0
 _EPS = 1e-6
 _POLAR_MAX_LEVELS = 4
+_MTP_VERIFY_MAX_APPEND = 15
+
+
+def _fused_dequantize_enabled() -> bool:
+    """Use the approximate FP16 dequantizer only on the fast path."""
+    batch_invariant = os.environ.get("MLX_VLM_BATCH_INVARIANT", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    return os.environ.get("MLX_VLM_TQ_FUSED_DEQUANT") == "1" and not batch_invariant
+
+
+def _should_eval_cache_append(n_new: int, offset: int) -> bool:
+    """Bound prefill graphs without synchronizing each small MTP verify append."""
+    lazy_verify = os.environ.get("MLX_VLM_TQ_LAZY_VERIFY_APPEND") == "1"
+    is_small_verify = lazy_verify and 1 < n_new <= _MTP_VERIFY_MAX_APPEND
+    return (n_new > 1 and not is_small_verify) or (offset % 50 == 0)
 
 
 def _metal_available() -> bool:
@@ -2300,7 +2319,12 @@ def _gen_unrolled_value(bits: int, n_elems: int, bit_off_var: str = "") -> str:
 
 
 @lru_cache(maxsize=None)
-def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
+def _fused_mse_decode_kernel(
+    key_bits: int,
+    val_bits: int,
+    dim: int = 256,
+    left_padded: bool = False,
+):
     """Fused MSE decode: 32 simdgroups × 32 lanes, online softmax + weighted sum."""
     if not _metal_available() or key_bits <= 0 or val_bits <= 0:
         return None
@@ -2331,6 +2355,8 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
         auto token_count = key_norms_shape[2];
         auto kv_heads = key_norms_shape[1];
         auto bh = bqh / RepeatCount;  // map q_head -> kv_head
+        auto batch_idx = bh / kv_heads;
+        int first_token = {"left_padding[batch_idx]" if left_padded else "0"};
 
         auto k_nm = key_norms + bh * token_count;
         auto k_pk = key_packed + bh * token_count * KPackedWidth;
@@ -2362,7 +2388,7 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
         {"int v_bit_off = v_bit_start & 7;" if (elems_per_lane * val_bits) % 8 else ""}
 
         // KV loop: each simdgroup handles tokens simd_gid, simd_gid+32, ...
-        for (int t = simd_gid; t < (int)token_count; t += BN) {{
+        for (int t = first_token + simd_gid; t < (int)token_count; t += BN) {{
             U kn = static_cast<U>(k_nm[t]);
 
             // Key score — unrolled byte extraction
@@ -2395,11 +2421,11 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
         // 2. Reduce max and sum across all simdgroups
         U sg_max = max_scores[simd_lid];
         U new_max = simd_max(sg_max);
-        U factor = fast::exp(sg_max - new_max);
+        U factor = isfinite(new_max) ? fast::exp(sg_max - new_max) : 0;
         U total_sum = simd_sum(sum_exp_scores[simd_lid] * factor);
 
         // 3. Rescale this simdgroup's factor for the global max
-        U my_factor = fast::exp(max_score - new_max);
+        U my_factor = isfinite(new_max) ? fast::exp(max_score - new_max) : 0;
 
         // 4. Transpose-reduce outputs through shared memory
         for (int i = 0; i < v_per_thread; i++) {{
@@ -2418,24 +2444,248 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
         }}
     """
 
+    input_names = [
+        "queries",
+        "key_norms",
+        "key_packed",
+        "key_codebook",
+        "val_norms",
+        "val_packed",
+        "val_codebook",
+    ]
+    if left_padded:
+        input_names.append("left_padding")
+
     return mx.fast.metal_kernel(
-        name=f"turboquant_fused_mse_sdpa_k{key_bits}_v{val_bits}_d{dim}",
-        input_names=[
-            "queries",
-            "key_norms",
-            "key_packed",
-            "key_codebook",
-            "val_norms",
-            "val_packed",
-            "val_codebook",
-        ],
+        name=(
+            f"turboquant_fused_mse_sdpa_k{key_bits}_v{val_bits}_d{dim}"
+            + ("_left_padded" if left_padded else "")
+        ),
+        input_names=input_names,
         output_names=["out"],
         source=source,
     )
 
 
 @lru_cache(maxsize=None)
-def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 256):
+def _fused_mse_prefill_qtile_kernel(
+    key_bits: int,
+    val_bits: int,
+    dim: int = 256,
+    query_tile: int = 4,
+    left_padded: bool = False,
+    simdgroups: int = 32,
+):
+    """Packed MSE attention with one KV read shared by a short query tile."""
+    if not _metal_available() or key_bits <= 0 or val_bits <= 0:
+        return None
+    if dim < 32 or dim % 32 != 0 or query_tile <= 0 or simdgroups not in (8, 16, 32):
+        return None
+
+    elems_per_lane = dim // 32
+    key_values = _gen_unrolled_extract(
+        key_bits,
+        elems_per_lane,
+        "key_codebook",
+        "key_bit_offset" if (elems_per_lane * key_bits) % 8 else "",
+    )
+    val_values = _gen_unrolled_extract(
+        val_bits,
+        elems_per_lane,
+        "val_codebook",
+        "value_bit_offset" if (elems_per_lane * val_bits) % 8 else "",
+    )
+
+    query_decls = []
+    accum_decls = []
+    query_updates = []
+    query_reductions = []
+    for q in range(query_tile):
+        output_index = (
+            f"((bqh * QueryLength + query_idx_{q}) * token_blocks + block_idx) * Dim"
+            if left_padded
+            else f"(bqh * QueryLength + query_idx_{q}) * Dim"
+        )
+        stats_index = f"(bqh * QueryLength + query_idx_{q}) * token_blocks + block_idx"
+        query_decls.extend(
+            [
+                f"        int query_idx_{q} = query_base + {q};",
+                f"        thread U query_{q}[qk_per_thread];",
+                f"        if (query_idx_{q} < QueryLength) {{",
+                f"            auto query_ptr_{q} = queries + (bqh * QueryLength + query_idx_{q}) * Dim + simd_lid * qk_per_thread;",
+                f"            for (int i = 0; i < qk_per_thread; i++) query_{q}[i] = static_cast<U>(query_ptr_{q}[i]);",
+                "        }",
+            ]
+        )
+        accum_decls.extend(
+            [
+                f"        thread U output_{q}[v_per_thread] = {{}};",
+                f"        U max_score_{q} = -INFINITY;",
+                f"        U sum_exp_score_{q} = 0;",
+            ]
+        )
+        score = "\n                    + ".join(
+            f"query_{q}[{i}] * key_value_{i}" for i in range(elems_per_lane)
+        )
+        value_updates = "\n".join(
+            f"                output_{q}[{i}] = output_{q}[{i}] * factor_{q} + exp_score_{q} * value_{i} * value_norm;"
+            for i in range(elems_per_lane)
+        )
+        query_updates.extend(
+            [
+                f"            if (query_idx_{q} < QueryLength && token_idx >= first_token && token_idx <= (int)token_count - QueryLength + query_idx_{q}) {{",
+                f"                U score_{q} = {score};",
+                f"                score_{q} = simd_sum(score_{q}) * key_norm;",
+                f"                U new_max_{q} = max(max_score_{q}, score_{q});",
+                f"                U factor_{q} = fast::exp(max_score_{q} - new_max_{q});",
+                f"                U exp_score_{q} = fast::exp(score_{q} - new_max_{q});",
+                f"                max_score_{q} = new_max_{q};",
+                f"                sum_exp_score_{q} = sum_exp_score_{q} * factor_{q} + exp_score_{q};",
+                value_updates,
+                "            }",
+            ]
+        )
+        query_reductions.extend(
+            [
+                f"        if (query_idx_{q} < QueryLength) {{",
+                "            if (simd_lid == 0) {",
+                f"                max_scores[simd_gid] = max_score_{q};",
+                f"                sum_exp_scores[simd_gid] = sum_exp_score_{q};",
+                "            }",
+                "            threadgroup_barrier(mem_flags::mem_threadgroup);",
+                "            U simdgroup_max = simd_lid < BN ? max_scores[simd_lid] : -INFINITY;",
+                "            U global_max = simd_max(simdgroup_max);",
+                "            U simdgroup_factor = isfinite(global_max) ? fast::exp(simdgroup_max - global_max) : 0;",
+                "            U simdgroup_sum = simd_lid < BN ? sum_exp_scores[simd_lid] : 0;",
+                "            U total_sum = simd_sum(simdgroup_sum * simdgroup_factor);",
+                *(
+                    [
+                        "            if (simd_gid == 0 && simd_lid == 0) {",
+                        f"                block_max[{stats_index}] = global_max;",
+                        f"                block_sum[{stats_index}] = total_sum;",
+                        "            }",
+                    ]
+                    if left_padded
+                    else []
+                ),
+                f"            U output_factor = isfinite(global_max) ? fast::exp(max_score_{q} - global_max) : 0;",
+                "            for (int i = 0; i < v_per_thread; i++) {",
+                f"                shared[simd_lid * BN + simd_gid] = output_{q}[i] * output_factor;",
+                "                threadgroup_barrier(mem_flags::mem_threadgroup);",
+                "                for (int output_lane = simd_gid; output_lane < BD; output_lane += BN) {",
+                "                    U lane_value = simd_lid < BN ? shared[output_lane * BN + simd_lid] : 0;",
+                "                    U reduced = simd_sum(lane_value);",
+                "                    if (simd_lid == 0) {",
+                f"                        out[{output_index} + output_lane * v_per_thread + i] = static_cast<U>(total_sum > 0 ? reduced / total_sum : 0);",
+                "                    }",
+                "                }",
+                "                threadgroup_barrier(mem_flags::mem_threadgroup);",
+                "            }",
+                "        }",
+            ]
+        )
+
+    key_decls = "\n".join(
+        f"            U key_value_{i} = {expr};" for i, expr in enumerate(key_values)
+    )
+    val_decls = "\n".join(
+        f"            U value_{i} = {expr.replace('kb[', 'vb[')};"
+        for i, expr in enumerate(val_values)
+    )
+    source = f"""
+        constexpr int BN = {simdgroups};
+        constexpr int BD = 32;
+        constexpr int qk_per_thread = Dim / BD;
+        constexpr int v_per_thread = Dim / BD;
+        typedef float U;
+
+        auto logical_work = threadgroup_position_in_grid.x;
+        int token_blocks = {"token_block_count[0]" if left_padded else "1"};
+        auto logical_tile = logical_work / token_blocks;
+        auto block_idx = logical_work % token_blocks;
+        constexpr int TilesPerHead = (QueryLength + QueryTile - 1) / QueryTile;
+        auto bqh = logical_tile / TilesPerHead;
+        auto tile_idx = logical_tile % TilesPerHead;
+        auto query_base = tile_idx * QueryTile;
+        auto simd_gid = simdgroup_index_in_threadgroup;
+        auto simd_lid = thread_index_in_simdgroup;
+
+        auto storage_token_count = key_norms_shape[2];
+        int token_count = logical_token_count[0];
+        auto kv_heads = key_norms_shape[1];
+        auto bh = bqh / RepeatCount;
+        auto batch_idx = bh / kv_heads{" + batch_row_offset[0]" if left_padded else ""};
+        auto storage_bh = batch_idx * kv_heads + bh % kv_heads;
+        auto key_norms_ptr = key_norms + storage_bh * storage_token_count;
+        auto keys_ptr = key_packed + storage_bh * storage_token_count * KPackedWidth;
+        auto value_norms_ptr = val_norms + storage_bh * storage_token_count;
+        auto values_ptr = val_packed + storage_bh * storage_token_count * VPackedWidth;
+
+{chr(10).join(query_decls)}
+{chr(10).join(accum_decls)}
+
+        int key_bit_start = simd_lid * qk_per_thread * KeyBits;
+        int value_bit_start = simd_lid * v_per_thread * ValBits;
+        int key_byte_base = key_bit_start >> 3;
+        int value_byte_base = value_bit_start >> 3;
+        int key_bit_offset = key_bit_start & 7;
+        int value_bit_offset = value_bit_start & 7;
+
+        int first_token = {"left_padding[batch_idx]" if left_padded else "0"};
+        int block_start = {"block_idx * TokenBlockSize" if left_padded else "0"};
+        int block_end = {"min(token_count, block_start + TokenBlockSize)" if left_padded else "token_count"};
+        for (int token_idx = block_start + simd_gid; token_idx < block_end; token_idx += BN) {{
+            U key_norm = static_cast<U>(key_norms_ptr[token_idx]);
+            U value_norm = static_cast<U>(value_norms_ptr[token_idx]);
+            auto kb = (const device uint8_t*)(keys_ptr + token_idx * KPackedWidth) + key_byte_base;
+            auto vb = (const device uint8_t*)(values_ptr + token_idx * VPackedWidth) + value_byte_base;
+{key_decls}
+{val_decls}
+{chr(10).join(query_updates)}
+        }}
+
+        threadgroup U max_scores[BN];
+        threadgroup U sum_exp_scores[BN];
+        threadgroup U shared[BD * BN];
+{chr(10).join(query_reductions)}
+    """
+
+    input_names = [
+        "queries",
+        "key_norms",
+        "key_packed",
+        "key_codebook",
+        "val_norms",
+        "val_packed",
+        "val_codebook",
+        "logical_token_count",
+    ]
+    if left_padded:
+        input_names.extend(["left_padding", "token_block_count", "batch_row_offset"])
+
+    output_names = ["out"]
+    if left_padded:
+        output_names.extend(["block_max", "block_sum"])
+
+    return mx.fast.metal_kernel(
+        name=(
+            f"turboquant_mse_prefill_q{query_tile}_k{key_bits}_v{val_bits}_d{dim}"
+            + ("_left_padded" if left_padded else "")
+            + f"_sg{simdgroups}"
+        ),
+        input_names=input_names,
+        output_names=output_names,
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _fused_mse_decode_2pass_1_kernel(
+    key_bits: int,
+    val_bits: int,
+    dim: int = 256,
+    left_padded: bool = False,
+):
     """2-pass decode pass 1: block-parallel quantized attention."""
     if not _metal_available() or key_bits <= 0 or val_bits <= 0:
         return None
@@ -2467,6 +2717,7 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 25
         auto kv_heads = key_norms_shape[1];
         auto bh = batch_idx * kv_heads + kv_head_idx;
         auto bqh = batch_idx * kv_heads * RepeatCount + kv_head_idx * RepeatCount + gqa_idx;
+        int first_token = {"left_padding[batch_idx]" if left_padded else "0"};
 
         auto k_nm = key_norms + bh * token_count;
         auto k_pk = key_packed + bh * token_count * KPackedWidth;
@@ -2492,7 +2743,9 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 25
         {"int v_bit_off = v_bit_start & 7;" if (elems_per_lane * val_bits) % 8 else ""}
 
         // KV loop: stride by blocks (each block handles a different subset)
-        for (int t = block_idx; t < (int)token_count; t += Blocks) {{
+        int first_block_token = first_token +
+            ((block_idx - first_token % Blocks + Blocks) % Blocks);
+        for (int t = first_block_token; t < (int)token_count; t += Blocks) {{
             U kn = static_cast<U>(k_nm[t]);
 
             // Key score — unrolled byte extraction
@@ -2522,17 +2775,24 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 25
                 static_cast<U>(o[i]);
     """
 
+    input_names = [
+        "queries",
+        "key_norms",
+        "key_packed",
+        "key_codebook",
+        "val_norms",
+        "val_packed",
+        "val_codebook",
+    ]
+    if left_padded:
+        input_names.append("left_padding")
+
     return mx.fast.metal_kernel(
-        name=f"turboquant_mse_sdpa_2pass1_k{key_bits}_v{val_bits}_d{dim}",
-        input_names=[
-            "queries",
-            "key_norms",
-            "key_packed",
-            "key_codebook",
-            "val_norms",
-            "val_packed",
-            "val_codebook",
-        ],
+        name=(
+            f"turboquant_mse_sdpa_2pass1_k{key_bits}_v{val_bits}_d{dim}"
+            + ("_left_padded" if left_padded else "")
+        ),
+        input_names=input_names,
         output_names=["out_acc", "out_sums", "out_maxs"],
         source=source,
     )
@@ -2570,6 +2830,9 @@ def _fused_mse_decode_2pass_2_kernel():
             U block_max = m[b];
             U block_sum = s[b];
 
+            if (!(block_sum > 0) || !isfinite(block_max))
+                continue;
+
             U new_max = max(max_score, block_max);
             U factor = fast::exp(max_score - new_max);
             U block_factor = fast::exp(block_max - new_max);
@@ -2594,10 +2857,10 @@ def _fused_mse_decode_2pass_2_kernel():
 
         U sg_max = sg_maxs[simd_lid];
         U new_max = simd_max(sg_max);
-        U factor = fast::exp(sg_max - new_max);
+        U factor = isfinite(new_max) ? fast::exp(sg_max - new_max) : 0;
         U total_sum = simd_sum(sg_sums[simd_lid] * factor);
 
-        U my_factor = fast::exp(max_score - new_max);
+        U my_factor = isfinite(new_max) ? fast::exp(max_score - new_max) : 0;
 
         for (int i = 0; i < elem_per_thread; i++) {
             outputs[simd_lid * BD + simd_gid] = o[i] * my_factor;
@@ -2690,6 +2953,45 @@ def _metal_butterfly_wht_inverse(
         f"            if (d < Dim) {shared_name}[d] *= rht_scale * {sign_name}[d];",
         f"        threadgroup_barrier(mem_flags::mem_threadgroup);",
     ]
+
+
+@lru_cache(maxsize=None)
+def _fused_mse_dequantize_rht_kernel(bits: int, dim: int):
+    """Unpack, codebook-decode, rescale, and inverse-RHT in one dispatch."""
+    if not _metal_available() or bits < 1 or dim < 32 or not _is_power_of_two(dim):
+        return None
+
+    mask = (1 << bits) - 1
+    inverse = _metal_butterfly_wht_inverse("shared", "signs", "temp")
+    source = "\n".join(
+        [
+            "        auto lane = thread_index_in_simdgroup;",
+            "        auto n = threadgroup_position_in_grid.y;",
+            "        threadgroup float shared[Dim];",
+            "        float temp[DimsPerLane];",
+            "        auto src = packed + n * PackedWidth;",
+            "        float norm = static_cast<float>(norms[n]);",
+            "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {",
+            f"            int bit = d * {bits};",
+            "            int word = bit >> 5;",
+            "            int off = bit & 31;",
+            "            uint code = src[word] >> off;",
+            f"            if (off + {bits} > 32)",
+            "                code |= src[word + 1] << (32 - off);",
+            f"            shared[d] = codebook[code & {mask}u] * norm;",
+            "        }",
+            "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+            *inverse,
+            "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32)",
+            "            out[n * Dim + d] = static_cast<half>(shared[d]);",
+        ]
+    )
+    return mx.fast.metal_kernel(
+        name=f"turboquant_mse_dequant_rht_{bits}b_d{dim}",
+        input_names=["packed", "norms", "codebook", "signs"],
+        output_names=["out"],
+        source=source,
+    )
 
 
 @lru_cache(maxsize=None)
@@ -4117,9 +4419,23 @@ def _map_state_pair(s1, s2, fn):
     raise TypeError(f"Unsupported TurboQuant state type: {type(s1)!r}")
 
 
-def _filter_state(state, batch_indices: mx.array):
-    """Select batch elements from a TurboQuant state."""
-    return _map_state(state, lambda a, ndim: a[batch_indices])
+def _contiguous_batch_slice(batch_indices: mx.array) -> Optional[slice]:
+    """Return a view-preserving slice for a contiguous ordered keep-set."""
+    indices = [int(index) for index in batch_indices.tolist()]
+    if not indices:
+        return slice(0, 0)
+    start = indices[0]
+    if indices == list(range(start, start + len(indices))):
+        return slice(start, start + len(indices))
+    return None
+
+
+def _filter_state(state, batch_indices: mx.array, batch_slice=None):
+    """Select batch elements, retaining a view for contiguous keep-sets."""
+    if batch_slice is None:
+        batch_slice = _contiguous_batch_slice(batch_indices)
+    selector = batch_indices if batch_slice is None else batch_slice
+    return _map_state(state, lambda a, ndim: a[selector])
 
 
 def _zero_state_row_tail(state, batch_index: int, start: int, end: int):
@@ -5247,13 +5563,30 @@ class _TurboQuantAttentionMixin:
         self.offset = new_end
         self._cached_state = None
         self._cached_state_offset = -1
-        if n_new > 1 or (self.offset % 50 == 0):
+        if _should_eval_cache_append(n_new, self.offset):
             mx.eval(self.keys, self.values)
         ks, vs = self.state
         return (
             _QuantizedStateProxy(ks, self.offset, n_heads),
             _QuantizedStateProxy(vs, self.offset, n_heads),
         )
+
+    def reserve_for_append(self, tokens: int) -> int:
+        """Reserve packed storage without changing the logical cache offset."""
+        tokens = max(0, int(tokens))
+        if self.keys is None or tokens == 0:
+            return _state_length(self.keys) if self.keys is not None else 0
+        needed = self.offset + tokens
+        self.keys = _reserve_state_capacity(
+            self.keys, self.offset, needed, self.cache_step
+        )
+        self.values = _reserve_state_capacity(
+            self.values, self.offset, needed, self.cache_step
+        )
+        mx.eval(self.keys, self.values)
+        self._cached_state = None
+        self._cached_state_offset = -1
+        return _state_length(self.keys)
 
     @staticmethod
     def _unwrap(state):
@@ -5267,6 +5600,49 @@ class _TurboQuantAttentionMixin:
         """
         state = self.state
         return state[0], state[1]
+
+    def _fused_mse_dequantize_pair(self, keys_state, values_state):
+        if not (
+            isinstance(self.key_codec, _TurboQuantMSECodec)
+            and isinstance(self.value_codec, _TurboQuantMSECodec)
+            and self.key_codec.use_rht
+            and self.value_codec.use_rht
+            and isinstance(keys_state, TurboQuantMSEState)
+            and isinstance(values_state, TurboQuantMSEState)
+            and self.key_codec.dim == self.value_codec.dim
+        ):
+            return None
+
+        dim = self.key_codec.dim
+
+        def launch(codec, state):
+            bits = int(codec.bits)
+            if bits != codec.bits:
+                return None
+            kernel = _fused_mse_dequantize_rht_kernel(bits, dim)
+            if kernel is None:
+                return None
+            vectors = math.prod(state.norms.shape)
+            return kernel(
+                inputs=[state.indices, state.norms, codec.codebook, codec.signs],
+                template=[
+                    ("Dim", dim),
+                    ("DimPadded", dim),
+                    ("DimsPerLane", dim // 32),
+                    ("DimsPerLanePadded", dim // 32),
+                    ("PackedWidth", state.indices.shape[-1]),
+                ],
+                grid=(32, vectors, 1),
+                threadgroup=(32, 1, 1),
+                output_shapes=[(*state.norms.shape, dim)],
+                output_dtypes=[mx.float16],
+            )[0]
+
+        keys = launch(self.key_codec, keys_state)
+        values = launch(self.value_codec, values_state)
+        if keys is None or values is None:
+            return None
+        return keys, values
 
     def prefix_cache_snapshot(self):
         """Capture packed state and the codec coordinates needed to decode it."""
@@ -5517,6 +5893,9 @@ class _TurboQuantAttentionMixin:
         values_state=None,
         scale: float = 1.0,
         mask: Optional[mx.array] = None,
+        left_padding: Optional[mx.array] = None,
+        logical_token_count: Optional[int] = None,
+        batch_row_offset: int = 0,
     ) -> Optional[mx.array]:
         """Fast prefill: fold L queries into R dimension, reuse decode kernels.
         Avoids the expensive O(T×D²) dequantize rotation matmul."""
@@ -5524,6 +5903,138 @@ class _TurboQuantAttentionMixin:
             keys_state, values_state = self._attention_states()
         keys_state = self._unwrap(keys_state)
         values_state = self._unwrap(values_state)
+
+        # MTP target verification is a decode-shaped causal call with only a
+        # handful of query rows.  Keep those rows in registers so each packed
+        # MSE K/V token is unpacked once instead of once per verify row, and do
+        # not materialize the L x T score tensor used by the generic path.
+        if (
+            os.environ.get("MLX_VLM_TQ_MTP_QTILE") == "1"
+            and (
+                (isinstance(mask, str) and mask == "causal")
+                or (isinstance(mask, mx.array) and left_padding is not None)
+            )
+            and (
+                1 <= queries.shape[-2] <= 4
+                if left_padding is not None
+                else 1 < queries.shape[-2] <= 4
+            )
+            and isinstance(self.key_codec, _TurboQuantMSECodec)
+            and isinstance(self.value_codec, _TurboQuantMSECodec)
+            and isinstance(keys_state, TurboQuantMSEState)
+            and isinstance(values_state, TurboQuantMSEState)
+        ):
+            B, n_q_heads, L, D = queries.shape
+            n_kv_heads = keys_state.norms.shape[1]
+            n_repeats = n_q_heads // n_kv_heads
+            T = keys_state.norms.shape[2]
+            logical_tokens = T if logical_token_count is None else logical_token_count
+            key_bits = int(self.key_codec.bits)
+            val_bits = int(self.value_codec.bits)
+            if (
+                T >= L
+                and key_bits == self.key_codec.bits
+                and val_bits == self.value_codec.bits
+            ):
+                simdgroups = int(
+                    os.environ.get("MLX_VLM_TQ_MTP_QTILE_SIMDGROUPS", "32")
+                )
+                kernel = _fused_mse_prefill_qtile_kernel(
+                    key_bits,
+                    val_bits,
+                    D,
+                    query_tile=4,
+                    left_padded=left_padding is not None,
+                    simdgroups=simdgroups,
+                )
+                if kernel is not None:
+                    grouped = (queries * scale).reshape(B, n_kv_heads, n_repeats, L, D)
+                    q_rot = self.key_codec.prepare_queries(grouped)
+                    logical_queries = B * n_q_heads * L
+                    logical_tiles = B * n_q_heads
+                    token_block_size = 1024
+                    token_blocks = (
+                        (logical_tokens + token_block_size - 1) // token_block_size
+                        if left_padding is not None
+                        else 1
+                    )
+                    inputs = [
+                        q_rot.reshape(logical_queries, D),
+                        keys_state.norms,
+                        keys_state.indices,
+                        self.key_codec.codebook,
+                        values_state.norms,
+                        values_state.indices,
+                        self.value_codec.codebook,
+                        mx.array([logical_tokens], dtype=mx.int32),
+                    ]
+                    if left_padding is not None:
+                        inputs.extend(
+                            [
+                                left_padding.astype(mx.int32),
+                                mx.array([token_blocks], dtype=mx.int32),
+                                mx.array([batch_row_offset], dtype=mx.int32),
+                            ]
+                        )
+                    template = [
+                        ("Dim", D),
+                        ("RepeatCount", n_repeats),
+                        ("QueryLength", L),
+                        ("QueryTile", 4),
+                        ("KeyBits", key_bits),
+                        ("ValBits", val_bits),
+                        ("KPackedWidth", keys_state.indices.shape[-1]),
+                        ("VPackedWidth", values_state.indices.shape[-1]),
+                    ]
+                    if left_padding is not None:
+                        template.append(("TokenBlockSize", token_block_size))
+                    result = kernel(
+                        inputs=inputs,
+                        template=template,
+                        grid=(
+                            logical_tiles * token_blocks * simdgroups * 32,
+                            1,
+                            1,
+                        ),
+                        threadgroup=(simdgroups * 32, 1, 1),
+                        output_shapes=(
+                            [
+                                (logical_queries, token_blocks, D),
+                                (logical_queries, token_blocks),
+                                (logical_queries, token_blocks),
+                            ]
+                            if left_padding is not None
+                            else [(logical_queries, D)]
+                        ),
+                        output_dtypes=(
+                            [mx.float32, mx.float32, mx.float32]
+                            if left_padding is not None
+                            else [mx.float32]
+                        ),
+                    )
+                    if left_padding is not None:
+                        partial, block_max, block_sum = result
+                        global_max = mx.max(block_max, axis=1, keepdims=True)
+                        block_scale = mx.where(
+                            mx.isfinite(block_max),
+                            mx.exp(block_max - global_max) * block_sum,
+                            0,
+                        )
+                        denominator = mx.sum(block_scale, axis=1, keepdims=True)
+                        out = mx.sum(partial * block_scale[..., None], axis=1)
+                        out = out / mx.maximum(denominator, _EPS)
+                    else:
+                        out = result[0]
+                    rotated = out.reshape(B, n_kv_heads, n_repeats, L, D)
+                    output = self.value_codec._rotate_inverse(rotated)
+                    output = output.reshape(B, n_q_heads, L, D).astype(queries.dtype)
+                    if left_padding is not None:
+                        # A full Qwen stack otherwise queues all ragged q-tile
+                        # kernels and inverse rotations in one Metal command
+                        # buffer. Long rows can exceed the macOS GPU watchdog
+                        # even though each kernel is independently bounded.
+                        mx.eval(output)
+                    return output
 
         if not (
             isinstance(self.key_codec, _TurboQuantProdCodec)
@@ -6088,7 +6599,8 @@ class _TurboQuantAttentionMixin:
         values_state=None,
         scale: float = 1.0,
         mask: Optional[mx.array] = None,
-    ) -> mx.array:
+        left_padding: Optional[mx.array] = None,
+    ) -> Optional[mx.array]:
         if keys_state is None or values_state is None:
             keys_state, values_state = self._attention_states()
         keys_state = self._unwrap(keys_state)
@@ -6137,18 +6649,26 @@ class _TurboQuantAttentionMixin:
 
                 if total_tokens <= 2048:
                     # Single-pass: 32 simdgroups cooperate per q_head
-                    fused_kernel = _fused_mse_decode_kernel(key_bits, val_bits, D)
+                    fused_kernel = _fused_mse_decode_kernel(
+                        key_bits,
+                        val_bits,
+                        D,
+                        left_padded=left_padding is not None,
+                    )
                     if fused_kernel is not None:
+                        inputs = [
+                            q_rot_flat,
+                            keys_state.norms,
+                            keys_state.indices,
+                            self.key_codec.codebook,
+                            values_state.norms,
+                            values_state.indices,
+                            self.value_codec.codebook,
+                        ]
+                        if left_padding is not None:
+                            inputs.append(left_padding.astype(mx.int32))
                         out = fused_kernel(
-                            inputs=[
-                                q_rot_flat,
-                                keys_state.norms,
-                                keys_state.indices,
-                                self.key_codec.codebook,
-                                values_state.norms,
-                                values_state.indices,
-                                self.value_codec.codebook,
-                            ],
+                            inputs=inputs,
                             template=[
                                 ("Dim", D),
                                 ("RepeatCount", n_repeats),
@@ -6165,7 +6685,12 @@ class _TurboQuantAttentionMixin:
                         return output.reshape(B, n_q_heads, L, value_dim).astype(dtype)
 
                 # 2-pass: split KV across blocks for GPU saturation
-                pass1 = _fused_mse_decode_2pass_1_kernel(key_bits, val_bits, D)
+                pass1 = _fused_mse_decode_2pass_1_kernel(
+                    key_bits,
+                    val_bits,
+                    D,
+                    left_padded=left_padding is not None,
+                )
                 pass2 = _fused_mse_decode_2pass_2_kernel()
                 if pass1 is not None and pass2 is not None:
                     if total_tokens <= 8192:
@@ -6179,16 +6704,19 @@ class _TurboQuantAttentionMixin:
 
                     acc_shape = (BQH * num_blocks, D)
                     sm_shape = (BQH * num_blocks,)
+                    inputs = [
+                        q_rot_flat,
+                        keys_state.norms,
+                        keys_state.indices,
+                        self.key_codec.codebook,
+                        values_state.norms,
+                        values_state.indices,
+                        self.value_codec.codebook,
+                    ]
+                    if left_padding is not None:
+                        inputs.append(left_padding.astype(mx.int32))
                     out_acc, out_sums, out_maxs = pass1(
-                        inputs=[
-                            q_rot_flat,
-                            keys_state.norms,
-                            keys_state.indices,
-                            self.key_codec.codebook,
-                            values_state.norms,
-                            values_state.indices,
-                            self.value_codec.codebook,
-                        ],
+                        inputs=inputs,
                         template=[
                             ("Dim", D),
                             ("RepeatCount", n_repeats),
@@ -6218,6 +6746,9 @@ class _TurboQuantAttentionMixin:
                     out_rotated = out.reshape(B, n_kv_heads, n_repeats, D)
                     output = self.value_codec._rotate_inverse(out_rotated)
                     return output.reshape(B, n_q_heads, L, value_dim).astype(dtype)
+
+            if left_padding is not None:
+                return None
 
             # Separate-kernel path fallback
             sep_output = self._separate_score_value_decode(
@@ -6439,7 +6970,7 @@ class TurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         self.offset = new_end
         self._cached_state = None
         self._cached_state_offset = -1
-        if n_new > 1 or (self.offset % 50 == 0):
+        if _should_eval_cache_append(n_new, self.offset):
             mx.eval(self.keys, self.values)
         ks, vs = self.state
         return (
@@ -6455,6 +6986,17 @@ class TurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         keys = self.key_codec.dequantize(keys_state).astype(mx.float32)
         values = self.value_codec.dequantize(values_state).astype(mx.float32)
         return keys, values
+
+    def dequantize_for_attention(self, keys_state=None, values_state=None):
+        if keys_state is None or values_state is None:
+            keys_state, values_state = self._attention_states()
+        keys_state = self._unwrap(keys_state)
+        values_state = self._unwrap(values_state)
+        if _fused_dequantize_enabled():
+            fused = self._fused_mse_dequantize_pair(keys_state, values_state)
+            if fused is not None:
+                return fused
+        return self.dequantize(keys_state, values_state)
 
     def dequantize_for_apc(self):
         """Return raw float (keys, values) for APC storage.
@@ -6554,6 +7096,7 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
     """
 
     cache_step = 256
+    prefix_cache_step = 4096
 
     def __init__(
         self,
@@ -6573,8 +7116,60 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         self.value_codec = None
         self.left_padding = mx.array(left_padding)
         self.offset = mx.array([-lp for lp in left_padding])
-        self._fused_attention_eligible = len(left_padding) == 1 and left_padding[0] == 0
+        self._fused_attention_eligible = bool(left_padding) and all(
+            lp == 0 for lp in left_padding
+        )
+        self._left_padding_values = tuple(int(lp) for lp in left_padding)
+        self._packed_verify_eligible = bool(left_padding)
+        self._eval_next_append = False
+        self._segments = None
         self._idx = 0
+
+    @property
+    def is_segmented(self):
+        return self._segments is not None
+
+    def _sync_segment_metadata(self):
+        offsets = [int(segment.offset) for segment in self._segments]
+        self._idx = max(offsets, default=0)
+        self.offset = mx.array(offsets)
+        self.left_padding = mx.array([self._idx - offset for offset in offsets])
+        self._refresh_fused_attention_eligibility()
+
+    def _activate_segments(self):
+        if self._segments is not None:
+            return
+        segments = []
+        for row in range(self.batch_size):
+            if self.keys is None:
+                segment = TurboQuantKVCache(
+                    bits=self.bits,
+                    seed=self.seed,
+                    key_bits=self.key_bits,
+                    value_bits=self.value_bits,
+                )
+            elif self.batch_size == 1 and int(self.left_padding[0].item()) == 0:
+                # Preserve the reserved B=1 backing storage. Slicing it to the
+                # logical length here would force a full-cache reallocation on
+                # the first decode step after admission.
+                segment = TurboQuantKVCache(
+                    bits=self.bits,
+                    seed=self.seed,
+                    key_bits=self.key_bits,
+                    value_bits=self.value_bits,
+                )
+                segment.key_codec = self.key_codec
+                segment.value_codec = self.value_codec
+                segment.keys = self.keys
+                segment.values = self.values
+                segment.offset = int(self.offset[0].item())
+            else:
+                segment = self.extract(row)
+            segments.append(segment)
+        self._segments = segments
+        self.keys = None
+        self.values = None
+        self._sync_segment_metadata()
 
     def _refresh_fused_attention_eligibility(self):
         """Refresh the host-side fused-kernel guard after batch mutation.
@@ -6582,8 +7177,122 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         Reading MLX state synchronizes the device, so lifecycle operations do
         it once and decode only reads the cached Python boolean.
         """
-        self._fused_attention_eligible = self.batch_size == 1 and bool(
-            (self.left_padding == 0).all().item()
+        self._left_padding_values = tuple(int(lp) for lp in self.left_padding.tolist())
+        no_left_padding = all(lp == 0 for lp in self._left_padding_values)
+        self._fused_attention_eligible = self.batch_size > 0 and no_left_padding
+        self._packed_verify_eligible = self.batch_size > 0
+
+    def packed_verify_attention(
+        self,
+        queries: mx.array,
+        keys_state=None,
+        values_state=None,
+        scale: float = 1.0,
+        mask: Optional[mx.array] = None,
+    ) -> Optional[mx.array]:
+        """Run short verification directly against packed batch storage.
+
+        Unpadded cohorts can use the q-tile causal fast path.  Ragged cohorts
+        must retain the full contiguous batch state and use the explicit mask
+        produced before the verify append.  Slicing individual packed rows
+        creates strided views that custom Metal kernels cannot consume safely.
+        """
+        if keys_state is None or values_state is None:
+            keys_state, values_state = self._attention_states()
+        keys_state = self._unwrap(keys_state)
+        values_state = self._unwrap(values_state)
+
+        if queries.shape[0] != self.batch_size:
+            return None
+        if isinstance(mask, mx.array):
+            left_padding = self.left_padding
+            # Custom packed kernels consume reserved backing storage directly.
+            # Ragged rows are updated in place, so finish those writes before
+            # launching a kernel that is not represented as an MLX view op.
+            mx.eval(self.keys, self.values, left_padding)
+        elif all(lp == 0 for lp in self._left_padding_values):
+            left_padding = None
+        else:
+            return None
+        # Keep a diagnostic row-step override while the multi-row packed Metal
+        # path is being validated under dynamic batch admission.
+        outputs = []
+        row_step = max(
+            1,
+            int(os.environ.get("MLX_VLM_TQ_VERIFY_ROW_STEP", str(self.batch_size))),
+        )
+        for row_start in range(0, self.batch_size, row_step):
+            row_end = min(row_start + row_step, self.batch_size)
+            output = self.prefill_attention(
+                queries[row_start:row_end],
+                # Use the contiguous reserved backing storage. The state
+                # returned by update_and_fetch is sliced to the logical
+                # length; later rows retain the larger capacity stride.
+                keys_state=self.keys,
+                values_state=self.values,
+                scale=scale,
+                mask=mask,
+                left_padding=left_padding,
+                logical_token_count=self._idx,
+                batch_row_offset=row_start,
+            )
+            if output is None:
+                return None
+            outputs.append(output)
+        return outputs[0] if len(outputs) == 1 else mx.concatenate(outputs, axis=0)
+
+    def packed_decode_attention(
+        self,
+        queries: mx.array,
+        keys_state=None,
+        values_state=None,
+        scale: float = 1.0,
+        mask: Optional[mx.array] = None,
+    ) -> Optional[mx.array]:
+        """Decode ragged rows with the stable MSE decode kernel family.
+
+        This is separate from speculative QTile verification.  It adds a
+        per-row starting-token bound to the ordinary one-query fused decode
+        kernels and keeps the packed cache compressed throughout attention.
+        """
+        if self._segments is not None:
+            if (
+                queries.shape[0] != self.batch_size
+                or queries.shape[-2] != 1
+                or mask is not None
+            ):
+                return None
+            outputs = []
+            for row, segment in enumerate(self._segments):
+                row_keys = keys_state[row] if keys_state is not None else None
+                row_values = values_state[row] if values_state is not None else None
+                outputs.append(
+                    segment.decode_attention(
+                        queries[row : row + 1],
+                        keys_state=row_keys,
+                        values_state=row_values,
+                        scale=scale,
+                        mask=None,
+                    )
+                )
+            return mx.concatenate(outputs, axis=0)
+        if (
+            os.environ.get("MLX_VLM_TQ_BATCH_DECODE") != "1"
+            or queries.shape[0] != self.batch_size
+            or queries.shape[-2] != 1
+            or mask is not None
+            or all(lp == 0 for lp in self._left_padding_values)
+        ):
+            return None
+        if keys_state is None or values_state is None:
+            keys_state, values_state = self._attention_states()
+        return self.decode_attention(
+            queries,
+            keys_state=keys_state,
+            values_state=values_state,
+            scale=scale,
+            mask=None,
+            left_padding=self.left_padding,
         )
 
     # ------------------------------------------------------------------
@@ -6609,8 +7318,28 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
     # ------------------------------------------------------------------
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
+        if self._segments is not None:
+            key_states = []
+            value_states = []
+            for row, segment in enumerate(self._segments):
+                row_keys, row_values = segment.update_and_fetch(
+                    keys[row : row + 1], values[row : row + 1]
+                )
+                key_states.append(row_keys)
+                value_states.append(row_values)
+            self._sync_segment_metadata()
+            return key_states, value_states
+
         self._ensure_codecs(keys, values)
         prev = self._idx
+
+        if self._eval_next_append:
+            # Batch extend/filter can leave the backing storage as a lazy
+            # concat, pad or gather result. Materialize it before the first
+            # in-place append; the ragged packed-attention boundary below
+            # materializes the resulting write before its custom kernel.
+            mx.eval(self.keys, self.values)
+            self._eval_next_append = False
 
         new_keys = self.key_codec.quantize(keys)
         new_values = self.value_codec.quantize(values)
@@ -6633,7 +7362,7 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         self.offset += keys.shape[2]
         self._idx = new_end
 
-        if keys.shape[2] > 1 or (self._idx % 50 == 0):
+        if _should_eval_cache_append(keys.shape[2], self._idx):
             mx.eval(self.keys, self.values)
 
         ks = _slice_state(self.keys, self._idx)
@@ -6643,6 +7372,56 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
             _QuantizedStateProxy(ks, self._idx, n_heads),
             _QuantizedStateProxy(vs, self._idx, n_heads),
         )
+
+    def reserve_for_append(self, tokens: int) -> int:
+        """Reserve packed storage without changing per-row cache offsets."""
+        tokens = max(0, int(tokens))
+        if self._segments is not None:
+            capacities = []
+            for segment in self._segments:
+                reserve = getattr(segment, "reserve_for_append", None)
+                if callable(reserve):
+                    capacities.append(reserve(tokens))
+            return sum(capacities)
+        if self.keys is None or tokens == 0:
+            return _state_length(self.keys) if self.keys is not None else 0
+        needed = self._idx + tokens
+        self.keys = _reserve_state_capacity(
+            self.keys, self._idx, needed, self.cache_step
+        )
+        self.values = _reserve_state_capacity(
+            self.values, self._idx, needed, self.cache_step
+        )
+        mx.eval(self.keys, self.values)
+        return _state_length(self.keys)
+
+    def prefix_cache_reserve(self, min_capacity_tokens: int):
+        """Reserve restored packed storage without changing logical offsets."""
+        if self.keys is None or self.values is None:
+            return ()
+        needed = max(self._idx, int(min_capacity_tokens))
+        if min(_state_length(self.keys), _state_length(self.values)) >= needed:
+            return ()
+        if _state_length(self.keys) < needed:
+            self.keys = _reserve_state_capacity(
+                self.keys, self._idx, needed, self.prefix_cache_step
+            )
+            mx.eval(self.keys)
+            mx.clear_cache()
+        if _state_length(self.values) < needed:
+            self.values = _reserve_state_capacity(
+                self.values, self._idx, needed, self.prefix_cache_step
+            )
+            mx.eval(self.values)
+            mx.clear_cache()
+        return self.keys, self.values
+
+    def prefix_cache_needs_reserve(self, min_capacity_tokens: int) -> bool:
+        """Return whether a restored packed cache must grow for this step."""
+        if self.keys is None or self.values is None:
+            return False
+        needed = max(self._idx, int(min_capacity_tokens))
+        return min(_state_length(self.keys), _state_length(self.values)) < needed
 
     def zero_row_tail(self, bi: int, start: int, end: int):
         if start >= end:
@@ -6665,11 +7444,18 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
     # ------------------------------------------------------------------
 
     def filter(self, batch_indices: mx.array):
+        if self._segments is not None:
+            keep = [int(index) for index in batch_indices.tolist()]
+            self._segments = [self._segments[index] for index in keep]
+            self._sync_segment_metadata()
+            return
+        batch_slice = _contiguous_batch_slice(batch_indices)
+        selector = batch_indices if batch_slice is None else batch_slice
         if self.keys is not None:
-            self.keys = _filter_state(self.keys, batch_indices)
-            self.values = _filter_state(self.values, batch_indices)
-        self.offset = self.offset[batch_indices]
-        self.left_padding = self.left_padding[batch_indices]
+            self.keys = _filter_state(self.keys, batch_indices, batch_slice)
+            self.values = _filter_state(self.values, batch_indices, batch_slice)
+        self.offset = self.offset[selector]
+        self.left_padding = self.left_padding[selector]
 
         min_lp = self.left_padding.min().item()
         if min_lp > 0:
@@ -6684,6 +7470,10 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
                 self.values = _map_state(self.values, _trim)
             self._idx -= min_lp
             self.left_padding -= min_lp
+        # The next append may write into storage produced by gather/slice
+        # operations above. Materialize that write once before custom packed
+        # attention kernels consume it.
+        self._eval_next_append = True
         self._refresh_fused_attention_eligibility()
 
     def zero_row_tail(self, batch_index: int, start: int, end: int):
@@ -6691,6 +7481,13 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         self.values = _zero_state_row_tail(self.values, batch_index, start, end)
 
     def extend(self, other: "BatchTurboQuantKVCache"):
+        if os.environ.get("MLX_VLM_SEGMENTED_BATCH_KV") == "1":
+            self._activate_segments()
+            other._activate_segments()
+            self._segments.extend(other._segments)
+            self._sync_segment_metadata()
+            return
+        needs_append_eval = self.keys is not None or other.keys is not None
         if self.keys is None and other.keys is None:
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])
@@ -6726,6 +7523,7 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
             self.offset = mx.concatenate([self.offset, so])
             self.left_padding = mx.concatenate([self.left_padding + max_idx, slp])
             self._idx = max_idx
+            self._eval_next_append = needs_append_eval
             self._refresh_fused_attention_eligibility()
             return
         if r_other is None:
@@ -6733,6 +7531,7 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
             self.offset = mx.concatenate([so, other.offset])
             self.left_padding = mx.concatenate([slp, other.left_padding + max_idx])
             self._idx = max_idx
+            self._eval_next_append = needs_append_eval
             self._refresh_fused_attention_eligibility()
             return
 
@@ -6744,6 +7543,7 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         self.offset = mx.concatenate([so, oo])
         self.left_padding = mx.concatenate([slp, olp])
         self._idx = max_idx
+        self._eval_next_append = needs_append_eval
         self._refresh_fused_attention_eligibility()
 
     # ------------------------------------------------------------------
@@ -6751,6 +7551,8 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
     # ------------------------------------------------------------------
 
     def dequantize(self, keys_state=None, values_state=None):
+        if self._segments is not None:
+            raise ValueError("Segmented TurboQuant cache cannot be dequantized densely")
         if keys_state is None or values_state is None:
             keys_state = _slice_state(self.keys, self._idx)
             values_state = _slice_state(self.values, self._idx)
@@ -6761,6 +7563,18 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         k = self.key_codec.dequantize(keys_state).astype(mx.float32)
         v = self.value_codec.dequantize(values_state).astype(mx.float32)
         return k, v
+
+    def dequantize_for_attention(self, keys_state=None, values_state=None):
+        if keys_state is None or values_state is None:
+            keys_state = _slice_state(self.keys, self._idx)
+            values_state = _slice_state(self.values, self._idx)
+        keys_state = self._unwrap(keys_state)
+        values_state = self._unwrap(values_state)
+        if _fused_dequantize_enabled():
+            fused = self._fused_mse_dequantize_pair(keys_state, values_state)
+            if fused is not None:
+                return fused
+        return self.dequantize(keys_state, values_state)
 
     def dequantize_for_apc(self):
         """Return raw float (keys, values) for APC storage.
@@ -6773,6 +7587,8 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
 
     def extract(self, idx):
         """Extract one batch row as a single-sequence TurboQuantKVCache."""
+        if self._segments is not None:
+            return self._segments[idx]
         cache = TurboQuantKVCache(
             bits=self.bits,
             seed=self.seed,
@@ -6799,12 +7615,43 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         cache.offset = _state_length(cache.keys)
         return cache
 
+    def extract_view(self, idx):
+        """Borrow one row for a synchronous exact-cache disk write.
+
+        The common single-row case avoids materializing a second packed KV
+        prefix. The returned cache must not outlive the serialization call.
+        """
+        if self._segments is not None:
+            return self._segments[idx]
+        if self.batch_size != 1 or int(idx) != 0:
+            return self.extract(idx)
+        cache = TurboQuantKVCache(
+            bits=self.bits,
+            seed=self.seed,
+            key_bits=self.key_bits,
+            value_bits=self.value_bits,
+        )
+        if self.keys is None or self._idx == 0:
+            return cache
+        cache.key_codec = self.key_codec
+        cache.value_codec = self.value_codec
+        padding = max(0, int(self.left_padding[0].item()))
+        end = self._idx
+        if padding >= end:
+            return cache
+        cache.keys = _slice_state_range(self.keys, padding, end)
+        cache.values = _slice_state_range(self.values, padding, end)
+        cache.offset = end - padding
+        return cache
+
     # ------------------------------------------------------------------
     # State / introspection
     # ------------------------------------------------------------------
 
     @property
     def state(self):
+        if self._segments is not None:
+            return [segment.state for segment in self._segments]
         if self.keys is None:
             return None, None, self.offset, self.left_padding
         k = _slice_state(self.keys, self._idx)
@@ -6816,6 +7663,7 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         self.keys, self.values, self.offset, self.left_padding = val
         if self.keys is not None:
             self._idx = _state_length(self.keys)
+        self._eval_next_append = False
         self._refresh_fused_attention_eligibility()
 
     @property
@@ -6842,12 +7690,18 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         return True
 
     def trim(self, n):
+        if self._segments is not None:
+            trimmed = [segment.trim(n) for segment in self._segments]
+            self._sync_segment_metadata()
+            return min(trimmed, default=0)
         n = min(self._idx, n)
         self._idx -= n
         self.offset -= n
         return n
 
     def empty(self):
+        if self._segments is not None:
+            return all(segment.empty() for segment in self._segments)
         return self.keys is None
 
     @property
@@ -6857,6 +7711,11 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
     @property
     def fused_attention_eligible(self):
         return self._fused_attention_eligible
+
+    @property
+    def packed_verify_eligible(self):
+        """Whether short-block verification can stay in packed TQ storage."""
+        return self._packed_verify_eligible
 
     def is_single_row(self):
         return self.batch_size == 1
@@ -6874,11 +7733,24 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
 
     @property
     def nbytes(self):
+        if self._segments is not None:
+            return sum(segment.nbytes for segment in self._segments)
         if self.keys is None:
             return 0
         s = _slice_state(self.keys, self._idx)
         v = _slice_state(self.values, self._idx)
         return _state_nbytes(s) + _state_nbytes(v)
+
+    @property
+    def physical_token_capacity(self):
+        if self._segments is not None:
+            return sum(
+                _state_length(segment.keys) if segment.keys is not None else 0
+                for segment in self._segments
+            )
+        return self.batch_size * (
+            _state_length(self.keys) if self.keys is not None else 0
+        )
 
 
 class _UniformTensorQuantizer:

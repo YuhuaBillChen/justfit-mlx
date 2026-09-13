@@ -8,6 +8,7 @@ from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
     _build_codec,
+    _state_length,
     _TurboQuantMSECodec,
     _TurboQuantProdCodec,
     resolve_kv_bits,
@@ -142,6 +143,61 @@ def test_batch_turboquant_extend_supports_uniform_single_item_offsets():
 
     assert first.offset.tolist() == [3, 3]
     assert first.left_padding.tolist() == [0, 0]
+
+
+def test_batch_turboquant_prefix_cache_reserve_preserves_offset_and_data():
+    keys = mx.arange(1 * 2 * 3 * 32, dtype=mx.float32).reshape(1, 2, 3, 32)
+    values = keys + 1000
+    cache = BatchTurboQuantKVCache([0], bits=3.5)
+    cache.update_and_fetch(keys, values)
+    before_keys, before_values = cache.dequantize()
+
+    targets = cache.prefix_cache_reserve(600)
+    mx.eval(targets)
+    after_keys, after_values = cache.dequantize()
+
+    assert cache._idx == 3
+    assert cache.offset.tolist() == [3]
+    assert cache.keys.norms.shape[2] == 4096
+    assert cache.values.norms.shape[2] == 4096
+    assert mx.allclose(after_keys, before_keys).item()
+    assert mx.allclose(after_values, before_values).item()
+
+    assert cache.prefix_cache_reserve(600) == ()
+
+
+def test_batch_turboquant_prefix_reserve_materializes_keys_before_values(
+    monkeypatch,
+):
+    import mlx_vlm.turboquant as turboquant
+
+    keys = mx.random.normal((1, 2, 3, 32))
+    values = mx.random.normal((1, 2, 3, 32))
+    cache = BatchTurboQuantKVCache([0], bits=3.5)
+    cache.update_and_fetch(keys, values)
+    events = []
+    reserve_state_capacity = turboquant._reserve_state_capacity
+    eval_arrays = turboquant.mx.eval
+
+    def tracked_reserve(state, used, needed, step):
+        name = "keys" if state is cache.keys else "values"
+        events.append(f"reserve_{name}")
+        return reserve_state_capacity(state, used, needed, step)
+
+    def tracked_eval(*arrays):
+        if arrays and arrays[0] is cache.keys:
+            events.append("eval_keys")
+        elif arrays and arrays[0] is cache.values:
+            events.append("eval_values")
+        return eval_arrays(*arrays)
+
+    monkeypatch.setattr(turboquant, "_reserve_state_capacity", tracked_reserve)
+    monkeypatch.setattr(turboquant.mx, "eval", tracked_eval)
+
+    cache.prefix_cache_reserve(600)
+
+    assert events == ["reserve_keys", "eval_keys", "reserve_values", "eval_values"]
+    assert not cache.prefix_cache_needs_reserve(600)
 
 
 def test_batch_turboquant_extend_supports_empty_uniform_offsets():
@@ -522,6 +578,91 @@ def test_turboquant_prefill_attention_matches_dequantized_attention():
     assert diff < 1e-4
 
 
+@pytest.mark.parametrize("bits", [3.5, 4.0])
+@pytest.mark.parametrize("query_length", [2, 3, 4])
+def test_turboquant_mtp_qtile_matches_dequantized_attention(
+    monkeypatch, bits, query_length
+):
+    import mlx_vlm.turboquant as turboquant
+
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+
+    keys = mx.random.normal((1, 2, 12, 32))
+    values = mx.random.normal((1, 2, 12, 32))
+    queries = mx.random.normal((1, 4, query_length, 32))
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(keys, values)
+    turbo_cache = TurboQuantKVCache.from_cache(fp_cache, bits=bits)
+    turbo_keys, turbo_values = turbo_cache.state
+    assert isinstance(turbo_keys, type(turbo_values))
+    dequantized_keys, dequantized_values = turbo_cache.dequantize(
+        turbo_keys, turbo_values
+    )
+
+    reference = mx.fast.scaled_dot_product_attention(
+        queries,
+        dequantized_keys.astype(queries.dtype),
+        dequantized_values.astype(queries.dtype),
+        scale=32**-0.5,
+        mask="causal",
+    )
+    calls = []
+    make_qtile_kernel = turboquant._fused_mse_prefill_qtile_kernel
+
+    def tracked_qtile_kernel(*args, **kwargs):
+        calls.append((args, kwargs))
+        return make_qtile_kernel(*args, **kwargs)
+
+    monkeypatch.setenv("MLX_VLM_TQ_MTP_QTILE", "1")
+    monkeypatch.setattr(
+        turboquant, "_fused_mse_prefill_qtile_kernel", tracked_qtile_kernel
+    )
+    quantized = scaled_dot_product_attention(
+        queries,
+        turbo_keys,
+        turbo_values,
+        turbo_cache,
+        scale=32**-0.5,
+        mask="causal",
+    )
+
+    diff = mx.max(mx.abs(reference - quantized)).item()
+    assert len(calls) == 1
+    assert quantized.shape == reference.shape
+    assert diff < 1e-4
+
+
+def test_turboquant_mtp_qtile_keeps_unsupported_query_length_on_fallback(
+    monkeypatch,
+):
+    import mlx_vlm.turboquant as turboquant
+
+    keys = mx.random.normal((1, 2, 12, 32))
+    values = mx.random.normal((1, 2, 12, 32))
+    queries = mx.random.normal((1, 4, 5, 32))
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(keys, values)
+    turbo_cache = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    turbo_keys, turbo_values = turbo_cache.state
+
+    def fail(*args, **kwargs):
+        raise AssertionError("q-tile must not be selected for q_len > 4")
+
+    monkeypatch.setenv("MLX_VLM_TQ_MTP_QTILE", "1")
+    monkeypatch.setattr(turboquant, "_fused_mse_prefill_qtile_kernel", fail)
+    output = scaled_dot_product_attention(
+        queries,
+        turbo_keys,
+        turbo_values,
+        turbo_cache,
+        scale=32**-0.5,
+        mask="causal",
+    )
+
+    assert output.shape == queries.shape
+
+
 def test_resolve_kv_bits_defaults_split_fractional_budget():
     assert resolve_kv_bits(3.5) == (3.5, 3.0, 4.0)
     assert resolve_kv_bits(4) == (4.0, 4.0, 4.0)
@@ -538,6 +679,39 @@ def test_resolve_kv_bits_validates_overrides():
         resolve_kv_bits(4, 0.5, None)
     with pytest.raises(ValueError):
         resolve_kv_bits(4, None, 3.25)
+
+
+def test_turboquant_reserve_for_append_preserves_state_and_offset():
+    cache = TurboQuantKVCache(bits=4)
+    keys = mx.random.normal((1, 4, 17, 256)).astype(mx.bfloat16)
+    values = mx.random.normal((1, 4, 17, 256)).astype(mx.bfloat16)
+    cache.update_and_fetch(keys, values)
+    before_keys, before_values = cache.dequantize()
+
+    capacity = cache.reserve_for_append(300)
+    after_keys, after_values = cache.dequantize()
+    mx.eval(before_keys, before_values, after_keys, after_values)
+
+    assert cache.offset == 17
+    assert capacity == 512
+    assert _state_length(cache.keys) == 512
+    assert mx.array_equal(before_keys, after_keys)
+    assert mx.array_equal(before_values, after_values)
+
+
+def test_batch_turboquant_reserve_for_append_preserves_offsets():
+    cache = BatchTurboQuantKVCache([2, 0], bits=4)
+    keys = mx.random.normal((2, 4, 17, 256)).astype(mx.bfloat16)
+    values = mx.random.normal((2, 4, 17, 256)).astype(mx.bfloat16)
+    cache.update_and_fetch(keys, values)
+    before_offsets = cache.offset.tolist()
+
+    capacity = cache.reserve_for_append(300)
+
+    assert cache.offset.tolist() == before_offsets
+    assert cache._idx == 17
+    assert capacity == 512
+    assert _state_length(cache.keys) == 512
 
 
 def test_asymmetric_bits_build_matching_codecs():

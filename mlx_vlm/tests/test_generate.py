@@ -42,6 +42,101 @@ from mlx_vlm.utils import ThinkingBudgetCriteria
 generate_module = sys.modules["mlx_vlm.generate"]
 image_module = __import__("mlx_vlm.generate.image", fromlist=[""])
 
+
+def test_turboquant_decode_reserve_is_layerwise_and_opt_in(monkeypatch):
+    events = []
+
+    class Reservable:
+        def __init__(self, layer):
+            self.layer = layer
+
+        def reserve_for_append(self, tokens):
+            events.append(("reserve", self.layer, tokens))
+
+    monkeypatch.setattr(ar_module.mx, "clear_cache", lambda: events.append(("clear",)))
+    caches = [CacheList(Reservable(0), object()), Reservable(1)]
+
+    assert ar_module._reserve_turboquant_decode_capacity(caches, 512) == 0
+    assert events == []
+
+    monkeypatch.setenv("MLX_VLM_TQ_RESERVE_DECODE", "1")
+    assert ar_module._reserve_turboquant_decode_capacity(caches, 512) == 2
+    assert events == [
+        ("reserve", 0, 512),
+        ("clear",),
+        ("reserve", 1, 512),
+        ("clear",),
+    ]
+
+
+def test_turboquant_decode_reserve_accepts_fixed_capacity_cache(
+    monkeypatch, caplog
+):
+    class FixedCapacity:
+        decode_capacity_is_fixed = True
+
+    monkeypatch.setenv("MLX_VLM_TQ_RESERVE_DECODE", "1")
+    with caplog.at_level(logging.INFO):
+        assert ar_module._reserve_turboquant_decode_capacity(
+            [FixedCapacity()], 512
+        ) == 0
+    assert "skipped for fixed-capacity caches" in caplog.text
+    assert "no cache supports it" not in caplog.text
+
+
+def test_warm_prompt_reserve_is_layerwise_and_only_evals_growth(monkeypatch):
+    events = []
+
+    class Reservable:
+        def __init__(self, layer, grows):
+            self.layer = layer
+            self._idx = 100
+            self.grows = grows
+            self.state = mx.array([layer])
+
+        def prefix_cache_needs_reserve(self, needed):
+            events.append(("needs_reserve", self.layer, needed))
+            return self.grows
+
+        def prefix_cache_reserve(self, needed):
+            events.append(("reserve", self.layer, needed))
+            return (mx.array([self.layer]),) if self.grows else ()
+
+    monkeypatch.setattr(
+        ar_module.mx, "eval", lambda targets: events.append(("eval", len(targets)))
+    )
+    monkeypatch.setattr(ar_module.mx, "clear_cache", lambda: events.append(("clear",)))
+    caches = [CacheList(Reservable(0, True), object()), Reservable(1, False)]
+
+    assert ar_module._reserve_warm_prompt_capacity(caches, 256) == 1
+    assert events == [
+        ("needs_reserve", 0, 356),
+        ("eval", 2),
+        ("clear",),
+        ("reserve", 0, 356),
+        ("eval", 1),
+        ("clear",),
+        ("reserve", 1, 356),
+    ]
+
+
+def test_warm_prompt_full_suffix_reserve_is_opt_in(monkeypatch):
+    assert ar_module._warm_prompt_reserve_tokens(256, 8192) == 256
+
+    monkeypatch.setenv("MLX_VLM_TQ_RESERVE_WARM_FULL_SUFFIX", "1")
+
+    assert ar_module._warm_prompt_reserve_tokens(256, 8192) == 8192
+
+
+def test_warm_prefill_tail_step_only_applies_after_threshold(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_WARM_PREFILL_TAIL_THRESHOLD", "150000")
+    monkeypatch.setenv("MLX_VLM_WARM_PREFILL_TAIL_STEP", "128")
+
+    assert ar_module._warm_prefill_step_for_context(256, [131003], 18000) == 256
+    assert ar_module._warm_prefill_step_for_context(256, [131003], 19000) == 128
+    assert ar_module._warm_prefill_step_for_context(64, [131003], 19000) == 64
+
+
 # ============================================================================
 # Fixtures and Mock Classes
 # ============================================================================
@@ -364,6 +459,83 @@ class TestGenerationBatch:
 
         assert calls == [("eval", (0, 1)), ("filter-cache", [0])]
 
+    def test_pending_state_prefers_cache_eval_state_without_materializing_state(self):
+        calls = []
+
+        class EvalStateCache:
+            @property
+            def eval_state(self):
+                calls.append("eval-state")
+                return mx.array([1], dtype=mx.int32)
+
+            @property
+            def state(self):
+                raise AssertionError("state must not be materialized")
+
+            @property
+            def reference_state(self):
+                raise AssertionError("reference_state must not be materialized")
+
+        batch = self._mrope_batch([0], [[0]])
+        batch.prompt_cache = [EvalStateCache()]
+
+        batch._eval_pending_state()
+
+        assert calls == ["eval-state"]
+
+    def test_pending_state_prefers_cache_synchronize_over_state_surfaces(self):
+        calls = []
+
+        class SynchronizingCache:
+            def synchronize(self):
+                calls.append("synchronize")
+
+            @property
+            def eval_state(self):
+                raise AssertionError("eval_state must not be read after synchronize")
+
+            @property
+            def state(self):
+                raise AssertionError("state must not be materialized")
+
+            @property
+            def reference_state(self):
+                raise AssertionError("reference_state must not be materialized")
+
+        batch = self._mrope_batch([0], [[0]])
+        batch.prompt_cache = [SynchronizingCache()]
+
+        batch._eval_pending_state()
+
+        assert calls == ["synchronize"]
+
+    def test_filter_empty_releases_cache_before_clearing_without_materialization(self):
+        calls = []
+
+        class ReleasableCache:
+            def synchronize(self):
+                calls.append("synchronize")
+
+            def release(self):
+                calls.append("release")
+
+            @property
+            def state(self):
+                raise AssertionError("state must not be materialized")
+
+            @property
+            def reference_state(self):
+                raise AssertionError("reference_state must not be materialized")
+
+        batch = self._mrope_batch([0], [[0]])
+        owned_cache = ReleasableCache()
+        batch.prompt_cache = [CacheList(owned_cache)]
+
+        batch.filter([])
+
+        assert calls == ["synchronize", "release"]
+        assert batch.prompt_cache == []
+
     @staticmethod
     def _capture(value, B):
         from mlx_vlm.generate import PromptProcessingBatch
@@ -579,6 +751,264 @@ class TestBatchGenerator:
         assert caches[0].remainder == [0, 0]
         assert caches[0].left_padding == [2, 0]
 
+    def test_make_cache_uses_paged_factory_only_for_eligible_kv_leaves(self):
+        sentinel = object()
+        calls = []
+
+        class Model:
+            def make_cache(self):
+                return [KVCache(), PoolingCache(ratio=4)]
+
+        def factory(layer_key):
+            calls.append(layer_key)
+            return sentinel
+
+        caches = ar_module._make_cache(
+            Model(),
+            [0],
+            kv_bits=4,
+            kv_quant_scheme="turboquant",
+            paged_cache_factory=factory,
+        )
+
+        assert caches[0] is sentinel
+        assert isinstance(caches[1], BatchPoolingCache)
+        assert calls == [0]
+
+    def test_make_cache_preserves_last_layer_quality_policy_in_paged_mode(self):
+        sentinels = {0: object(), 1: object()}
+        calls = []
+
+        class Model:
+            def make_cache(self):
+                return [KVCache(), KVCache(), KVCache()]
+
+        def factory(layer_key):
+            calls.append(layer_key)
+            return sentinels[layer_key]
+
+        caches = ar_module._make_cache(
+            Model(),
+            [0],
+            kv_bits=4,
+            kv_quant_scheme="turboquant",
+            paged_cache_factory=factory,
+        )
+
+        assert caches[:2] == [sentinels[0], sentinels[1]]
+        assert isinstance(caches[2], BatchKVCache)
+        assert caches[2].segment_on_extend
+        assert calls == [0, 1]
+
+        peer = BatchKVCache([0])
+        peer.segment_on_extend = True
+        for batch_cache, length in ((caches[2], 9), (peer, 3)):
+            state = mx.zeros((1, 1, length, 4))
+            batch_cache.update_and_fetch(state, state)
+        caches[2].extend(peer)
+        assert caches[2].is_segmented
+        assert [segment.offset for segment in caches[2]._segments] == [9, 3]
+        assert caches[2].physical_token_capacity == 2 * BatchKVCache.step
+
+    @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+    def test_tiny_qwen_paged_cache_runs_b1_b2_b1_without_kv_relocation(self):
+        import mlx_vlm.models.qwen3_5.language as qwen_language
+        from mlx_vlm.paged_turboquant_pool import (
+            PagedTurboQuantLayerSpec,
+            PagedTurboQuantPoolRegistry,
+        )
+
+        config = qwen_language.TextConfig(
+            model_type="qwen3_5_text",
+            hidden_size=512,
+            intermediate_size=64,
+            linear_num_value_heads=2,
+            linear_num_key_heads=2,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_conv_kernel_dim=4,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            rms_norm_eps=1e-6,
+            vocab_size=64,
+            num_key_value_heads=1,
+            max_position_embeddings=1024,
+            tie_word_embeddings=True,
+            head_dim=256,
+            full_attention_interval=2,
+            rope_parameters={
+                "type": "default",
+                "mrope_section": [8, 12, 12],
+                "rope_theta": 10000,
+                "partial_rotary_factor": 0.25,
+            },
+        )
+        model = qwen_language.LanguageModel(config)
+        model.config = SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+            image_token_id=100,
+            video_token_id=101,
+            vision_start_token_id=102,
+        )
+        registry = PagedTurboQuantPoolRegistry(
+            {1: PagedTurboQuantLayerSpec(capacity_pages=8, kv_heads=1)}
+        )
+
+        def make_cache():
+            return ar_module._make_cache(
+                model,
+                [0],
+                kv_bits=4,
+                kv_quant_scheme="turboquant",
+                paged_cache_factory=registry,
+            )
+
+        active_cache = make_cache()
+        model(
+            mx.arange(260, dtype=mx.int32)[None] % config.vocab_size,
+            cache=active_cache,
+        )
+        model(mx.array([[3]], dtype=mx.int32), cache=active_cache)
+        paged = active_cache[1]
+        original_storage = paged.storage
+        original_payload_ids = tuple(
+            id(array)
+            for state in (original_storage.keys, original_storage.values)
+            for array in state
+        )
+        original_pages = paged._rows.rows[0].page_ids
+
+        joining_cache = make_cache()
+        model(
+            mx.arange(17, dtype=mx.int32)[None] % config.vocab_size,
+            cache=joining_cache,
+        )
+        ar_module._extend_cache(active_cache, joining_cache)
+
+        assert paged.storage is original_storage
+        assert paged._rows.rows[0].page_ids == original_pages
+        assert tuple(
+            id(array)
+            for state in (original_storage.keys, original_storage.values)
+            for array in state
+        ) == original_payload_ids
+        output = model(mx.array([[4], [5]], dtype=mx.int32), cache=active_cache)
+        mx.eval(output.logits)
+        assert output.logits.shape == (2, 1, config.vocab_size)
+
+        for cache_entry in active_cache:
+            cache_entry.filter(mx.array([1], dtype=mx.int32))
+        output = model(mx.array([[6]], dtype=mx.int32), cache=active_cache)
+        mx.eval(output.logits)
+        assert output.logits.shape == (1, 1, config.vocab_size)
+        assert paged.storage is original_storage
+        assert original_storage.allocator.stats().used_pages == 1
+
+        registry.release()
+        assert original_storage.allocator.stats().used_pages == 0
+
+    @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+    def test_batch_generator_admits_independent_paged_prompt_without_relocation(
+        self, mock_processor
+    ):
+        import mlx_vlm.models.qwen3_5.language as qwen_language
+        from mlx_vlm.paged_turboquant_pool import (
+            PagedTurboQuantLayerSpec,
+            PagedTurboQuantPoolRegistry,
+        )
+
+        config = qwen_language.TextConfig(
+            model_type="qwen3_5_text",
+            hidden_size=512,
+            intermediate_size=64,
+            linear_num_value_heads=2,
+            linear_num_key_heads=2,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_conv_kernel_dim=4,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            rms_norm_eps=1e-6,
+            vocab_size=64,
+            num_key_value_heads=1,
+            max_position_embeddings=1024,
+            tie_word_embeddings=True,
+            head_dim=256,
+            full_attention_interval=2,
+            rope_parameters={
+                "type": "default",
+                "mrope_section": [8, 12, 12],
+                "rope_theta": 10000,
+                "partial_rotary_factor": 0.25,
+            },
+        )
+        model = qwen_language.LanguageModel(config)
+        model.config = SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+            image_token_id=100,
+            video_token_id=101,
+            vision_start_token_id=102,
+        )
+        registry = PagedTurboQuantPoolRegistry(
+            {1: PagedTurboQuantLayerSpec(capacity_pages=8, kv_heads=1)}
+        )
+        mock_processor.tokenizer.stopping_criteria.eos_token_ids = [999]
+        generator = BatchGenerator(
+            model,
+            mock_processor,
+            completion_batch_size=2,
+            prefill_batch_size=1,
+            prefill_step_size=256,
+            kv_bits=4,
+            kv_quant_scheme="turboquant",
+            quantized_kv_start=0,
+            compute_logprobs=False,
+            paged_cache_factory=registry,
+        )
+
+        first_prompt = list(range(260))
+        first_embeds = model.model.embed_tokens(
+            (mx.array(first_prompt, dtype=mx.int32) % config.vocab_size)[None]
+        )
+        (first_uid,) = generator.insert(
+            [first_prompt],
+            max_tokens=20,
+            prompt_kwargs=[{"inputs_embeds": first_embeds}],
+        )
+        first_seen = False
+        for _ in range(8):
+            _, responses = generator.next()
+            first_seen = first_seen or any(r.uid == first_uid for r in responses)
+            if first_seen:
+                break
+        assert first_seen
+        paged = generator._generation_batch.prompt_cache[1]
+        storage = paged.storage
+        first_pages = paged._rows.rows[0].page_ids
+
+        second_prompt = list(range(17))
+        second_embeds = model.model.embed_tokens(
+            (mx.array(second_prompt, dtype=mx.int32) % config.vocab_size)[None]
+        )
+        (second_uid,) = generator.insert(
+            [second_prompt],
+            max_tokens=4,
+            prompt_kwargs=[{"inputs_embeds": second_embeds}],
+        )
+        second_seen = False
+        for _ in range(12):
+            _, responses = generator.next()
+            second_seen = second_seen or any(r.uid == second_uid for r in responses)
+            if second_seen:
+                break
+
+        assert second_seen
+        assert paged.storage is storage
+        assert paged._rows.rows[0].page_ids == first_pages
+        assert paged.batch_size == 2
+        generator.close()
+        assert storage.allocator.stats().used_pages == 0
+
     def test_next_reports_prompt_progress_for_completed_prefill(
         self, mock_model, mock_processor, monkeypatch
     ):
@@ -629,6 +1059,146 @@ class TestBatchGenerator:
 
         assert gen.stats().prompt_tokens == prompt_tokens
 
+    def test_active_mtp_decode_interleaves_pending_prefill(
+        self, mock_model, mock_processor
+    ):
+        events = []
+
+        class ActiveMTP:
+            is_speculative = True
+            draft_kind = "mtp"
+            logits_processors = []
+
+            def __len__(self):
+                return 1
+
+            def next(self):
+                events.append("decode")
+                return ["token"]
+
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=2,
+        )
+        gen._generation_batch = ActiveMTP()
+        gen._prompt_batch = SimpleNamespace(
+            needs_processing=lambda: True,
+            prompt_step=lambda: events.append("prefill"),
+        )
+
+        prompt_responses, generation_responses = gen.next()
+
+        assert prompt_responses == []
+        assert generation_responses == ["token"]
+        assert events == ["decode", "prefill"]
+
+    def test_prefill_schedule_interval_allows_one_mixed_step_per_n_decode_steps(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        monkeypatch.setenv("MLX_VLM_PREFILL_SCHEDULE_INTERVAL", "4")
+        events = []
+
+        class ActiveAR:
+            is_speculative = False
+            logits_processors = []
+
+            def __len__(self):
+                return 1
+
+            def next(self):
+                events.append("decode")
+                return ["token"]
+
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=2,
+        )
+        gen._generation_batch = ActiveAR()
+        gen._prompt_batch = SimpleNamespace(
+            needs_processing=lambda: True,
+            prompt_step=lambda: events.append("prefill"),
+        )
+
+        for _ in range(4):
+            gen.next()
+
+        assert events == ["decode", "decode", "decode", "decode", "prefill"]
+
+    def test_prefill_schedule_interval_does_not_throttle_without_decode(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        monkeypatch.setenv("MLX_VLM_PREFILL_SCHEDULE_INTERVAL", "8")
+        events = []
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=2,
+        )
+        gen._prompt_batch = SimpleNamespace(
+            needs_processing=lambda: True,
+            prompt_step=lambda: events.append("prefill"),
+        )
+
+        gen.next()
+
+        assert events == ["prefill"]
+
+    def test_mixed_prefill_step_cap_only_applies_while_decode_is_active(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        monkeypatch.setenv("MLX_VLM_MIXED_PREFILL_STEP_SIZE", "64")
+
+        class ActiveAR:
+            is_speculative = False
+            logits_processors = []
+
+            def __len__(self):
+                return 1
+
+            def next(self):
+                return ["token"]
+
+        observed = []
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=2,
+        )
+        gen._generation_batch = ActiveAR()
+        prompt = SimpleNamespace(prefill_step_size=256)
+        prompt.needs_processing = lambda: True
+        prompt.prompt_step = lambda: observed.append(prompt.prefill_step_size)
+        gen._prompt_batch = prompt
+
+        gen.next()
+
+        assert observed == [64]
+        assert prompt.prefill_step_size == 256
+        gen.close()
+
+    def test_mixed_prefill_step_cap_does_not_throttle_prefill_alone(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        monkeypatch.setenv("MLX_VLM_MIXED_PREFILL_STEP_SIZE", "64")
+        observed = []
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=2,
+        )
+        prompt = SimpleNamespace(prefill_step_size=256)
+        prompt.needs_processing = lambda: True
+        prompt.prompt_step = lambda: observed.append(prompt.prefill_step_size)
+        gen._prompt_batch = prompt
+
+        gen.next()
+
+        assert observed == [256]
+        assert prompt.prefill_step_size == 256
+        gen.close()
+
     def test_prompt_progress_reports_apc_cached_tokens(self):
         batch = PromptProcessingBatch(
             model=SimpleNamespace(),
@@ -674,6 +1244,151 @@ class TestBatchGenerator:
         async_eval_mock.assert_called_once_with([cache_state])
         eval_mock.assert_not_called()
 
+    def test_prompt_step_builds_only_the_current_embedding_chunk(self, monkeypatch):
+        cache_state = mx.array([1])
+        calls = []
+
+        def provider(input_ids, *, start):
+            calls.append((input_ids.tolist(), start))
+            return mx.ones((1, input_ids.shape[1], 4))
+
+        model = MagicMock()
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[1],
+            input_ids=[[1, 2, 3, 4, 5]],
+            max_tokens=[1],
+            inputs_embeds=None,
+            prompt_kwargs={"input_embedding_provider": provider},
+            prefill_step_size=2,
+            warm_cache=[SimpleNamespace(state=cache_state)],
+        )
+        monkeypatch.setattr(ar_module.mx, "async_eval", MagicMock())
+        monkeypatch.setattr(ar_module.mx, "clear_cache", MagicMock())
+
+        assert batch.prompt_step() == 2
+        assert calls == [([[1, 2]], 0)]
+        assert model.call_args.kwargs["inputs_embeds"].shape == (1, 2, 4)
+        assert batch._input_ids.tolist() == [[3, 4, 5]]
+
+    def test_prompt_step_skips_unused_logits_when_model_supports_it(self, monkeypatch):
+        cache_state = mx.array([1])
+        model = MagicMock()
+        model.supports_skip_logits = True
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[1],
+            input_ids=[[1, 2, 3, 4, 5]],
+            max_tokens=[1],
+            inputs_embeds=mx.ones((1, 5, 4)),
+            prompt_kwargs={"position_ids": mx.arange(5)[None]},
+            prefill_step_size=2,
+            warm_cache=[SimpleNamespace(state=cache_state)],
+        )
+        monkeypatch.setattr(ar_module.mx, "async_eval", MagicMock())
+        monkeypatch.setattr(ar_module.mx, "clear_cache", MagicMock())
+
+        assert batch.prompt_step() == 2
+        assert model.call_args.kwargs["skip_logits"] is True
+        assert model.call_args.kwargs["position_ids"].shape == (1, 2)
+
+    def test_prompt_head_phase_swap_unloads_for_chunks_and_loads_for_final_token(
+        self, monkeypatch
+    ):
+        cache_state = mx.array([1])
+        model = MagicMock()
+        model.supports_skip_logits = True
+        model.prefill_head_phase_swap = SimpleNamespace(
+            unload=MagicMock(), load=MagicMock()
+        )
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[1],
+            input_ids=[[1, 2, 3]],
+            max_tokens=[1],
+            inputs_embeds=mx.ones((1, 3, 4)),
+            prompt_kwargs={},
+            prefill_step_size=2,
+            warm_cache=[SimpleNamespace(state=cache_state)],
+        )
+        monkeypatch.setattr(ar_module.mx, "async_eval", MagicMock())
+        monkeypatch.setattr(ar_module.mx, "clear_cache", MagicMock())
+
+        assert batch.prompt_step() == 2
+        model.prefill_head_phase_swap.unload.assert_called_once_with()
+
+        model.side_effect = RuntimeError("stop after lifecycle transition")
+        sampler = lambda logits: mx.array([1])
+        stop = MagicMock()
+        stop.eos_token_ids = []
+        with pytest.raises(RuntimeError, match="lifecycle transition"):
+            batch.generate(sampler, stop)
+        model.prefill_head_phase_swap.load.assert_called_once_with()
+
+    def test_prompt_head_phase_swap_respects_active_generation_lease(
+        self, monkeypatch
+    ):
+        cache_state = mx.array([1])
+        phase_swap = SimpleNamespace(unload=MagicMock(), load=MagicMock())
+        residency = SimpleNamespace(
+            contains=MagicMock(return_value=True),
+            unload_if_idle=MagicMock(),
+            acquire=MagicMock(),
+        )
+
+        model = MagicMock()
+        model.supports_skip_logits = True
+        model.prefill_head_phase_swap = phase_swap
+        model.phase_residency_manager = residency
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[1],
+            input_ids=[[1, 2, 3]],
+            max_tokens=[1],
+            inputs_embeds=mx.ones((1, 3, 4)),
+            prompt_kwargs={},
+            prefill_step_size=2,
+            warm_cache=[SimpleNamespace(state=cache_state)],
+        )
+        monkeypatch.setattr(ar_module.mx, "async_eval", MagicMock())
+        monkeypatch.setattr(ar_module.mx, "clear_cache", MagicMock())
+
+        assert batch.prompt_step() == 2
+        residency.unload_if_idle.assert_called_once_with("lm_head")
+        phase_swap.unload.assert_not_called()
+
+        model.side_effect = RuntimeError("stop after lifecycle transition")
+        sampler = lambda logits: mx.array([1])
+        stop = MagicMock()
+        stop.eos_token_ids = []
+        with pytest.raises(RuntimeError, match="lifecycle transition"):
+            batch.generate(sampler, stop)
+        residency.acquire.assert_called_once_with("lm_head", "generation")
+        phase_swap.load.assert_not_called()
+
+    def test_batch_generator_releases_head_after_last_decoder_finishes(self):
+        residency = SimpleNamespace(
+            contains=MagicMock(return_value=True),
+            acquire=MagicMock(),
+            release=MagicMock(),
+        )
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen.model = SimpleNamespace(phase_residency_manager=residency)
+        gen._generation_batch = []
+
+        gen._sync_generation_head_residency()
+
+        residency.release.assert_called_once_with("lm_head", "generation")
+        residency.acquire.assert_not_called()
+
+        residency.acquire.reset_mock()
+        residency.release.reset_mock()
+        gen._generation_batch = [object()]
+        gen._sync_generation_head_residency()
+
+        residency.acquire.assert_called_once_with("lm_head", "generation")
+        residency.release.assert_not_called()
+
     def test_prompt_step_keeps_exact_apc_checkpoint_async(self, monkeypatch):
         cache_state = mx.array([1])
         batch = PromptProcessingBatch(
@@ -700,6 +1415,14 @@ class TestBatchGenerator:
         eval_mock.assert_not_called()
         batch._store_apc_exact_checkpoints.assert_called_once_with()
 
+    def test_response_dataclass(self):
+        response = GenerationBatch.Response(
+            uid=0, token=42, token_logprob=-0.5, finish_reason="stop"
+        )
+
+        assert response.uid == 0
+        assert response.token == 42
+        assert response.finish_reason == "stop"
     def test_generation_batch_applies_per_sequence_logits_processors(self):
         class FixedLogitModel:
             def __call__(self, input_ids, cache=None, **kwargs):
@@ -881,8 +1604,12 @@ class TestBatchGenerator:
         assert model.calls == [{}]
 
     def test_speculative_generation_batch_drains_full_round(self, monkeypatch):
+        factory = object()
+        seen = {}
+
         def fake_rounds(*args, **kwargs):
-            del args, kwargs
+            del args
+            seen.update(kwargs)
             yield [1, 10], {"round_pos": 0, "round_len": 2}
             yield [2, 11], {"round_pos": 1, "round_len": 2}
             yield [3, 12], {"round_pos": 0, "round_len": 1}
@@ -902,6 +1629,7 @@ class TestBatchGenerator:
             hidden=mx.zeros((2, 1, 1)),
             shared_kv_states=None,
             prompt_tokens=mx.array([[0], [9]], dtype=mx.int32),
+            paged_cache_factory=factory,
         )
 
         first = batch.next()
@@ -914,6 +1642,767 @@ class TestBatchGenerator:
             (100, 2),
             (200, 11),
         ]
+        assert seen["paged_cache_factory"] is factory
+
+    @pytest.mark.parametrize("first_token_sent", [False, True])
+    def test_mtp_batch_demotes_to_ar_without_reemitting_last_token(
+        self, first_token_sent
+    ):
+        class Model:
+            def __call__(self, inputs, cache=None, **kwargs):
+                del cache, kwargs
+                logits = mx.zeros((inputs.shape[0], 1, 8))
+                logits[:, :, 4] = 10
+                return SimpleNamespace(logits=logits)
+
+        batch = SpeculativeGenerationBatch(
+            model=Model(),
+            draft_model=SimpleNamespace(),
+            draft_kind="mtp",
+            uids=[100],
+            first_tokens=mx.array([3], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[8],
+            hidden=mx.zeros((1, 1, 1)),
+            shared_kv_states=None,
+            prompt_tokens=mx.array([[1, 2]], dtype=mx.int32),
+            greedy_sampling=True,
+            paged_cache_factory=object(),
+        )
+
+        if first_token_sent:
+            assert [response.token for response in batch.next()] == [3]
+
+        batch._rope_deltas = mx.array([[7]], dtype=mx.int32)
+        ar_batch = batch.to_autoregressive()
+        assert ar_batch._paged_cache_factory is batch._paged_cache_factory
+        assert ar_batch._rope_deltas.tolist() == [[7]]
+        assert ar_batch.thinking_budget_criteria == [None]
+        response = ar_batch.next()
+
+        assert [item.token for item in response] == [4 if first_token_sent else 3]
+
+    def test_ar_batch_repromotes_survivor_to_mtp_without_token_or_cache_migration(self):
+        class Model:
+            def __call__(self, inputs, cache=None, **kwargs):
+                del cache
+                logits = mx.zeros((inputs.shape[0], 1, 8))
+                logits[:, :, 4] = 10
+                hidden = inputs[:, :, None].astype(mx.float32)
+                return SimpleNamespace(
+                    logits=logits,
+                    hidden_states=[hidden] if kwargs.get("return_hidden") else None,
+                    shared_kv_states={} if kwargs.get("return_shared_kv") else None,
+                )
+
+        cache_owner = object()
+        draft_owner = SimpleNamespace()
+        batch = GenerationBatch(
+            model=Model(),
+            uids=[100, 200],
+            inputs=mx.array([2, 3], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[8, 1],
+            greedy_sampling=True,
+            paged_cache_factory=cache_owner,
+        )
+        batch.compute_logprobs = False
+        batch.enable_mtp_repromotion(draft_owner, draft_block_size=3)
+
+        responses = batch.next()
+        assert [(item.uid, item.token, item.finish_reason) for item in responses] == [
+            (100, 2, None),
+            (200, 3, "length"),
+        ]
+        assert batch.uids == [100]
+
+        promoted = batch.to_speculative_mtp()
+        assert promoted is not None
+        assert promoted._paged_cache_factory is cache_owner
+        assert promoted.prompt_cache is batch.prompt_cache
+        assert promoted._draft_owner is draft_owner
+        assert promoted._num_tokens == [1]
+        assert [(item.uid, item.token) for item in promoted.next()] == [(100, 4)]
+
+    def test_singleton_speculation_policy_uses_ar_for_joined_rows(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        monkeypatch.setenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "1")
+        draft = object()
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=2,
+            draft_model=draft,
+            draft_kind="mtp",
+            draft_block_size=3,
+        )
+
+        assert gen._draft_for_prompt_batch(1) == (draft, "mtp", 3)
+        assert gen._draft_for_prompt_batch(2) == (None, None, None)
+
+        class Active:
+            def __len__(self):
+                return 1
+
+        gen._generation_batch = Active()
+        assert gen._draft_for_prompt_batch(1) == (None, None, None)
+
+    def test_singleton_speculation_policy_uses_ar_while_initial_peers_wait(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        """Paged B4 prefill must not materialize MTP for its first B1 chunk."""
+        monkeypatch.setenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "1")
+        draft = object()
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=4,
+            prefill_batch_size=1,
+            draft_model=draft,
+            draft_kind="mtp",
+            draft_block_size=3,
+        )
+        gen.insert([[1], [2], [3], [4]])
+
+        # The paged scheduler will prefill one row at a time, but the other
+        # three rows are already resident work and require an AR cohort.
+        assert gen._draft_for_prompt_batch(1) == (None, None, None)
+        gen.close()
+
+    def test_peer_arriving_mid_prefill_suppresses_stale_singleton_mtp(
+        self, monkeypatch, mock_model, mock_processor, caplog
+    ):
+        """A prompt's MTP choice must be rechecked at its final boundary."""
+        monkeypatch.setenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "1")
+        caplog.set_level(logging.INFO, logger="mlx_vlm.generate")
+        draft = object()
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=2,
+            prefill_batch_size=1,
+            draft_model=draft,
+            draft_kind="mtp",
+            draft_block_size=3,
+        )
+        prompt = SimpleNamespace(
+            draft_model=draft,
+            draft_kind="mtp",
+            draft_block_size=3,
+        )
+
+        assert not gen._suppress_stale_singleton_mtp(prompt)
+        gen._unprocessed_sequences.append(object())
+        assert gen._suppress_stale_singleton_mtp(prompt)
+        assert prompt.draft_model is None
+        assert prompt.draft_kind is None
+        assert prompt.draft_block_size is None
+        assert "cold peer arrived during prefill" in caplog.text
+        gen.close()
+
+    def test_initial_ar_cohort_retains_singleton_mtp_repromotion_owner(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        monkeypatch.setenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "1")
+        monkeypatch.setenv("MLX_VLM_MTP_REPROMOTE", "1")
+        draft = object()
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=4,
+            draft_model=draft,
+            draft_kind="mtp",
+            draft_block_size=3,
+        )
+        initial = GenerationBatch.empty(
+            mock_model.language_model,
+            gen.sampler,
+            gen.tokenizer.stopping_criteria,
+            compute_logprobs=False,
+            greedy_sampling=True,
+        )
+
+        gen._extend_generation_batch(initial)
+
+        assert gen._generation_batch._mtp_repromotion == {
+            "draft_model": draft,
+            "draft_block_size": 3,
+        }
+        gen.close()
+
+    def test_batch_invariant_policy_disables_mtp_and_repromotion(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        monkeypatch.setenv("MLX_VLM_BATCH_INVARIANT", "1")
+        monkeypatch.setenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "1")
+        monkeypatch.setenv("MLX_VLM_MTP_REPROMOTE", "1")
+        draft = object()
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            completion_batch_size=4,
+            draft_model=draft,
+            draft_kind="mtp",
+            draft_block_size=3,
+        )
+
+        assert gen._draft_for_prompt_batch(1) == (None, None, None)
+
+        initial = GenerationBatch.empty(
+            mock_model.language_model,
+            gen.sampler,
+            gen.tokenizer.stopping_criteria,
+            compute_logprobs=False,
+            greedy_sampling=True,
+        )
+        gen._extend_generation_batch(initial)
+
+        assert gen._generation_batch._mtp_repromotion is None
+        promote = MagicMock(return_value=object())
+        monkeypatch.setattr(gen._generation_batch, "to_speculative_mtp", promote)
+        assert not gen.promote_ar_singleton_to_mtp()
+        promote.assert_not_called()
+        gen.close()
+
+    def test_cold_peer_demotes_active_singleton_mtp_before_ar_join(
+        self, monkeypatch, mock_model, mock_processor, caplog
+    ):
+        """A peer prefetched while singleton MTP starts must join as AR."""
+        monkeypatch.setenv("MLX_VLM_MTP_REPROMOTE", "1")
+        caplog.set_level(logging.INFO, logger="mlx_vlm.generate")
+        model = mock_model.language_model
+        draft = SimpleNamespace(unload=MagicMock())
+        cache_factory = object()
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop = lambda token: False
+        gen = BatchGenerator(model=model, processor=mock_processor)
+        active = SpeculativeGenerationBatch(
+            model=model,
+            draft_model=draft,
+            draft_kind="mtp",
+            uids=[100],
+            first_tokens=mx.array([3], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop,
+            max_tokens=[8],
+            hidden=mx.zeros((1, 1, 1)),
+            shared_kv_states=None,
+            prompt_tokens=mx.array([[1, 2]], dtype=mx.int32),
+            greedy_sampling=True,
+            paged_cache_factory=cache_factory,
+        )
+        peer = GenerationBatch(
+            model=model,
+            uids=[200],
+            inputs=mx.array([4], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop,
+            max_tokens=[8],
+            greedy_sampling=True,
+            paged_cache_factory=cache_factory,
+        )
+        gen._generation_batch = active
+
+        gen._extend_generation_batch(peer)
+
+        assert isinstance(gen._generation_batch, GenerationBatch)
+        assert gen._generation_batch.uids == [100, 200]
+        assert gen._generation_batch._mtp_repromotion["draft_model"] is draft
+        draft.unload.assert_called_once_with()
+        assert "Demoted active MTP cohort to AR before cold peer admission" in caplog.text
+        gen.close()
+
+    def test_close_returns_rows_without_releasing_server_owned_paged_pool(self):
+        """A completed cohort must leave persistent pool ownership to the server."""
+        registry = SimpleNamespace(release=MagicMock())
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen._prompt_batch = None
+        gen._generation_batch = None
+        gen._paged_cache_factory = registry
+        gen._owns_paged_cache_factory = False
+        gen._wire_stack = None
+
+        gen.close()
+
+        registry.release.assert_not_called()
+        assert gen._paged_cache_factory is registry
+
+    def test_paged_runtime_accepts_only_singleton_mtp(
+        self, monkeypatch, mock_model, mock_processor
+    ):
+        factory = object()
+        draft = object()
+        common = dict(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            prefill_batch_size=1,
+            kv_bits=4,
+            kv_quant_scheme="turboquant",
+            quantized_kv_start=0,
+            paged_cache_factory=factory,
+            draft_model=draft,
+            draft_kind="mtp",
+        )
+
+        with pytest.raises(ValueError, match="singleton-only MTP"):
+            BatchGenerator(**common)
+
+        monkeypatch.setenv("MLX_VLM_SPECULATIVE_SINGLETON_ONLY", "1")
+        gen = BatchGenerator(**common)
+        assert gen._paged_cache_factory is factory
+        assert gen._draft_for_prompt_batch(1) == (draft, "mtp", None)
+        gen.close()
+
+    def test_active_mtp_batch_rebases_and_extends_prefetched_batch(self):
+        class BatchCache:
+            def __init__(self, value):
+                self.value = mx.array([[value]], dtype=mx.float32)
+
+            @property
+            def state(self):
+                return self.value
+
+            def filter(self, indices):
+                self.value = self.value[indices]
+
+            def extend(self, other):
+                self.value = mx.concatenate([self.value, other.value])
+
+        class Model:
+            def __call__(self, inputs, cache=None, **kwargs):
+                assert inputs.tolist() == [[1]]
+                assert kwargs == {"return_hidden": True, "return_shared_kv": True}
+                logits = mx.array([[[0.0, 1.0, 2.0, 4.0]]])
+                hidden = mx.array([[[10.0, 11.0]]])
+                keys = mx.arange(8, dtype=mx.float32).reshape(1, 1, 4, 2)
+                return SimpleNamespace(
+                    logits=logits,
+                    hidden_states=[hidden],
+                    shared_kv_states={"full": (keys, keys + 100)},
+                )
+
+        model = Model()
+        draft = SimpleNamespace()
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop = lambda token: False
+        active = SpeculativeGenerationBatch(
+            model=model,
+            draft_model=draft,
+            draft_kind="mtp",
+            uids=[100],
+            first_tokens=mx.array([1], dtype=mx.int32),
+            prompt_cache=[BatchCache(1)],
+            sampler=sampler,
+            stop_criteria=stop,
+            max_tokens=[8],
+            hidden=mx.zeros((1, 1, 2)),
+            shared_kv_states={
+                "full": (
+                    mx.zeros((1, 1, 2, 2)),
+                    mx.zeros((1, 1, 2, 2)),
+                )
+            },
+            prompt_tokens=mx.array([[5, 6]], dtype=mx.int32),
+        )
+        pending_keys = mx.ones((1, 1, 3, 2))
+        pending = SpeculativeGenerationBatch(
+            model=model,
+            draft_model=draft,
+            draft_kind="mtp",
+            uids=[200],
+            first_tokens=mx.array([9], dtype=mx.int32),
+            prompt_cache=[BatchCache(2)],
+            sampler=sampler,
+            stop_criteria=stop,
+            max_tokens=[6],
+            hidden=mx.array([[[20.0, 21.0]]]),
+            shared_kv_states={"full": (pending_keys, pending_keys + 100)},
+            prompt_tokens=mx.array([[7, 8, 9]], dtype=mx.int32),
+        )
+
+        assert [(r.uid, r.token) for r in active.next()] == [(100, 1)]
+        # Deferred phase-swap keeps a stable LazyDrafter owner, while the
+        # active batch replaces its operational reference with the loaded
+        # model. A newly-prefetched row still carries the wrapper.
+        lazy_owner = SimpleNamespace()
+        active._draft_owner = lazy_owner
+        pending._draft_owner = lazy_owner
+        pending.draft_model = lazy_owner
+        active.extend(pending)
+
+        assert active.uids == [100, 200]
+        assert active.draft_model is draft
+        assert active.first_tokens.tolist() == [3, 9]
+        assert active.prompt_tokens.tolist() == [[0, 0, 1], [7, 8, 9]]
+        assert active.prompt_cache[0].value.tolist() == [[1.0], [2.0]]
+        assert active.shared_kv_states["full"][0].shape == (2, 1, 4, 2)
+        assert [(r.uid, r.token) for r in active.next()] == [(100, 3), (200, 9)]
+
+    def test_tiny_qwen_mtp_staggered_join_matches_singletons(self):
+        import mlx_vlm.models.qwen3_5.language as qwen_language
+        from mlx_vlm.speculative.drafters.qwen3_5_mtp import (
+            ModelConfig as QwenMTPConfig,
+        )
+        from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
+
+        config = qwen_language.TextConfig(
+            model_type="qwen3_5_text",
+            hidden_size=16,
+            intermediate_size=32,
+            linear_num_value_heads=2,
+            linear_num_key_heads=2,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_conv_kernel_dim=4,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            rms_norm_eps=1e-6,
+            vocab_size=32,
+            num_key_value_heads=1,
+            max_position_embeddings=128,
+            tie_word_embeddings=True,
+            head_dim=8,
+            full_attention_interval=2,
+            rope_parameters={
+                "type": "default",
+                "mrope_section": [1, 0, 0],
+                "rope_theta": 10000,
+                "partial_rotary_factor": 0.25,
+            },
+        )
+        config.mtp_num_hidden_layers = 1
+        target = qwen_language.LanguageModel(config)
+        target.config = SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+            image_token_id=100,
+            video_token_id=101,
+            vision_start_token_id=102,
+        )
+        draft = Qwen3_5MTPDraftModel(QwenMTPConfig(text_config=config, block_size=3))
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+
+        def make_batch(uid, prompt, max_tokens=12):
+            prompt = mx.array([prompt], dtype=mx.int32)
+            prompt_cache = ar_module._make_cache(
+                target,
+                [0],
+                kv_bits=4,
+                kv_quant_scheme="turboquant",
+            )
+            output = target(
+                prompt,
+                cache=prompt_cache,
+                return_hidden=True,
+                return_shared_kv=True,
+            )
+            first = mx.argmax(output.logits[:, -1, :], axis=-1)
+            mx.eval(first, [c.state for c in prompt_cache])
+            return SpeculativeGenerationBatch(
+                model=target,
+                draft_model=draft,
+                draft_kind="mtp",
+                uids=[uid],
+                first_tokens=first,
+                prompt_cache=prompt_cache,
+                sampler=sampler,
+                stop_criteria=lambda token: False,
+                max_tokens=[max_tokens],
+                hidden=output.hidden_states[-1],
+                shared_kv_states=output.shared_kv_states,
+                prompt_tokens=prompt,
+                draft_block_size=3,
+                greedy_sampling=True,
+            )
+
+        def make_ar_batch(uid, prompt, max_tokens=12):
+            prompt = mx.array([prompt], dtype=mx.int32)
+            prompt_cache = ar_module._make_cache(
+                target,
+                [0],
+                kv_bits=4,
+                kv_quant_scheme="turboquant",
+            )
+            output = target(prompt, cache=prompt_cache)
+            first = mx.argmax(output.logits[:, -1, :], axis=-1)
+            mx.eval(first, [c.state for c in prompt_cache])
+            batch = GenerationBatch(
+                model=target,
+                uids=[uid],
+                inputs=first,
+                prompt_cache=prompt_cache,
+                sampler=sampler,
+                stop_criteria=lambda token: False,
+                max_tokens=[max_tokens],
+                greedy_sampling=True,
+            )
+            batch.compute_logprobs = False
+            return batch
+
+        def drain(batch):
+            tokens = {}
+            while len(batch) > 0:
+                for response in batch.next():
+                    if response.token is not None:
+                        tokens.setdefault(response.uid, []).append(response.token)
+            return tokens
+
+        active = make_batch(100, [1, 2, 3, 4])
+        dynamic = {100: []}
+        for _ in range(2):
+            for response in active.next():
+                dynamic.setdefault(response.uid, []).append(response.token)
+        active.extend(make_batch(200, [5, 6, 7, 8, 9]))
+        for uid, tokens in drain(active).items():
+            dynamic.setdefault(uid, []).extend(tokens)
+
+        baseline_a = drain(make_batch(100, [1, 2, 3, 4]))[100]
+        baseline_b = drain(make_batch(200, [5, 6, 7, 8, 9]))[200]
+
+        assert dynamic[100] == baseline_a
+        assert dynamic[200] == baseline_b
+
+        # Reproduce the synchronized-cold admission lifecycle: A begins in
+        # singleton MTP, B finishes prefill as AR, A demotes for the join, and
+        # the surviving A row later re-promotes. Both token streams must match
+        # their uninterrupted singleton trajectories exactly.
+        transitioning = make_batch(210, [1, 2, 3, 4], max_tokens=12)
+        transitioned_tokens = {210: []}
+        for _ in range(2):
+            for response in transitioning.next():
+                transitioned_tokens[210].append(response.token)
+        transitioning_ar = transitioning.to_autoregressive()
+        transitioning_ar.enable_mtp_repromotion(draft, draft_block_size=3)
+        transitioning_ar.extend(make_ar_batch(220, [5, 6, 7, 8, 9], max_tokens=3))
+        while 220 in transitioning_ar.uids:
+            for response in transitioning_ar.next():
+                if response.token is not None:
+                    transitioned_tokens.setdefault(response.uid, []).append(
+                        response.token
+                    )
+        promoted = transitioning_ar.to_speculative_mtp()
+        assert promoted is not None
+        for uid, tokens in drain(promoted).items():
+            transitioned_tokens.setdefault(uid, []).extend(tokens)
+
+        assert transitioned_tokens[210] == drain(
+            make_batch(210, [1, 2, 3, 4], 12)
+        )[210]
+        assert transitioned_tokens[220] == drain(
+            make_ar_batch(220, [5, 6, 7, 8, 9], 3)
+        )[220]
+
+        # A short row must be removed from the target/drafter cache before a
+        # later request joins the still-active row.
+        staggered = make_batch(300, [10, 11, 12], max_tokens=2)
+        staggered.extend(make_batch(400, [13, 14, 15, 16], max_tokens=10))
+        filtered = {300: [], 400: []}
+        for response in staggered.next():
+            filtered[response.uid].append(response.token)
+        for response in staggered.next():
+            filtered[response.uid].append(response.token)
+        assert staggered.uids == [400]
+
+        staggered.extend(make_batch(500, [17, 18, 19], max_tokens=8))
+        for uid, tokens in drain(staggered).items():
+            filtered.setdefault(uid, []).extend(tokens)
+
+        assert filtered[300] == drain(make_batch(300, [10, 11, 12], 2))[300]
+        assert filtered[400] == drain(make_batch(400, [13, 14, 15, 16], 10))[400]
+        assert filtered[500] == drain(make_batch(500, [17, 18, 19], 8))[500]
+
+        # Keep all three rows alive after staggered admission.  This pins the
+        # 1 -> 2 -> 3 transition separately from the filter-then-join case
+        # above and compares every row with its singleton trajectory.
+        three_way = make_batch(600, [20, 21, 22, 23], max_tokens=12)
+        three_way_tokens = {600: []}
+        for response in three_way.next():
+            three_way_tokens[response.uid].append(response.token)
+
+        three_way.extend(make_batch(700, [24, 25, 26], max_tokens=10))
+        for response in three_way.next():
+            three_way_tokens.setdefault(response.uid, []).append(response.token)
+
+        three_way.extend(make_batch(800, [27, 28, 29, 30, 31], max_tokens=8))
+        for uid, tokens in drain(three_way).items():
+            three_way_tokens.setdefault(uid, []).extend(tokens)
+
+        assert three_way_tokens[600] == drain(
+            make_batch(600, [20, 21, 22, 23], 12)
+        )[600]
+        assert three_way_tokens[700] == drain(
+            make_batch(700, [24, 25, 26], 10)
+        )[700]
+        assert three_way_tokens[800] == drain(
+            make_batch(800, [27, 28, 29, 30, 31], 8)
+        )[800]
+
+    @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+    def test_tiny_qwen_singleton_mtp_stays_page_native(self, monkeypatch):
+        import mlx_vlm.models.qwen3_5.language as qwen_language
+        from mlx_vlm.paged_turboquant_pool import (
+            PagedTurboQuantLayerSpec,
+            PagedTurboQuantPoolRegistry,
+        )
+        from mlx_vlm.speculative.drafters.qwen3_5_mtp import (
+            ModelConfig as QwenMTPConfig,
+        )
+        from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
+
+        monkeypatch.setenv("MLX_VLM_TQ_MTP_QTILE", "1")
+        config = qwen_language.TextConfig(
+            model_type="qwen3_5_text",
+            hidden_size=512,
+            intermediate_size=64,
+            linear_num_value_heads=2,
+            linear_num_key_heads=2,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_conv_kernel_dim=4,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            rms_norm_eps=1e-6,
+            vocab_size=64,
+            num_key_value_heads=1,
+            max_position_embeddings=128,
+            tie_word_embeddings=True,
+            head_dim=256,
+            full_attention_interval=2,
+            rope_parameters={
+                "type": "default",
+                "mrope_section": [8, 12, 12],
+                "rope_theta": 10000,
+                "partial_rotary_factor": 0.25,
+            },
+        )
+        config.mtp_num_hidden_layers = 1
+        target = qwen_language.LanguageModel(config)
+        target.config = SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+            image_token_id=100,
+            video_token_id=101,
+            vision_start_token_id=102,
+        )
+        draft = Qwen3_5MTPDraftModel(QwenMTPConfig(text_config=config, block_size=3))
+        registry = PagedTurboQuantPoolRegistry(
+            {1: PagedTurboQuantLayerSpec(capacity_pages=4, kv_heads=1)}
+        )
+        prompt = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        prompt_cache = ar_module._make_cache(
+            target,
+            [0],
+            kv_bits=4,
+            kv_quant_scheme="turboquant",
+            paged_cache_factory=registry,
+        )
+        with registry.reserve_append(prompt_cache, prompt.shape[1]):
+            output = target(
+                prompt,
+                cache=prompt_cache,
+                return_hidden=True,
+                return_shared_kv=True,
+            )
+        first = mx.argmax(output.logits[:, -1, :], axis=-1)
+        mx.eval(first, [cache.state for cache in prompt_cache])
+
+        paged = prompt_cache[1]
+
+        def fail_materialize(*args, **kwargs):
+            raise AssertionError("singleton MTP must not reconstruct contiguous KV")
+
+        monkeypatch.setattr(paged, "materialize", fail_materialize)
+        batch = SpeculativeGenerationBatch(
+            model=target,
+            draft_model=draft,
+            draft_kind="mtp",
+            uids=[900],
+            first_tokens=first,
+            prompt_cache=prompt_cache,
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[8],
+            hidden=output.hidden_states[-1],
+            shared_kv_states=output.shared_kv_states,
+            prompt_tokens=prompt,
+            draft_block_size=3,
+            greedy_sampling=True,
+            paged_cache_factory=registry,
+        )
+
+        tokens = []
+        for _ in range(3):
+            tokens.extend(
+                response.token
+                for response in batch.next()
+                if response.token is not None
+            )
+        assert 3 <= len(tokens) < 8
+
+        storage = paged.storage
+        payload_ids = tuple(
+            id(array)
+            for state in (storage.keys, storage.values)
+            for array in state
+        )
+        first_pages = paged._rows.rows[0].page_ids
+        active_ar = batch.to_autoregressive()
+        assert active_ar._paged_cache_factory is registry
+
+        joining_prompt = mx.array([[6, 7, 8]], dtype=mx.int32)
+        joining_cache = ar_module._make_cache(
+            target,
+            [0],
+            kv_bits=4,
+            kv_quant_scheme="turboquant",
+            paged_cache_factory=registry,
+        )
+        with registry.reserve_append(joining_cache, joining_prompt.shape[1]):
+            joining_output = target(joining_prompt, cache=joining_cache)
+        joining_first = mx.argmax(joining_output.logits[:, -1, :], axis=-1)
+        joining = GenerationBatch(
+            model=target,
+            uids=[901],
+            inputs=joining_first,
+            prompt_cache=joining_cache,
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[1],
+            greedy_sampling=True,
+            paged_cache_factory=registry,
+        )
+        active_ar.extend(joining)
+        active_ar.enable_mtp_repromotion(draft, draft_block_size=3)
+
+        joined_paged = active_ar.prompt_cache[1]
+        assert joined_paged.storage is storage
+        assert tuple(
+            id(array)
+            for state in (storage.keys, storage.values)
+            for array in state
+        ) == payload_ids
+        assert joined_paged._rows.rows[0].page_ids == first_pages
+        assert joined_paged.batch_size == 2
+        responses = active_ar.next()
+        assert {response.uid for response in responses} == {900, 901}
+        peer_response = next(
+            response for response in responses if response.uid == 901
+        )
+        assert peer_response.finish_reason == "length"
+        assert active_ar.uids == [900]
+
+        survivor_pages = active_ar.prompt_cache[1]._rows.rows[0].page_ids
+        promoted = active_ar.to_speculative_mtp()
+        assert promoted is not None
+        assert promoted.prompt_cache[1].storage is storage
+        assert promoted.prompt_cache[1]._rows.rows[0].page_ids == survivor_pages
+        assert [response.uid for response in promoted.next()] == [900]
+        registry.release()
 
     def test_generation_batch_extend_keeps_processor_context_aligned(self):
         class FixedLogitModel:
@@ -3133,6 +4622,40 @@ def test_cold_batch_merges_mixed_text_and_mrope_position_ids():
     assert prompt_kwargs["position_ids"][0, 1].tolist() == [7, 7, 7]
 
 
+def test_cold_batch_combines_chunk_local_providers_with_left_padding():
+    calls = [[], []]
+
+    def make_provider(row):
+        def provider(input_ids, *, start):
+            calls[row].append((input_ids.tolist(), start))
+            return mx.full((1, input_ids.shape[1], 2), row + 1, dtype=mx.float16)
+
+        return provider
+
+    prompt_kwargs = [
+        {ar_module.INPUT_EMBEDDING_PROVIDER_KEY: make_provider(0)},
+        {ar_module.INPUT_EMBEDDING_PROVIDER_KEY: make_provider(1)},
+    ]
+    inputs_embeds, merged = ar_module._merge_prefill_prompt_kwargs(
+        prompt_kwargs,
+        [[10, 11], [20, 21, 22, 23]],
+    )
+
+    assert inputs_embeds is None
+    assert all(ar_module.INPUT_EMBEDDING_PROVIDER_KEY not in kw for kw in prompt_kwargs)
+    provider = merged[ar_module.INPUT_EMBEDDING_PROVIDER_KEY]
+    actual = provider(mx.array([[0, 0, 10], [20, 21, 22]]), start=0)
+    assert actual.shape == (2, 3, 2)
+    assert actual[0, :, 0].tolist() == [0, 0, 1]
+    assert actual[1, :, 0].tolist() == [2, 2, 2]
+    assert calls == [[([[10]], 0)], [([[20, 21, 22]], 0)]]
+
+    actual = provider(mx.array([[11], [23]]), start=3)
+    assert actual[:, 0, 0].tolist() == [1, 2]
+    assert calls[-1] == [([[20, 21, 22]], 0), ([[23]], 3)]
+    assert calls[0][-1] == ([[11]], 1)
+
+
 def test_prompt_processing_batch_slices_native_mrope_position_ids():
     batch = object.__new__(PromptProcessingBatch)
     position_ids = mx.arange(3 * 2 * 5, dtype=mx.int32).reshape(3, 2, 5)
@@ -3216,6 +4739,185 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     assert "_apc_image_hash" not in captured["prompt_kwargs"]
     assert "_apc_semantic_hash" not in captured["prompt_kwargs"]
     assert captured["prompt_kwargs"]["keep_tensor"].shape == (2, 1)
+
+
+def test_single_row_apc_offsets_chunk_local_embedding_provider():
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = object()
+    bg.model = SimpleNamespace(layers=[object()])
+    bg.prefill_step_size = 2
+    bg.kv_bits = None
+    bg.kv_group_size = 64
+    bg.kv_quant_scheme = "affine"
+    bg._wire_stack = None
+    calls = []
+
+    def provider(input_ids, *, start):
+        calls.append((input_ids.tolist(), start))
+        return mx.ones((1, input_ids.shape[1], 4))
+
+    sequence = (
+        1,
+        list(range(8)),
+        1,
+        {ar_module.INPUT_EMBEDDING_PROVIDER_KEY: provider},
+        [],
+        None,
+    )
+    pick = {
+        "matched_blocks": [],
+        "prefix_len": 4,
+        "extra_hash": 0,
+        "full_input_ids": list(range(8)),
+    }
+    captured = {}
+
+    def fake_prompt_batch(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    with (
+        patch.object(BatchGenerator, "_apc_pick_for", return_value=pick),
+        patch.object(
+            ar_module._apc,
+            "make_warm_batch_kv_cache_multi",
+            return_value=([], 4),
+        ),
+        patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch),
+    ):
+        batch = bg._build_mixed_prompt_batch([sequence])
+
+    assert batch is not None
+    assert captured["inputs_embeds"] is None
+    suffix_provider = captured["prompt_kwargs"][ar_module.INPUT_EMBEDDING_PROVIDER_KEY]
+    suffix_provider(mx.array([[4, 5]]), start=1)
+    assert calls == [([[4, 5]], 5)]
+    assert ar_module.INPUT_EMBEDDING_PROVIDER_KEY not in sequence[3]
+
+
+def test_single_row_apc_uses_provider_suffix_view_when_available():
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = object()
+    bg.model = SimpleNamespace(layers=[object()])
+    bg.prefill_step_size = 2
+    bg.kv_bits = None
+    bg.kv_group_size = 64
+    bg.kv_quant_scheme = "affine"
+    bg._wire_stack = None
+    suffix_calls = []
+
+    def suffix_provider(input_ids, *, start):
+        suffix_calls.append((input_ids.tolist(), start))
+        return mx.ones((1, input_ids.shape[1], 4))
+
+    provider = MagicMock()
+    provider.slice_from.return_value = suffix_provider
+    sequence = (
+        1,
+        list(range(8)),
+        1,
+        {ar_module.INPUT_EMBEDDING_PROVIDER_KEY: provider},
+        [],
+        None,
+    )
+    pick = {
+        "matched_blocks": [],
+        "prefix_len": 4,
+        "extra_hash": 0,
+        "full_input_ids": list(range(8)),
+    }
+    captured = {}
+
+    def fake_prompt_batch(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    with (
+        patch.object(BatchGenerator, "_apc_pick_for", return_value=pick),
+        patch.object(
+            ar_module._apc,
+            "make_warm_batch_kv_cache_multi",
+            return_value=([], 4),
+        ),
+        patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch),
+    ):
+        batch = bg._build_mixed_prompt_batch([sequence])
+
+    assert batch is not None
+    provider.slice_from.assert_called_once_with(4)
+    actual = captured["prompt_kwargs"][ar_module.INPUT_EMBEDDING_PROVIDER_KEY]
+    actual(mx.array([[4, 5]]), start=1)
+    assert suffix_calls == [([[4, 5]], 1)]
+    assert ar_module.INPUT_EMBEDDING_PROVIDER_KEY not in sequence[3]
+
+
+def test_multi_row_apc_combines_chunk_local_suffix_providers_with_right_padding():
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = object()
+    bg.model = SimpleNamespace(layers=[object()])
+    bg.prefill_step_size = 2
+    bg.kv_bits = None
+    bg.kv_group_size = 64
+    bg.kv_quant_scheme = "affine"
+    bg._wire_stack = None
+    calls = [[], []]
+
+    def make_provider(row):
+        def provider(input_ids, *, start):
+            calls[row].append((input_ids.tolist(), start))
+            return mx.full((1, input_ids.shape[1], 3), row + 1, dtype=mx.float16)
+
+        return provider
+
+    sequences = [
+        (
+            1,
+            list(range(8)),
+            1,
+            {ar_module.INPUT_EMBEDDING_PROVIDER_KEY: make_provider(0)},
+            [],
+            None,
+        ),
+        (
+            2,
+            list(range(6)),
+            1,
+            {ar_module.INPUT_EMBEDDING_PROVIDER_KEY: make_provider(1)},
+            [],
+            None,
+        ),
+    ]
+    picks = [
+        {"matched_blocks": [], "prefix_len": 4, "extra_hash": 0},
+        {"matched_blocks": [], "prefix_len": 4, "extra_hash": 0},
+    ]
+    captured = {}
+
+    def fake_prompt_batch(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    with (
+        patch.object(BatchGenerator, "_apc_pick_for", side_effect=picks),
+        patch.object(
+            ar_module._apc,
+            "make_warm_batch_kv_cache_multi",
+            return_value=([], 4),
+        ),
+        patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch),
+    ):
+        batch = bg._build_mixed_prompt_batch(sequences)
+
+    assert batch is not None
+    assert captured["inputs_embeds"] is None
+    provider = captured["prompt_kwargs"][ar_module.INPUT_EMBEDDING_PROVIDER_KEY]
+    actual = provider(mx.array([[4, 5, 6], [4, 5, 0]]), start=0)
+    assert actual[:, :, 0].tolist() == [[1, 1, 1], [2, 2, 0]]
+    assert calls == [[([[4, 5, 6]], 4)], [([[4, 5]], 4)]]
+    assert all(
+        ar_module.INPUT_EMBEDDING_PROVIDER_KEY not in sequence[3]
+        for sequence in sequences
+    )
 
 
 def test_apc_pick_rejects_image_tokens_and_releases_blocks():
