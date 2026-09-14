@@ -17,8 +17,8 @@ class LazyDrafter:
 
     The wrapper retains the already-resolved drafter metadata while allowing
     the loaded weights to be released during target-model prefill. It is
-    intentionally single-owner; the server only enables it for a one-sequence
-    generation worker.
+    used by singleton speculative cohorts; the worker may also serve AR peers.
+    Residency leases belong to the cohort, not to this reusable loader.
     """
 
     def __init__(
@@ -38,12 +38,24 @@ class LazyDrafter:
         self._validator = validator
         self._target_model = target_model
         self._model = None
+        # Host scalars only: unloading weights must not erase the final SSE
+        # statistics or reset snapshot/diff accounting across re-promotion.
+        self._retired_stats = {
+            "speculative_total_rounds": 0,
+            "speculative_total_accepted": 0.0,
+            "speculative_total_drafted": 0,
+        }
 
     @property
     def loaded(self) -> bool:
         return self._model is not None
 
     def materialize(self):
+        """Compatibility entry point for non-server speculative callers."""
+        return self.load()
+
+    def load(self):
+        """ResidencyComponent adapter: load and validate before publishing."""
         if self._model is not None:
             return self._model
         started = time.perf_counter()
@@ -64,6 +76,10 @@ class LazyDrafter:
     def unload(self) -> None:
         if self._model is None:
             return
+        self._retired_stats = {
+            name: total + getattr(self._model, name, 0)
+            for name, total in self._retired_stats.items()
+        }
         model, self._model = self._model, None
         del model
         gc.collect()
@@ -72,14 +88,12 @@ class LazyDrafter:
 
     def __getattr__(self, name: str):
         model = self.__dict__.get("_model")
+        retired_stats = self.__dict__.get("_retired_stats", {})
+        if name in retired_stats:
+            live = getattr(model, name, 0) if model is not None else 0
+            return retired_stats[name] + live
         if model is None:
             if name in {"accept_lens", "draft_lens"}:
                 return []
-            if name in {
-                "speculative_total_rounds",
-                "speculative_total_accepted",
-                "speculative_total_drafted",
-            }:
-                return 0
             raise AttributeError(name)
         return getattr(model, name)

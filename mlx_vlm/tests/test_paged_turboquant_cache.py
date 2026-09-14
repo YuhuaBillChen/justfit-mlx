@@ -5,6 +5,7 @@ import pytest
 
 from mlx_vlm.models.base import scaled_dot_product_attention
 from mlx_vlm.paged_turboquant_cache import PagedBatchTurboQuantKVCache
+from mlx_vlm.paged_turboquant_config import PagedTurboQuantConfig
 from mlx_vlm.paged_turboquant_kernel import PAGED_TURBOQUANT_PAGE_SIZE
 from mlx_vlm.turboquant import TurboQuantKVCache
 
@@ -202,24 +203,32 @@ def test_base_attention_dispatches_paged_prefill_without_reading_pool_as_dense()
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
-def test_direct_inverse_prefill_never_materializes_contiguous_kv(monkeypatch):
+@pytest.mark.parametrize("eager_release", [False, True])
+def test_direct_inverse_prefill_never_materializes_contiguous_kv(
+    monkeypatch, eager_release
+):
     mx.random.seed(8110)
     query_length = 8
     keys, values = _kv(PAGE + query_length)
     queries = mx.random.normal((1, H_Q, query_length, D)).astype(mx.bfloat16)
-    paged = PagedBatchTurboQuantKVCache([0], bits=4, capacity_pages=4)
+    paged = PagedBatchTurboQuantKVCache(
+        [0],
+        bits=4,
+        capacity_pages=4,
+        config=PagedTurboQuantConfig(
+            prefill_impl="direct_inverse", prefill_eager_release=eager_release
+        ),
+    )
     pool_keys, pool_values = paged.update_and_fetch(keys, values)
-
+    oracle = paged.extract(0)
     expected = scaled_dot_product_attention(
         queries,
-        pool_keys,
-        pool_values,
-        cache=paged,
+        *oracle.state,
+        cache=oracle,
         scale=SCALE,
         mask="causal",
     )
     mx.eval(expected)
-    monkeypatch.setenv("MLX_VLM_PAGED_PREFILL_IMPL", "direct_inverse")
 
     def fail_materialize(*args, **kwargs):
         raise AssertionError("direct-inverse prefill must not materialize KV")
@@ -244,7 +253,12 @@ def test_direct_inverse_prefill_is_bitwise_with_fragmented_physical_pages(
     monkeypatch,
 ):
     mx.random.seed(8111)
-    owner = PagedBatchTurboQuantKVCache([0], bits=4, capacity_pages=8)
+    owner = PagedBatchTurboQuantKVCache(
+        [0],
+        bits=4,
+        capacity_pages=8,
+        config=PagedTurboQuantConfig(prefill_impl="direct_inverse"),
+    )
     owner.update_and_fetch(*_kv(PAGE))
     target = owner.new_empty()
     target.update_and_fetch(*_kv(PAGE))
@@ -256,16 +270,15 @@ def test_direct_inverse_prefill_is_bitwise_with_fragmented_physical_pages(
 
     queries = mx.random.normal((1, H_Q, query_length, D)).astype(mx.bfloat16)
     pool_keys, pool_values = target.state
+    oracle = target.extract(0)
     expected = scaled_dot_product_attention(
         queries,
-        pool_keys,
-        pool_values,
-        cache=target,
+        *oracle.state,
+        cache=oracle,
         scale=SCALE,
         mask="causal",
     )
     mx.eval(expected)
-    monkeypatch.setenv("MLX_VLM_PAGED_PREFILL_IMPL", "direct_inverse")
 
     def fail_materialize(*args, **kwargs):
         raise AssertionError("direct-inverse prefill must not materialize KV")

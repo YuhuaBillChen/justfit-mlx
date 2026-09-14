@@ -31,6 +31,7 @@ import mlx.core as mx
 
 from .paged_turboquant import PagePoolSpec, PagePoolStats, PagedPoolSet
 from .paged_turboquant_cache import PagedBatchTurboQuantKVCache
+from .paged_turboquant_config import PagedTurboQuantConfig
 from .paged_turboquant_kernel import (
     PAGED_TURBOQUANT_BITS,
     PAGED_TURBOQUANT_DIM,
@@ -112,7 +113,13 @@ class PagedTurboQuantPoolRegistry:
         layer_specs: Mapping[Hashable, PagedTurboQuantLayerSpec],
         *,
         seed: int = DEFAULT_TURBOQUANT_SEED,
+        config: PagedTurboQuantConfig | None = None,
     ):
+        if config is not None and not isinstance(config, PagedTurboQuantConfig):
+            raise TypeError("config must be a PagedTurboQuantConfig")
+        self._config = (
+            config if config is not None else PagedTurboQuantConfig.from_env()
+        )
         if not layer_specs:
             raise ValueError("paged TurboQuant registry requires at least one leaf")
         specs = dict(layer_specs)
@@ -177,6 +184,12 @@ class PagedTurboQuantPoolRegistry:
             raise RuntimeError("paged TurboQuant registry has been released")
 
     @property
+    def config(self) -> PagedTurboQuantConfig:
+        """The effective policy shared by all layer and request caches."""
+
+        return self._config
+
+    @property
     def leaf_keys(self) -> tuple[Hashable, ...]:
         return tuple(self._specs)
 
@@ -207,6 +220,7 @@ class PagedTurboQuantPoolRegistry:
                 value_bits=PAGED_TURBOQUANT_BITS,
                 key_codec=self._key_codec,
                 value_codec=self._value_codec,
+                config=self.config,
             )
             self._facades.add(facade)
             return facade

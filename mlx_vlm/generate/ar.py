@@ -2310,6 +2310,12 @@ class SpeculativeGenerationBatch:
         if self._rounds_iter is not None:
             return
 
+        residency = getattr(self.model, "phase_residency_manager", None)
+        if residency is not None and residency.contains("mtp_drafter") is True:
+            if not hasattr(self, "_drafter_lease_owner"):
+                self._drafter_lease_owner = object()
+            residency.acquire("mtp_drafter", self._drafter_lease_owner)
+            self._drafter_released = False
         materialize = getattr(self.draft_model, "materialize", None)
         if callable(materialize):
             self.draft_model = materialize()
@@ -2348,6 +2354,32 @@ class SpeculativeGenerationBatch:
                 self._take_forced_token if has_token_controls else None
             ),
         )
+
+    def release_drafter(self) -> None:
+        """Retire the round iterator and its aliases at a completed boundary."""
+        if getattr(self, "_drafter_released", False):
+            return
+        rounds = getattr(self, "_rounds_iter", None)
+        if rounds is not None:
+            close = getattr(rounds, "close", None)
+            if callable(close):
+                close()
+            self._rounds_iter = None
+        # Resolve pending target-cache work before detaching consumers. The
+        # iterator is closed first so its frame cannot retain drafter aliases.
+        mx.eval(_cache_eval_targets(getattr(self, "prompt_cache", [])))
+        owner = getattr(self, "_draft_owner", getattr(self, "draft_model", None))
+        self.draft_model = owner
+        residency = getattr(self.model, "phase_residency_manager", None)
+        self._drafter_released = True
+        if residency is not None and residency.contains("mtp_drafter") is True:
+            lease = getattr(self, "_drafter_lease_owner", None)
+            if lease is not None:
+                residency.release("mtp_drafter", lease)
+        else:
+            unload = getattr(owner, "unload", None)
+            if callable(unload):
+                unload()
 
     def next(self) -> List[GenerationBatch.Response]:
         if len(self) == 0:
@@ -2550,7 +2582,11 @@ class PromptProcessingBatch:
                 )
             head_phase_swap = getattr(self.model, "prefill_head_phase_swap", None)
             if head_phase_swap is not None:
-                head_phase_swap.unload()
+                residency = getattr(self.model, "phase_residency_manager", None)
+                if residency is not None and residency.contains("lm_head") is True:
+                    residency.unload_if_idle("lm_head")
+                else:
+                    head_phase_swap.unload()
             provider = spill(self._input_ids, spill_directory)
             self._input_embedding_provider = provider
             # The caller that assembled this batch can still hold the original
@@ -2786,7 +2822,11 @@ class PromptProcessingBatch:
                 self.model, "prefill_embedding_phase_swap", None
             )
             if embedding_phase_swap is not None:
-                embedding_phase_swap.unload()
+                residency = getattr(self.model, "phase_residency_manager", None)
+                if residency is not None and residency.contains("input_embedding") is True:
+                    residency.unload_if_idle("input_embedding")
+                else:
+                    embedding_phase_swap.unload()
             self._embedding_phase_swap_pending = False
 
         step = self.prefill_step_size or self._input_ids.shape[1]
@@ -2808,29 +2848,47 @@ class PromptProcessingBatch:
             n = min(n, checkpoint_col - self._processed_prompt_columns)
         if n <= 0:
             return 0
+        if self._right_pad_per_row is not None:
+            end = self._processed_prompt_columns + n
+            finished_rows = [
+                i for i, length in enumerate(self._suffix_lens) if length == end
+            ]
         prompt_kwargs = {
             **self._prompt_kwargs_for_step(n),
             **self._speculative_prefill.kwargs,
         }
+        skip_logits = bool(
+            getattr(self.model, "supports_skip_logits", False)
+            and not finished_rows
+        )
         phase_swap = getattr(self.model, "prefill_head_phase_swap", None)
+        residency = getattr(self.model, "phase_residency_manager", None)
+        managed_head = False
+        prompt_logits_owner = False
         if phase_swap is not None:
-            residency = getattr(self.model, "phase_residency_manager", None)
-            if (
-                residency is not None
-                and residency.contains("lm_head") is True
-            ):
-                residency.unload_if_idle("lm_head")
+            managed_head = (
+                residency is not None and residency.contains("lm_head") is True
+            )
+            if skip_logits:
+                if managed_head:
+                    residency.unload_if_idle("lm_head")
+                else:
+                    phase_swap.unload()
             else:
-                phase_swap.unload()
+                if managed_head:
+                    residency.acquire("lm_head", "prompt_logits")
+                    prompt_logits_owner = True
+                else:
+                    prompt_logits_owner = not bool(
+                        getattr(phase_swap, "loaded", False)
+                    )
+                    phase_swap.load()
         if any(self._cached_tokens_per_row):
             _reserve_warm_prompt_capacity(
                 self.prompt_cache,
                 _warm_prompt_reserve_tokens(n, self._input_ids.shape[1]),
             )
-        if (
-            getattr(self.model, "supports_skip_logits", False)
-            and self._right_pad_per_row is None
-        ):
+        if skip_logits:
             prompt_kwargs = dict(prompt_kwargs)
             prompt_kwargs["skip_logits"] = True
         if self._inputs_embeds is not None:
@@ -2841,25 +2899,39 @@ class PromptProcessingBatch:
             )
         else:
             inputs_embeds = None
-        with _paged_append_reservation(
-            self._paged_cache_factory, self.prompt_cache, n
-        ):
-            output = self.model(
-                self._input_ids[:, :n],
-                cache=self.prompt_cache,
-                inputs_embeds=inputs_embeds,
-                n_to_process=n,
-                **prompt_kwargs,
-            )
+        try:
+            with _paged_append_reservation(
+                self._paged_cache_factory, self.prompt_cache, n
+            ):
+                output = self.model(
+                    self._input_ids[:, :n],
+                    cache=self.prompt_cache,
+                    inputs_embeds=inputs_embeds,
+                    n_to_process=n,
+                    **prompt_kwargs,
+                )
+        except Exception:
+            if prompt_logits_owner:
+                if managed_head:
+                    residency.release("lm_head", "prompt_logits")
+                else:
+                    phase_swap.unload()
+            raise
         self._speculative_prefill.append(output)
-        if self._right_pad_per_row is not None:
-            end = self._processed_prompt_columns + n
-            finished_rows = [
-                i for i, length in enumerate(self._suffix_lens) if length == end
-            ]
+        if finished_rows:
             logits = output.logits if hasattr(output, "logits") else output
             for i in finished_rows:
                 self._finished_prompt_logits[i] = mx.contiguous(mx.array(logits[i, -1]))
+        if prompt_logits_owner:
+            # Phase-swap components cannot be released while a lazy logits
+            # graph still references their weights. Materialize the boundary
+            # logits first, then return the head to the shared residency pool.
+            logits = output.logits if hasattr(output, "logits") else output
+            mx.eval(logits)
+            if managed_head:
+                residency.release("lm_head", "prompt_logits")
+            else:
+                phase_swap.unload()
         cache_states = _cache_eval_targets(self.prompt_cache)
         cache_states.extend(self._finished_prompt_logits[i] for i in finished_rows)
         direct_checkpoint = bool(
@@ -3159,7 +3231,11 @@ class PromptProcessingBatch:
 
         embedding_phase_swap = getattr(self.model, "prefill_embedding_phase_swap", None)
         if embedding_phase_swap is not None:
-            embedding_phase_swap.load()
+            residency = getattr(self.model, "phase_residency_manager", None)
+            if residency is not None and residency.contains("input_embedding") is True:
+                residency.acquire("input_embedding", "generation")
+            else:
+                embedding_phase_swap.load()
         cleanup_provider = getattr(self._input_embedding_provider, "cleanup", None)
         if callable(cleanup_provider):
             cleanup_provider()
@@ -3364,13 +3440,18 @@ class BatchGenerator:
     def _sync_generation_head_residency(self) -> None:
         model = getattr(self, "model", None)
         residency = getattr(model, "phase_residency_manager", None)
-        if residency is None or residency.contains("lm_head") is not True:
-            return
         generation_batch = getattr(self, "_generation_batch", ())
-        if len(generation_batch) > 0:
-            residency.acquire("lm_head", "generation")
-        else:
-            residency.release("lm_head", "generation")
+        active = len(generation_batch) > 0
+        if not active and isinstance(generation_batch, SpeculativeGenerationBatch):
+            generation_batch.release_drafter()
+        if residency is None:
+            return
+        for name in ("lm_head", "input_embedding"):
+            if residency.contains(name) is True:
+                if active:
+                    residency.acquire(name, "generation")
+                else:
+                    residency.release(name, "generation")
 
     def _draft_for_prompt_batch(self, batch_size: int):
         # Batch-invariant mode compares the same AR execution across cohort
@@ -3435,9 +3516,7 @@ class BatchGenerator:
         # The stable owner is a LazyDrafter in the phase-swap runtime. Release
         # its materialized weights as soon as the cohort switches to AR; the
         # same owner can materialize them again when a singleton re-promotes.
-        unload = getattr(current._draft_owner, "unload", None)
-        if callable(unload):
-            unload()
+        current.release_drafter()
         self._generation_batch = batch
         return True
 
@@ -3854,6 +3933,8 @@ class BatchGenerator:
         return stats() if callable(stats) else None
 
     def close(self):
+        if getattr(self, "_closed", False):
+            return
         prompt_batch = getattr(self, "_prompt_batch", None)
         if prompt_batch is not None:
             prompt_cache = getattr(prompt_batch, "prompt_cache", [])
@@ -3863,14 +3944,27 @@ class BatchGenerator:
             self._prompt_batch = None
         generation_batch = getattr(self, "_generation_batch", None)
         if generation_batch is not None:
+            if isinstance(generation_batch, SpeculativeGenerationBatch):
+                generation_batch.release_drafter()
             _release_cache_resources(getattr(generation_batch, "prompt_cache", []))
         model = getattr(self, "model", None)
         residency = getattr(model, "phase_residency_manager", None)
         if (
             residency is not None
             and residency.contains("lm_head") is True
+            and not getattr(self, "_generation_head_released_on_close", False)
         ):
+            # A delayed finalizer (or a cleanup retry) must not release a
+            # successor generator's lease on the same shared model.
+            self._generation_head_released_on_close = True
             residency.release("lm_head", "generation")
+        if (
+            residency is not None
+            and residency.contains("input_embedding") is True
+            and not getattr(self, "_generation_embedding_released_on_close", False)
+        ):
+            self._generation_embedding_released_on_close = True
+            residency.release("input_embedding", "generation")
         paged_factory = getattr(self, "_paged_cache_factory", None)
         release_factory = getattr(paged_factory, "release", None)
         if callable(release_factory) and getattr(
@@ -3890,6 +3984,7 @@ class BatchGenerator:
         if wire_stack is not None:
             wire_stack.close()
             self._wire_stack = None
+        self._closed = True
 
     def __del__(self):
         self.close()
@@ -4037,6 +4132,8 @@ class BatchGenerator:
 
     def _extend_generation_batch(self, gen_batch) -> None:
         if len(self._generation_batch) == 0:
+            if isinstance(self._generation_batch, SpeculativeGenerationBatch):
+                self._generation_batch.release_drafter()
             self._generation_batch = gen_batch
         else:
             # With singleton-only speculation, a peer can begin cold prefill

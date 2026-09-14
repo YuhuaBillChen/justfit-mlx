@@ -70,6 +70,34 @@ def test_lazy_drafter_rejects_a_changed_resolved_kind():
     assert not lazy.loaded
 
 
+def test_lifetime_statistics_survive_unload_and_repromotion(monkeypatch):
+    from mlx_vlm.speculative.common import speculative_stats_snapshot, speculative_stats_since
+
+    monkeypatch.setattr("mlx_vlm.server.draft_lifecycle.mx.clear_cache", lambda: None)
+    lazy = LazyDrafter(
+        path="unused", kind="mtp", config=None, target_model=None,
+        loader=lambda *args: (SimpleNamespace(), "mtp"),
+        validator=lambda *args: None,
+    )
+    before = speculative_stats_snapshot(lazy)
+    model = lazy.load()
+    model.speculative_total_rounds = 4
+    model.speculative_total_accepted = 7.0
+    model.speculative_total_drafted = 12
+    lazy.unload()
+    assert speculative_stats_since(lazy, before) == (4, 7, 12)
+    lazy.unload()
+    assert speculative_stats_since(lazy, before) == (4, 7, 12)
+    second = lazy.load()
+    assert speculative_stats_snapshot(lazy) == (4, 7.0, 12)
+    second.speculative_total_rounds = 2
+    second.speculative_total_accepted = 3.0
+    second.speculative_total_drafted = 6
+    assert speculative_stats_since(lazy, before) == (6, 10, 18)
+    lazy.unload()
+    assert speculative_stats_since(lazy, before) == (6, 10, 18)
+
+
 def test_speculative_rounds_materialize_a_deferred_drafter():
     model = object()
     materialize_calls = []

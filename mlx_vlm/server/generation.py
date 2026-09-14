@@ -1329,6 +1329,10 @@ class ResponseGenerator:
         )
 
     def _unload_deferred_drafter(self) -> None:
+        residency = getattr(self, "component_residency", None)
+        if residency is not None and residency.contains("mtp_drafter") is True:
+            residency.unload_if_idle("mtp_drafter")
+            return
         unload = getattr(getattr(self, "draft_model", None), "unload", None)
         if callable(unload):
             unload()
@@ -1456,6 +1460,8 @@ class ResponseGenerator:
         self.draft_model = draft_model
         self.draft_kind = draft_kind
         self.component_residency = ComponentResidencyManager()
+        language_model = getattr(model, "language_model", model)
+        language_model.phase_residency_manager = self.component_residency
         vision_component = self.vision_phase_swap_path or os.environ.get(
             "MLX_VLM_VISION_PHASE_SWAP_PATH"
         )
@@ -1483,6 +1489,18 @@ class ResponseGenerator:
             language_model = getattr(model, "language_model", model)
             language_model.prefill_embedding_phase_swap = LanguageEmbeddingPhaseSwap(
                 language_model, embedding_component
+            )
+            self.component_residency.register(
+                "input_embedding", language_model.prefill_embedding_phase_swap,
+                retain_on_release=True,
+            )
+        if isinstance(draft_model, LazyDrafter):
+            dependencies = tuple(
+                name for name in ("input_embedding", "lm_head")
+                if self.component_residency.contains(name)
+            )
+            self.component_residency.register(
+                "mtp_drafter", draft_model, dependencies=dependencies,
             )
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
@@ -1976,6 +1994,11 @@ class ResponseGenerator:
 
         # Always call get_input_embeddings — BatchGenerator requires inputs_embeds
         try:
+            residency = getattr(self, "component_residency", None)
+            if residency is not None and residency.contains("input_embedding") is True:
+                # A cancelled warm spill may have detached the embedding table.
+                # Its retained policy keeps the table available to returned providers.
+                residency.ensure_loaded("input_embedding")
             embedding_kwargs = dict(data_kwargs)
             if getattr(self, "chunk_local_input_embeddings", False):
                 embedding_kwargs["chunked"] = True

@@ -1,9 +1,8 @@
 """Single-layer paged TurboQuant cache facade.
 
-This is an intentionally narrow integration scaffold: integer Q4 MSE K/V,
-256-wide heads, 256-token pages, and one request per prefill batch.  It joins
-the existing host allocator, fixed page storage, and batched paged Metal
-decode kernel without changing the production cache dispatch.
+The supported geometry is integer Q4 MSE K/V, 256-wide heads, 256-token pages,
+and one request per prefill batch. The facade joins the host allocator, fixed
+page storage, paged decode and verification kernels, and prefill backends.
 
 The facade owns ordered :class:`PagedSequence` rows.  Independently prefetched
 rows created by :meth:`new_empty` share the same physical storage and can be
@@ -13,13 +12,13 @@ surfaces; paged decode consumes the page pool directly.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
 
 import mlx.core as mx
 
 from .models.cache import _BaseCache, create_causal_mask
 from .paged_turboquant import PageAllocator, PageAppend, PagedBatchRows, PagedSequence
+from .paged_turboquant_config import PagedTurboQuantConfig
 from .paged_turboquant_kernel import (
     PAGED_TURBOQUANT_BITS,
     PAGED_TURBOQUANT_DIM,
@@ -96,7 +95,13 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
         value_bits: float | None = None,
         key_codec=None,
         value_codec=None,
+        config: PagedTurboQuantConfig | None = None,
     ):
+        if config is not None and not isinstance(config, PagedTurboQuantConfig):
+            raise TypeError("config must be a PagedTurboQuantConfig")
+        self._config = (
+            config if config is not None else PagedTurboQuantConfig.from_env()
+        )
         self.bits, self.key_bits, self.value_bits = resolve_kv_bits(
             bits, key_bits, value_bits
         )
@@ -144,6 +149,12 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
         self._reserved_token_count: int | None = None
         self._reservation_consumed = False
         self._validate_existing_codecs()
+
+    @property
+    def config(self) -> PagedTurboQuantConfig:
+        """Construction-time execution policy, preserved across batch changes."""
+
+        return self._config
 
     def _ensure_live(self) -> None:
         if self._released:
@@ -424,12 +435,11 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
     ) -> mx.array:
         """Dispatch attention while keeping the owning cache page-backed.
 
-        Decode consumes the physical pool directly.  The first prefill path
-        reconstructs only this request's packed Q4 logical view and tries the
-        existing TurboQuant prefill kernel.  Its compatibility fallback
-        dequantizes that one row, matching the existing MSE-Q4 behavior; it
-        never creates a padded multi-row cache.  A native paged prefill kernel
-        can replace this path without changing the runtime protocol.
+        Decode and eligible MTP verification consume physical pages directly.
+        Direct-inverse prefill reconstructs temporary floating-point K/V from
+        pages for SDPA. Compatibility prefill materializes one packed logical
+        row and uses the existing TurboQuant kernels or dequantized fallback.
+        The execution policy is fixed when the cache is constructed.
         """
 
         if sinks is not None:
@@ -447,7 +457,7 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
             and int(mask.shape[-1]) == self.sequence_lengths[0]
         )
         if (
-            os.environ.get("MLX_VLM_PAGED_PREFILL_IMPL") == "direct_inverse"
+            self.config.prefill_impl == "direct_inverse"
             and (isinstance(mask, str) and mask == "causal" or causal_array)
         ):
             if self.storage is None or self.empty():
@@ -463,12 +473,12 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
                 mask=mask,
                 page_size=PAGED_TURBOQUANT_PAGE_SIZE,
             )
-            if os.environ.get("MLX_VLM_PAGED_PREFILL_EAGER_RELEASE") == "1":
+            if self.config.prefill_eager_release:
                 mx.eval(result)
             return result
 
         if (
-            os.environ.get("MLX_VLM_TQ_MTP_QTILE") == "1"
+            self.config.mtp_qtile
             and isinstance(mask, str)
             and mask == "causal"
             and 2 <= query_length <= 4
@@ -506,7 +516,7 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
                 scale=scale,
                 mask=mask,
             )
-        if os.environ.get("MLX_VLM_PAGED_PREFILL_EAGER_RELEASE") == "1":
+        if self.config.prefill_eager_release:
             # Bound the lifetime of this layer's temporary contiguous and
             # dequantized compatibility views in an otherwise lazy forward.
             mx.eval(result)
@@ -527,6 +537,7 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
             value_bits=self.value_bits,
             key_codec=self.key_codec,
             value_codec=self.value_codec,
+            config=self.config,
         )
 
     def extend(self, other: PagedBatchTurboQuantKVCache) -> None:
@@ -540,6 +551,8 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
             raise RuntimeError("cannot extend caches during an active reservation")
         if self.storage is None or self.storage is not other.storage:
             raise ValueError("paged cache extend requires identical shared storage")
+        if self.config != other.config:
+            raise ValueError("paged cache execution policies are incompatible")
         if (
             self.seed != other.seed
             or self.key_bits != other.key_bits
