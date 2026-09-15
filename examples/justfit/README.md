@@ -18,16 +18,15 @@ On an Apple-silicon Mac with a working MLX environment:
 ```bash
 git clone https://github.com/YuhuaBillChen/mlx-vlm.git
 cd mlx-vlm
-git checkout a30c0cf39fd4c3367f3bf381df192851cfaa1801
+git checkout justfit-repro-v1
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
 ```
 
-This commit contains the reproduction kit. The three repeated limit runs use
+This tag contains the tested reproduction kit. The three repeated limit runs use
 `143967472416aece96eeae392eaf931426acad3c` as their measured runtime
-provenance; the `mlx_vlm/` tree is identical between that commit and the
-reproduction-kit commit above.
+provenance; the `mlx_vlm/` tree is identical between that commit and this tag.
 
 The evolving branch is useful for daily use, but an experiment should always
 record an immutable commit:
@@ -47,18 +46,28 @@ model revision.
 Extract the output head and vision tower from the same checkpoint:
 
 ```bash
+export MODEL_PATH=/absolute/path/to/Qwen3.8-27B-mxfp4-mtp-vq8
 python examples/justfit/prepare_components.py \
   --model "$MODEL_PATH" \
   --output ./justfit-components
 ```
 
-Split the checkpoint's native MTP tensors with mlx-vlm's family splitter:
+The measured target artifact did not contain native MTP tensors; the recorded
+runs used a compatible standalone Qwen3.8 MTP checkpoint. Set its path directly:
+
+```bash
+export MTP_PATH=/absolute/path/to/compatible-Qwen3.8-MTP-checkpoint
+```
+
+If a different target checkpoint does contain top-level `mtp.*` tensors, create
+the standalone directory with mlx-vlm's family splitter instead:
 
 ```bash
 python -m mlx_vlm.speculative.drafters.qwen3_5_mtp.split \
   --model "$MODEL_PATH" \
   --output ./justfit-components/mtp \
   --block-size 3
+export MTP_PATH="$PWD/justfit-components/mtp"
 ```
 
 The component files are backing artifacts. PhaseSwap reconstructs the matching
@@ -67,8 +76,6 @@ runtime module from them; it does not imply a discrete-VRAM transfer.
 ## 3. Start the server
 
 ```bash
-export MODEL_PATH=/absolute/path/to/Qwen3.8-27B-mxfp4-mtp-vq8
-export MTP_PATH="$PWD/justfit-components/mtp"
 export LM_HEAD_PATH="$PWD/justfit-components/language-head.safetensors"
 export VISION_PATH="$PWD/justfit-components/vision-tower.safetensors"
 
@@ -87,8 +94,9 @@ for the forced-length capacity protocol.
 In another terminal:
 
 ```bash
+export MODEL_PATH=/absolute/path/to/Qwen3.8-27B-mxfp4-mtp-vq8
 python examples/justfit/capacity_client.py \
-  --model "$(basename "$MODEL_PATH")" \
+  --model "$MODEL_PATH" \
   --tokenizer "$MODEL_PATH" \
   --prompt-tokens 8192 \
   --output-tokens 64 \
@@ -111,8 +119,9 @@ CAPACITY_MODE=1 LANES=1 KV_CAPACITY=229376 MAX_TOKENS=16384 \
   OUTPUT_GUARANTEE=16384 examples/justfit/run_server.sh
 
 # Terminal 2
+export MODEL_PATH=/absolute/path/to/Qwen3.8-27B-mxfp4-mtp-vq8
 python examples/justfit/capacity_client.py \
-  --model "$(basename "$MODEL_PATH")" \
+  --model "$MODEL_PATH" \
   --tokenizer "$MODEL_PATH" \
   --prompt-tokens 196608 \
   --output-tokens 16384 \
@@ -146,6 +155,21 @@ interval if it is to be compared with the paper.
 
 Do not treat two sequential requests as B2, or add per-request decode rates to
 manufacture an aggregate result.
+
+## Reproduction-kit smoke evidence
+
+On 2026-09-15, the tagged source flow was exercised on the paper's M4 Pro / 24
+GiB host with APC disabled. `prepare_components.py` produced a 675,430,400-byte
+language head and a 617,072,992-byte vision tower. Two consecutive requests on
+one server each reported exactly 8,192 prompt tokens, 64 completion tokens,
+`finish_reason=length`, `[DONE]`, and no stream error. Their TTFT / wall times
+were 65.64 / 68.23 seconds and 64.25 / 66.84 seconds. The second request reused
+the persistent paged pool after the first request released its page ownership.
+
+This smoke validates the public launcher, component extraction, streaming
+client, phase-swapped head, paged Q4 prefill/decode, and page reuse. It uses the
+compatible standalone MTP artifact described above; it does not make that
+checkpoint redistributable or turn the smoke into a quality benchmark.
 
 ## Minimal validation suite
 

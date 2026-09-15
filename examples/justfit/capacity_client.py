@@ -73,6 +73,7 @@ def main() -> None:
     text_parts: list[str] = []
     usage = None
     finish_reason = None
+    stream_error = None
     done = False
     with urllib.request.urlopen(request, timeout=args.timeout) as response:
         for raw_line in response:
@@ -86,6 +87,9 @@ def main() -> None:
             if not body:
                 continue
             event = json.loads(body)
+            if event.get("error") is not None:
+                stream_error = event["error"]
+                continue
             if event.get("usage") is not None:
                 usage = event["usage"]
             for choice in event.get("choices", []):
@@ -107,6 +111,7 @@ def main() -> None:
         "requested_output_tokens": args.output_tokens,
         "tokenizer_offset": args.tokenizer_offset,
         "done": done,
+        "stream_error": stream_error,
         "finish_reason": finish_reason,
         "usage": usage,
         "ttft_seconds": first_text - started if first_text else None,
@@ -126,7 +131,7 @@ def main() -> None:
         ).strip()
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
-    if not done or "validation_error" in result:
+    if not done or stream_error is not None or "validation_error" in result:
         raise SystemExit(1)
 
 

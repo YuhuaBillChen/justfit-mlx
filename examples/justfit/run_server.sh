@@ -77,5 +77,6 @@ exec python -m mlx_vlm.server \
   --max-kv-size "$KV_CAPACITY" \
   --kv-bits 4 \
   --kv-quant-scheme turboquant \
+  --quantized-kv-start 0 \
   --prefill-step-size "${PREFILL_STEP_SIZE:-256}" \
   --log-progress-interval "${LOG_PROGRESS_INTERVAL:-256}"

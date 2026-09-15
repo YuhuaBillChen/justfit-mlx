@@ -150,9 +150,9 @@
         <p>The fork includes a component-preparation helper, explicit server launcher, streaming workload client, and path-sanitized result JSON.</p>
       </div>
       <ol class="repro-steps">
-        <li><b>01</b><div><h3>Pin the runnable kit</h3><code>git checkout a30c0cf39fd4c3367f3bf381df192851cfaa1801</code><p>Measured runtime provenance: <code>143967472416aece96eeae392eaf931426acad3c</code>. The <code>mlx_vlm/</code> tree is identical between these commits.</p></div></li>
-        <li><b>02</b><div><h3>Prepare matching components</h3><code>python examples/justfit/prepare_components.py --model "$MODEL_PATH" --output ./justfit-components</code></div></li>
-        <li><b>03</b><div><h3>Run an 8K smoke profile</h3><code>LANES=1 KV_CAPACITY=32768 MAX_TOKENS=512 examples/justfit/run_server.sh</code></div></li>
+        <li><b>01</b><div><h3>Pin the runnable kit</h3><code>git checkout justfit-repro-v1</code><p>Measured runtime provenance: <code>143967472416aece96eeae392eaf931426acad3c</code>. The tagged kit has the identical <code>mlx_vlm/</code> tree.</p></div></li>
+        <li><b>02</b><div><h3>Prepare matching components</h3><code>export MODEL_PATH=/absolute/path/to/target<br>python examples/justfit/prepare_components.py --model "$MODEL_PATH" --output ./justfit-components</code></div></li>
+        <li><b>03</b><div><h3>Run an 8K smoke profile</h3><code>MTP_PATH=/absolute/path/to/compatible-MTP LM_HEAD_PATH="$PWD/justfit-components/language-head.safetensors" VISION_PATH="$PWD/justfit-components/vision-tower.safetensors" LANES=1 KV_CAPACITY=32768 MAX_TOKENS=512 examples/justfit/run_server.sh</code><p>The measured target artifact requires a compatible standalone MTP checkpoint; use the splitter only when the target contains native <code>mtp.*</code> tensors.</p></div></li>
         <li><b>04</b><div><h3>Archive the evidence</h3><p>Commit, checkpoint hashes, effective environment, stream completion, process peak, failures, and page-reuse postflight.</p></div></li>
       </ol>
       <div class="repro-links">
