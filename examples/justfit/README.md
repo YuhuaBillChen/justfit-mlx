@@ -18,11 +18,16 @@ On an Apple-silicon Mac with a working MLX environment:
 ```bash
 git clone https://github.com/YuhuaBillChen/mlx-vlm.git
 cd mlx-vlm
-git checkout 143967472416aece96eeae392eaf931426acad3c
+git checkout a30c0cf39fd4c3367f3bf381df192851cfaa1801
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
 ```
+
+This commit contains the reproduction kit. The three repeated limit runs use
+`143967472416aece96eeae392eaf931426acad3c` as their measured runtime
+provenance; the `mlx_vlm/` tree is identical between that commit and the
+reproduction-kit commit above.
 
 The evolving branch is useful for daily use, but an experiment should always
 record an immutable commit:
