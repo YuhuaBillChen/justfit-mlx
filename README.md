@@ -3,6 +3,15 @@
 
 MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX.
 
+> **JustFit research branch.** This fork's
+> [`production/qwen-paged-continuous-batching`](https://github.com/YuhuaBillChen/mlx-vlm/tree/production/qwen-paged-continuous-batching)
+> branch contains the runtime used for *JustFit: 200K-Token LLM Serving on a
+> 24 GiB Laptop with Just-in-Time State Management*. See the
+> [project overview and measured results](docs/justfit.md), then use the
+> [reproduction kit](examples/justfit/README.md) for a smoke test or the
+> full 192K-input + 16K-output capacity protocol. These fork-only mechanisms
+> are experimental and are not part of the upstream mlx-vlm release.
+
 ## Table of Contents
 - [Installation](#installation)
 - [Usage](#usage)

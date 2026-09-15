@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "system": "JustFit",
+  "source_commit": "143967472416aece96eeae392eaf931426acad3c",
+  "hardware": "Apple M4 Pro MacBook Pro, 24 GiB unified memory",
+  "model_label": "Qwen3.8-27B MXFP4",
+  "guard_mib": 21000,
+  "protocol": {
+    "lanes": 1,
+    "pool_tokens": 229376,
+    "uncached_input_tokens": 196608,
+    "generated_tokens": 16384,
+    "capacity_mode_ignore_eos": true,
+    "temperature": 0,
+    "mtp_block_size": 3,
+    "corpus": "deterministic repetitive text memory-stress workload",
+    "prefix_hit": false
+  },
+  "attempts": [
+    {
+      "id": "repeat-01",
+      "status": "passed",
+      "prefill_work_seconds": 2878.1234479587583,
+      "prefill_work_tps": 68.3111769022415,
+      "decode_interval_seconds": 3286.255648332997,
+      "decode_interval_tokens": 16383,
+      "decode_tps": 4.985309042621356,
+      "wall_seconds": 6165.163588708005,
+      "wall_output_tps": 2.657512613291985,
+      "peak_footprint_mib": 20977,
+      "paged_high_water_layer_pages": 13312,
+      "paged_capacity_layer_pages": 14336,
+      "postflight_passed": true,
+      "paged_release_verified_by_reuse": true
+    },
+    {
+      "id": "repeat-02",
+      "status": "passed",
+      "prefill_work_seconds": 2878.4149288189947,
+      "prefill_work_tps": 68.30425941428385,
+      "decode_interval_seconds": 3286.686637375009,
+      "decode_interval_tokens": 16383,
+      "decode_tps": 4.9846553102137765,
+      "wall_seconds": 6165.9628748749965,
+      "wall_output_tps": 2.6571681232077085,
+      "peak_footprint_mib": 20975,
+      "paged_high_water_layer_pages": 13312,
+      "paged_capacity_layer_pages": 14336,
+      "postflight_passed": true,
+      "paged_release_verified_by_reuse": true
+    },
+    {
+      "id": "repeat-03",
+      "status": "passed",
+      "prefill_work_seconds": 2877.5108213831263,
+      "prefill_work_tps": 68.3257204591491,
+      "decode_interval_seconds": 3285.6822739579948,
+      "decode_interval_tokens": 16383,
+      "decode_tps": 4.9861790136709505,
+      "wall_seconds": 6164.015172208994,
+      "wall_output_tps": 2.6580077339635224,
+      "peak_footprint_mib": 20960,
+      "paged_high_water_layer_pages": 13312,
+      "paged_capacity_layer_pages": 14336,
+      "postflight_passed": true,
+      "paged_release_verified_by_reuse": true
+    }
+  ],
+  "reporting_notes": [
+    "This is a current-version n=3 cohort and is not pooled with the historical n=1 run.",
+    "Peak is sampled whole-process footprint, not per-component attribution.",
+    "Minimum sampled guard margin is 23 MiB; this is not a service reliability guarantee."
+  ]
+}

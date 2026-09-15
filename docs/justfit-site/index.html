@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="JustFit serves more than 200K retained LLM tokens on a 24 GiB Apple-silicon laptop through just-in-time state management.">
+  <meta property="og:title" content="JustFit — 200K-token LLM serving on a 24 GiB laptop">
+  <meta property="og:description" content="Compressed KV execution, phase-aware component residency, and state-preserving request transitions for MLX-VLM.">
+  <meta name="theme-color" content="#10221b">
+  <title>JustFit — 200K-token LLM serving on 24 GiB</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <nav class="topbar">
+    <a class="wordmark" href="#top" aria-label="JustFit home">JUST<span>FIT</span></a>
+    <div>
+      <a href="#results">Results</a>
+      <a href="#system">System</a>
+      <a href="#reproduce">Reproduce</a>
+      <a class="nav-paper" href="JustFit_Preprint_v20.pdf">Paper PDF ↗</a>
+    </div>
+  </nav>
+
+  <main id="top">
+    <header class="hero shell">
+      <div class="hero-copy">
+        <p class="eyebrow">Apple M4 Pro · 24 GiB unified memory · Qwen3.8-27B MXFP4</p>
+        <h1>A 27B model.<br><em>More than 200K retained tokens.</em></h1>
+        <p class="lede">JustFit coordinates compressed KV execution, component residency, and request-state transitions so temporary work does not erase the memory saved by compression.</p>
+        <div class="actions">
+          <a class="primary" href="JustFit_Preprint_v20.pdf">Read the paper</a>
+          <a href="https://github.com/YuhuaBillChen/mlx-vlm/tree/production/qwen-paged-continuous-batching">Browse the code</a>
+          <a href="https://github.com/YuhuaBillChen/mlx-vlm/tree/production/qwen-paged-continuous-batching/examples/justfit">Run it</a>
+        </div>
+      </div>
+      <div class="hero-meter" aria-label="Measured single-request retained positions">
+        <div class="meter-number">212,992</div>
+        <div class="meter-label">retained positions · single request</div>
+        <div class="meter-rail"><i></i></div>
+        <dl>
+          <div><dt>Input</dt><dd>196,608</dd></div>
+          <div><dt>Generated</dt><dd>16,384</dd></div>
+          <div><dt>Median TG</dt><dd>4.985 tok/s</dd></div>
+          <div><dt>Median peak</dt><dd>20,975 MiB</dd></div>
+        </dl>
+        <small>Three independent fresh-process completions under a 21,000-MiB guard.</small>
+      </div>
+    </header>
+
+    <section class="thesis">
+      <div class="shell thesis-grid">
+        <p class="eyebrow">The capacity stack</p>
+        <blockquote>Quantizing KV is only the first step. Usable context is set by every allocation that overlaps it.</blockquote>
+        <p>The live budget includes weights, resident KV pages, floating-point attention operands, prefill workspace, output state, speculative state, and component lifetimes. JustFit treats their overlap as the systems problem.</p>
+      </div>
+    </section>
+
+    <section id="results" class="section shell">
+      <div class="section-head">
+        <p class="eyebrow">Measured results</p>
+        <h2>Capacity that completes.</h2>
+        <p>Every capacity row includes the requested generated tail. Concurrent totals are aggregate across requests.</p>
+      </div>
+      <div class="results-grid">
+        <article class="result-card result-main">
+          <span>B1 / single request</span>
+          <strong>6.93×</strong>
+          <h3>completed context</h3>
+          <p>30,720 baseline positions → 212,992 JustFit positions on the same 24 GiB laptop.</p>
+          <div class="bar"><i class="bar-base"></i><i class="bar-fit"></i></div>
+          <small>192K input + 16K output · n=3 · peak range 20,960–20,977 MiB</small>
+        </article>
+        <article class="result-card">
+          <span>B2 / shared pool</span>
+          <strong>229,376</strong>
+          <h3>aggregate positions</h3>
+          <p>Two simultaneous 96K-input + 16K-output requests complete at 12.55 aggregate tok/s.</p>
+          <small>20,310 MiB peak · common-active-interval TG</small>
+        </article>
+        <article class="result-card">
+          <span>B4 / unequal requests</span>
+          <strong>204,800</strong>
+          <h3>aggregate positions</h3>
+          <p>One 128K+12K stream and three 8K+12K streams complete together.</p>
+          <small>20.78 aggregate tok/s · 11.55 wall-output tok/s</small>
+        </article>
+        <article class="result-card">
+          <span>Capability / separate protocol</span>
+          <strong>29 / 30</strong>
+          <h3>AIME 2026</h3>
+          <p>Paged TQ4 generates 696,834 reasoning tokens at 15.04 token-weighted tok/s.</p>
+          <small>Integrated runtime check · not 200K-context comprehension</small>
+        </article>
+      </div>
+    </section>
+
+    <section id="system" class="section dark-section">
+      <div class="shell">
+        <div class="section-head inverted">
+          <p class="eyebrow">One memory budget</p>
+          <h2>Three cooperating mechanisms.</h2>
+        </div>
+        <div class="mechanisms">
+          <article><b>01</b><span>KVEXEC</span><h3>Compact in storage.<br>Bounded in execution.</h3><p>Page-addressed Q4 KV, page-native decode and short verification, plus direct-inverse reconstruction of only the current layer's floating-point attention operands.</p></article>
+          <article><b>02</b><span>PHASESWAP</span><h3>Components follow<br>live owners.</h3><p>The output head, vision tower, and singleton drafter attach when required, stay while leased, and detach only at scheduler-selected safe boundaries.</p></article>
+          <article><b>03</b><span>STATETRANS</span><h3>Change execution.<br>Keep the context.</h3><p>A request can move MTP → batched AR → MTP without migrating its surviving target KV. Completed and cancelled rows return page IDs after evaluation.</p></article>
+        </div>
+
+        <div class="scheduler">
+          <header>
+            <div><p class="eyebrow">Interactive serving schematic</p><h2>Different requests. One physical page pool.</h2></div>
+            <p id="event-detail">A begins alone and owns six equal-capacity page groups.</p>
+          </header>
+          <div class="event-tabs" id="event-tabs" aria-label="Scheduler event">
+            <button data-frame="0" aria-pressed="true">A starts</button>
+            <button data-frame="1">B, C, D join</button>
+            <button data-frame="2">B → E</button>
+            <button data-frame="3">C, D leave</button>
+            <button data-frame="4">E leaves</button>
+            <button data-frame="5">A → F vision</button>
+          </div>
+          <div class="scheduler-grid">
+            <div>
+              <div class="pool-meta"><span>Physical KV slots</span><b id="pool-count">6 occupied / 12 free</b></div>
+              <div class="pool" id="pool" aria-live="polite"></div>
+              <p class="pool-note" id="pool-note">A's six page IDs remain fixed across serving-mode changes.</p>
+            </div>
+            <dl class="runtime-state">
+              <div><dt>Execution</dt><dd id="mode">B1 · MTP</dd></div>
+              <div><dt>Output head</dt><dd id="head">generation lease</dd></div>
+              <div><dt>Singleton drafter</dt><dd id="drafter">attached</dd></div>
+              <div><dt>Vision tower</dt><dd id="vision">detached</dd></div>
+            </dl>
+          </div>
+          <p class="schematic-note">Schematic, not a combined measured vision+B4+200K trace. Slots are equal-capacity page groups; returning a slot does not free the resident pool backing.</p>
+        </div>
+
+        <figure class="paper-figure">
+          <img src="assets/state-transitions.svg" alt="JustFit component residency and shared page ownership across single-lane and continuous-batching phases">
+          <figcaption>The paper's state-transition figure separates active computation, component residency, page ownership, waiting requests, and safe reuse.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="reproduce" class="section shell reproduce">
+      <div class="section-head">
+        <p class="eyebrow">Run and reproduce</p>
+        <h2>Start small. Pin everything.</h2>
+        <p>The fork includes a component-preparation helper, explicit server launcher, streaming workload client, and path-sanitized result JSON.</p>
+      </div>
+      <ol class="repro-steps">
+        <li><b>01</b><div><h3>Pin the runtime</h3><code>git checkout 143967472416aece96eeae392eaf931426acad3c</code></div></li>
+        <li><b>02</b><div><h3>Prepare matching components</h3><code>python examples/justfit/prepare_components.py --model "$MODEL_PATH" --output ./justfit-components</code></div></li>
+        <li><b>03</b><div><h3>Run an 8K smoke profile</h3><code>LANES=1 KV_CAPACITY=32768 MAX_TOKENS=512 examples/justfit/run_server.sh</code></div></li>
+        <li><b>04</b><div><h3>Archive the evidence</h3><p>Commit, checkpoint hashes, effective environment, stream completion, process peak, failures, and page-reuse postflight.</p></div></li>
+      </ol>
+      <div class="repro-links">
+        <a href="https://github.com/YuhuaBillChen/mlx-vlm/blob/production/qwen-paged-continuous-batching/examples/justfit/README.md">Full reproduction guide ↗</a>
+        <a href="https://github.com/YuhuaBillChen/mlx-vlm/blob/production/qwen-paged-continuous-batching/examples/justfit/results/limit-runs.json">Limit-run JSON ↗</a>
+        <a href="https://github.com/YuhuaBillChen/mlx-vlm/blob/production/qwen-paged-continuous-batching/docs/justfit.md">Method and source map ↗</a>
+      </div>
+      <aside class="boundary"><strong>Boundary, not default.</strong><p>The 192K+16K workload takes about 103 minutes and approaches the guard within 23 MiB. It is a full-execution memory stress test using repetitive text and EOS suppression—not a daily service preset or coding benchmark.</p></aside>
+    </section>
+  </main>
+
+  <footer>
+    <div class="shell"><div><b>JustFit</b><p>Independent systems research by Yuhua Chen.</p></div><div><a href="https://www.yuhuachen.com">yuhuachen.com</a><a href="https://github.com/YuhuaBillChen/mlx-vlm">GitHub</a><a href="JustFit_Preprint_v20.pdf">Paper</a></div></div>
+  </footer>
+</body>
+</html>
