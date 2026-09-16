@@ -1,5 +1,9 @@
 # JustFit
 
+[Paper](https://arxiv.org/abs/2609.17475) ·
+[Project page](https://yuhuabillchen.github.io/mlx-vlm/) ·
+[Reproduction kit](../examples/justfit/README.md)
+
 **JustFit** is an experimental mlx-vlm runtime for executing and serving long
 contexts under a fixed unified-memory budget. It coordinates three mechanisms:
 
@@ -99,3 +103,17 @@ Qwen3.8 configuration (head dimension 256, page size 256, Q4 TurboQuant) and
 does not claim general paged-attention support for every mlx-vlm model. The
 converted checkpoint label used in the experiments is a local artifact label;
 an upstream public checkpoint revision was not retrospectively verified.
+
+## Citation
+
+```bibtex
+@misc{chen2026justfit,
+  title         = {JustFit: 200K-Token LLM Serving on a 24 GiB Laptop with Just-in-Time State Management},
+  author        = {Yuhua Chen},
+  year          = {2026},
+  eprint        = {2609.17475},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.AI},
+  url           = {https://arxiv.org/abs/2609.17475}
+}
+```

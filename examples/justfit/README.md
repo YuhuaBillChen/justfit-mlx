@@ -1,5 +1,9 @@
 # JustFit reproduction kit
 
+This kit accompanies the
+[JustFit paper](https://arxiv.org/abs/2609.17475) and its
+[project page](https://yuhuabillchen.github.io/mlx-vlm/).
+
 This directory makes the public JustFit branch runnable without copying the
 author's machine-specific launcher. It supports two useful levels of evidence:
 
@@ -137,7 +141,7 @@ checkpoint reports a different value, do not edit the result—record the
 template revision and calibrate the offset for a new cohort.
 
 The checked-in [`results/limit-runs.json`](results/limit-runs.json) is the
-path-sanitized record used in the final preprint. The authoritative definitions
+path-sanitized record used in the arXiv paper. The authoritative definitions
 are:
 
 - PP = uncached prefill tokens / summed prefill work seconds;

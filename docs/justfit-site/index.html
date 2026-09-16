@@ -6,6 +6,12 @@
   <meta name="description" content="JustFit serves more than 200K retained LLM tokens on a 24 GiB Apple-silicon laptop through just-in-time state management.">
   <meta property="og:title" content="JustFit — 200K-token LLM serving on a 24 GiB laptop">
   <meta property="og:description" content="Compressed KV execution, phase-aware component residency, and state-preserving request transitions for MLX-VLM.">
+  <meta property="og:url" content="https://yuhuabillchen.github.io/mlx-vlm/">
+  <meta name="citation_title" content="JustFit: 200K-Token LLM Serving on a 24 GiB Laptop with Just-in-Time State Management">
+  <meta name="citation_author" content="Yuhua Chen">
+  <meta name="citation_publication_date" content="2026/09/15">
+  <meta name="citation_pdf_url" content="https://arxiv.org/pdf/2609.17475">
+  <link rel="canonical" href="https://yuhuabillchen.github.io/mlx-vlm/">
   <meta name="theme-color" content="#10221b">
   <title>JustFit — 200K-token LLM serving on 24 GiB</title>
   <link rel="stylesheet" href="styles.css">
@@ -18,7 +24,7 @@
       <a href="#results">Results</a>
       <a href="#system">System</a>
       <a href="#reproduce">Reproduce</a>
-      <a class="nav-paper" href="JustFit_Preprint_v20.pdf">Paper PDF ↗</a>
+      <a class="nav-paper" href="https://arxiv.org/abs/2609.17475">arXiv ↗</a>
     </div>
   </nav>
 
@@ -29,7 +35,7 @@
         <h1>A 27B model.<br><em>More than 200K retained tokens.</em></h1>
         <p class="lede">JustFit coordinates compressed KV execution, component residency, and request-state transitions so temporary work does not erase the memory saved by compression.</p>
         <div class="actions">
-          <a class="primary" href="JustFit_Preprint_v20.pdf">Read the paper</a>
+          <a class="primary" href="https://arxiv.org/abs/2609.17475">Read on arXiv</a>
           <a href="https://github.com/YuhuaBillChen/mlx-vlm/tree/production/qwen-paged-continuous-batching">Browse the code</a>
           <a href="https://github.com/YuhuaBillChen/mlx-vlm/tree/production/qwen-paged-continuous-batching/examples/justfit">Run it</a>
         </div>
@@ -156,6 +162,7 @@
         <li><b>04</b><div><h3>Archive the evidence</h3><p>Commit, checkpoint hashes, effective environment, stream completion, process peak, failures, and page-reuse postflight.</p></div></li>
       </ol>
       <div class="repro-links">
+        <a href="https://arxiv.org/abs/2609.17475">Paper on arXiv ↗</a>
         <a href="https://github.com/YuhuaBillChen/mlx-vlm/blob/production/qwen-paged-continuous-batching/examples/justfit/README.md">Full reproduction guide ↗</a>
         <a href="https://github.com/YuhuaBillChen/mlx-vlm/blob/production/qwen-paged-continuous-batching/examples/justfit/results/limit-runs.json">Limit-run JSON ↗</a>
         <a href="https://github.com/YuhuaBillChen/mlx-vlm/blob/production/qwen-paged-continuous-batching/docs/justfit.md">Method and source map ↗</a>
@@ -165,7 +172,7 @@
   </main>
 
   <footer>
-    <div class="shell"><div><b>JustFit</b><p>Independent systems research by Yuhua Chen.</p></div><div><a href="https://www.yuhuachen.com">yuhuachen.com</a><a href="https://github.com/YuhuaBillChen/mlx-vlm">GitHub</a><a href="JustFit_Preprint_v20.pdf">Paper</a></div></div>
+    <div class="shell"><div><b>JustFit</b><p>Independent systems research by Yuhua Chen.</p></div><div><a href="https://www.yuhuachen.com">yuhuachen.com</a><a href="https://github.com/YuhuaBillChen/mlx-vlm">GitHub</a><a href="https://arxiv.org/abs/2609.17475">arXiv</a><a href="JustFit_Preprint_v20.pdf">Archived PDF</a></div></div>
   </footer>
 </body>
 </html>
