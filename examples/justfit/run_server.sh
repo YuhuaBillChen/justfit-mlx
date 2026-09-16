@@ -62,21 +62,33 @@ export MLX_VLM_LANGUAGE_HEAD_PHASE_SWAP_PATH="$LM_HEAD_PATH"
 export MLX_VLM_CAPACITY_IGNORE_EOS="$CAPACITY_MODE"
 export MLX_VLM_TOKEN_QUEUE_TIMEOUT="${TOKEN_QUEUE_TIMEOUT:-0}"
 
-exec python -m mlx_vlm.server \
-  --host "$HOST" \
-  --port "$PORT" \
-  --model "$MODEL_PATH" \
-  --draft-model "$MTP_PATH" \
-  --draft-kind mtp \
-  --draft-block-size "${DRAFT_BLOCK_SIZE:-3}" \
-  --defer-draft-model \
-  --vision-phase-swap-path "$VISION_PATH" \
-  --chunk-local-input-embeddings \
-  --max-num-seqs "$LANES" \
-  --max-tokens "$MAX_TOKENS" \
-  --max-kv-size "$KV_CAPACITY" \
-  --kv-bits 4 \
-  --kv-quant-scheme turboquant \
-  --quantized-kv-start 0 \
-  --prefill-step-size "${PREFILL_STEP_SIZE:-256}" \
+server_args=(
+  --host "$HOST"
+  --port "$PORT"
+  --model "$MODEL_PATH"
+  --draft-model "$MTP_PATH"
+  --draft-kind mtp
+  --draft-block-size "${DRAFT_BLOCK_SIZE:-3}"
+  --defer-draft-model
+  --vision-phase-swap-path "$VISION_PATH"
+  --chunk-local-input-embeddings
+  --max-num-seqs "$LANES"
+  --max-tokens "$MAX_TOKENS"
+  --max-kv-size "$KV_CAPACITY"
+  --kv-bits 4
+  --kv-quant-scheme turboquant
+  --quantized-kv-start 0
+  --prefill-step-size "${PREFILL_STEP_SIZE:-256}"
   --log-progress-interval "${LOG_PROGRESS_INTERVAL:-256}"
+)
+
+if [[ -n "${API_KEY:-}" ]]; then
+  server_args+=(--api-key "$API_KEY")
+fi
+
+if [[ "$HOST" != "127.0.0.1" && "$HOST" != "localhost" && "$HOST" != "::1" && -z "${API_KEY:-}" ]]; then
+  echo "refusing to expose an unauthenticated server on HOST=$HOST; set API_KEY" >&2
+  exit 2
+fi
+
+exec python -m mlx_vlm.server "${server_args[@]}"

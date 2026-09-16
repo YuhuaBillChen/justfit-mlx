@@ -15,6 +15,11 @@ author's machine-specific launcher. It supports two useful levels of evidence:
 
 The second is intentionally expensive and is not a quality benchmark.
 
+For normal use instead of a benchmark, see the
+[serving guide](../../docs/justfit-serving.md). It includes a secured local
+server plus Open WebUI, terminal chat, and Hermes Agent setup. The Hermes
+profile is 64K input + 8K output (73,728 total positions).
+
 ## 1. Install the pinned source
 
 On an Apple-silicon Mac with a working MLX environment:
@@ -22,7 +27,7 @@ On an Apple-silicon Mac with a working MLX environment:
 ```bash
 git clone https://github.com/YuhuaBillChen/mlx-vlm.git
 cd mlx-vlm
-git checkout justfit-repro-v2
+git checkout justfit-repro-v3
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .

@@ -3,6 +3,7 @@
 [Paper](https://arxiv.org/abs/2609.17475) ·
 [Project page](https://yuhuabillchen.github.io/mlx-vlm/) ·
 [Reproduction kit](../examples/justfit/README.md) ·
+[Serving guide](justfit-serving.md) ·
 [Published components](https://huggingface.co/billchen42/JustFit-Qwen3.8-27B-components)
 
 **JustFit** is an experimental mlx-vlm runtime for executing and serving long
@@ -79,6 +80,11 @@ Start with the 8K+64 smoke profile. Only attempt 192K+16K after verifying the
 checkpoint, component files, thermal conditions, free disk space and a process
 footprint monitor. The reported throughput and final few MiB of headroom are
 hardware-, checkpoint- and software-revision-specific.
+
+For daily use, the [serving guide](justfit-serving.md) documents one shared
+OpenAI-compatible endpoint for Open WebUI, the included terminal client, and
+Hermes Agent. Its Hermes profile uses 65,536 input positions plus an 8,192-token
+output ceiling (73,728 total), rather than the paper's boundary workload.
 
 ## Source map
 

@@ -23,6 +23,7 @@
     <div>
       <a href="#results">Results</a>
       <a href="#system">System</a>
+      <a href="#use">Use</a>
       <a href="#reproduce">Reproduce</a>
       <a class="nav-paper" href="https://arxiv.org/abs/2609.17475">arXiv ↗</a>
     </div>
@@ -149,6 +150,34 @@
       </div>
     </section>
 
+    <section id="use" class="section shell use">
+      <div class="section-head">
+        <p class="eyebrow">Use the server</p>
+        <h2>One endpoint.<br>Three familiar clients.</h2>
+        <p>Run a secured OpenAI-compatible endpoint locally, then connect a browser UI, a small streaming terminal client, or Hermes Agent. The recommended Hermes profile is 64K input + 8K output.</p>
+      </div>
+      <div class="use-grid">
+        <article>
+          <span>Browser chat</span>
+          <h3>Open WebUI</h3>
+          <p>Add <code>http://host.docker.internal:8080/v1</code> as an OpenAI-compatible connection, supply the local API key, and select <code>justfit-qwen38</code>.</p>
+        </article>
+        <article>
+          <span>Terminal chat</span>
+          <h3>Streaming CLI</h3>
+          <p>Use the dependency-free <code>examples/justfit/chat_cli.py</code> client for a direct multi-turn Chat Completions session.</p>
+        </article>
+        <article>
+          <span>Coding agent</span>
+          <h3>Hermes Agent</h3>
+          <p>Configure the custom endpoint with context length <code>73728</code>: 65,536 input positions plus an 8,192-token output ceiling.</p>
+        </article>
+      </div>
+      <div class="repro-links">
+        <a href="https://github.com/YuhuaBillChen/mlx-vlm/blob/production/qwen-paged-continuous-batching/docs/justfit-serving.md">Serving quickstart ↗</a>
+      </div>
+    </section>
+
     <section id="reproduce" class="section shell reproduce">
       <div class="section-head">
         <p class="eyebrow">Run and reproduce</p>
@@ -156,7 +185,7 @@
         <p>The fork includes a component-preparation helper, explicit server launcher, streaming workload client, and path-sanitized result JSON.</p>
       </div>
       <ol class="repro-steps">
-        <li><b>01</b><div><h3>Pin the runnable kit</h3><code>git checkout justfit-repro-v2</code><p>Measured runtime provenance: <code>143967472416aece96eeae392eaf931426acad3c</code>. The tagged kit has the identical <code>mlx_vlm/</code> tree.</p></div></li>
+        <li><b>01</b><div><h3>Pin the runnable kit</h3><code>git checkout justfit-repro-v3</code><p>Measured runtime provenance: <code>143967472416aece96eeae392eaf931426acad3c</code>. The tagged kit has the identical <code>mlx_vlm/</code> tree.</p></div></li>
         <li><b>02</b><div><h3>Download pinned public artifacts</h3><code>hf download mlx-community/Qwen3.8-27B-mxfp4 --revision 97ab0819817ab1c61d7d39f9169fc71999915641 --local-dir ./justfit-models/qwen38-mxfp4<br>hf download billchen42/JustFit-Qwen3.8-27B-components --revision 13e0462fa911a1bcbdccbaa759120500c0f90582 --local-dir ./justfit-components</code><p>The component revision contains the exact production BF16 vision backing and byte-identical MTP weights.</p></div></li>
         <li><b>03</b><div><h3>Extract the head and run an 8K smoke profile</h3><code>export MODEL_PATH="$PWD/justfit-models/qwen38-mxfp4" MTP_PATH="$PWD/justfit-components/mtp" VISION_PATH="$PWD/justfit-components/vision-bf16.safetensors"<br>python examples/justfit/prepare_components.py --model "$MODEL_PATH" --output ./justfit-extracted --head-only<br>LM_HEAD_PATH="$PWD/justfit-extracted/language-head.safetensors" LANES=1 KV_CAPACITY=32768 MAX_TOKENS=512 examples/justfit/run_server.sh</code><p>Verify the published SHA-256 values in the component manifest before running.</p></div></li>
         <li><b>04</b><div><h3>Archive the evidence</h3><p>Commit, checkpoint hashes, effective environment, stream completion, process peak, failures, and page-reuse postflight.</p></div></li>
