@@ -1,5 +1,9 @@
 # Serving JustFit
 
+> New to local model serving? Follow the complete
+> [beginner Quick Start](../examples/justfit/quickstart.md) first. This page is
+> the shorter serving reference.
+
 This guide turns the JustFit reproduction kit into a local OpenAI-compatible
 server for three common clients:
 

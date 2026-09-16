@@ -4,6 +4,17 @@ This kit accompanies the
 [JustFit paper](https://arxiv.org/abs/2609.17475) and its
 [project page](https://yuhuabillchen.github.io/mlx-vlm/).
 
+## Start here
+
+> ### [Run JustFit: beginner Quick Start →](quickstart.md)
+>
+> Download the public model, start the tested 64K-input + 8K-output profile,
+> send the first message, and connect Open WebUI or Hermes Agent. Every command
+> is included; no knowledge of the paper or benchmark harness is required.
+
+This README is the **research reproduction guide**. Use it when you want to
+reproduce the paper's smoke checks, 192K+16K boundary run, or validation suite.
+
 This directory makes the public JustFit branch runnable without copying the
 author's machine-specific launcher. It supports two useful levels of evidence:
 

@@ -10,7 +10,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 > [paper on arXiv](https://arxiv.org/abs/2609.17475) or visit the
 > [project page](https://yuhuabillchen.github.io/mlx-vlm/), see the
 > [project overview and measured results](docs/justfit.md), follow the
-> [Open WebUI, terminal and Hermes serving guide](docs/justfit-serving.md), or
+> [beginner Quick Start](examples/justfit/quickstart.md), or
 > use the [reproduction kit](examples/justfit/README.md) with its
 > [published checkpoint components](https://huggingface.co/billchen42/JustFit-Qwen3.8-27B-components)
 > for a smoke test or the

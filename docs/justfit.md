@@ -2,6 +2,7 @@
 
 [Paper](https://arxiv.org/abs/2609.17475) ·
 [Project page](https://yuhuabillchen.github.io/mlx-vlm/) ·
+[Beginner Quick Start](../examples/justfit/quickstart.md) ·
 [Reproduction kit](../examples/justfit/README.md) ·
 [Serving guide](justfit-serving.md) ·
 [Published components](https://huggingface.co/billchen42/JustFit-Qwen3.8-27B-components)
