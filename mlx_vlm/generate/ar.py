@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import gc
 import logging
 import os
 import sys
@@ -3885,6 +3886,11 @@ class BatchGenerator:
                 )
                 _release_cache_resources(warm_cache)
                 return None
+        # A warm restore may materialize retained cache state through temporary
+        # host buffers and MLX conversion graphs. Release those before the final
+        # prompt token reloads the LM head and deferred drafter.
+        gc.collect()
+        mx.clear_cache()
         apc_meta = [
             {
                 "full_input_ids": full_ids[i],
