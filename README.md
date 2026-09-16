@@ -10,7 +10,9 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 > [paper on arXiv](https://arxiv.org/abs/2609.17475) or visit the
 > [project page](https://yuhuabillchen.github.io/mlx-vlm/), see the
 > [project overview and measured results](docs/justfit.md), and use the
-> [reproduction kit](examples/justfit/README.md) for a smoke test or the
+> [reproduction kit](examples/justfit/README.md) with its
+> [published checkpoint components](https://huggingface.co/billchen42/JustFit-Qwen3.8-27B-components)
+> for a smoke test or the
 > full 192K-input + 16K-output capacity protocol. These fork-only mechanisms
 > are experimental and are not part of the upstream mlx-vlm release.
 

@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "target": {
+    "repo_id": "mlx-community/Qwen3.8-27B-mxfp4",
+    "revision": "97ab0819817ab1c61d7d39f9169fc71999915641"
+  },
+  "components": {
+    "repo_id": "billchen42/JustFit-Qwen3.8-27B-components",
+    "revision": "13e0462fa911a1bcbdccbaa759120500c0f90582",
+    "files": [
+      {
+        "path": "vision-bf16.safetensors",
+        "bytes": 921492862,
+        "sha256": "b27ad7963b3752b5cab9d225f9c0b033d0d59066e7ff357dac17d690a6ff7994"
+      },
+      {
+        "path": "mtp/model.safetensors",
+        "bytes": 225662258,
+        "sha256": "9b1d99f402f98940e08891d04815271e3fa94d6bc762f042fd311d3aa0d8bd1d"
+      },
+      {
+        "path": "mtp/config.json",
+        "bytes": 3777,
+        "sha256": "e0d0d5dc68f59559940e1b2dafc40a34700b9ae7ff963de268225a54550af563"
+      }
+    ]
+  },
+  "audit": {
+    "target_non_vision_tensors": 1349,
+    "target_non_vision_bytes": 14292384768,
+    "target_non_vision_mismatches": 0,
+    "language_head_tensors": 2,
+    "language_head_raw_bytes": 675430400,
+    "language_head_mismatches": 0,
+    "vision_backing_tensors": 333,
+    "vision_backing_raw_bytes": 921460192,
+    "vision_backing_mismatches": 0
+  }
+}

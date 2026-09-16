@@ -28,24 +28,31 @@ def main() -> None:
     parser.add_argument("--model", required=True, help="Local path or Hugging Face id")
     parser.add_argument("--revision", help="Optional immutable Hugging Face revision")
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--head-only",
+        action="store_true",
+        help="Extract only the language head when using the published vision backing.",
+    )
     args = parser.parse_args()
 
     model_path = get_model_path(args.model, revision=args.revision)
     model = load_model(model_path, lazy=True)
     language_model = getattr(model, "language_model", model)
     head = getattr(language_model, "lm_head", None)
-    vision = getattr(model, "vision_tower", None)
     if head is None:
         raise ValueError("checkpoint does not expose an untied language_model.lm_head")
-    if vision is None:
-        raise ValueError("checkpoint does not expose model.vision_tower")
 
     head_path = args.output / "language-head.safetensors"
-    vision_path = args.output / "vision-tower.safetensors"
     head_bytes = save_component(head, head_path)
-    vision_bytes = save_component(vision, vision_path)
     print(f"wrote {head_path} ({head_bytes} parameter bytes)")
-    print(f"wrote {vision_path} ({vision_bytes} parameter bytes)")
+
+    if not args.head_only:
+        vision = getattr(model, "vision_tower", None)
+        if vision is None:
+            raise ValueError("checkpoint does not expose model.vision_tower")
+        vision_path = args.output / "vision-tower.safetensors"
+        vision_bytes = save_component(vision, vision_path)
+        print(f"wrote {vision_path} ({vision_bytes} parameter bytes)")
 
 
 if __name__ == "__main__":

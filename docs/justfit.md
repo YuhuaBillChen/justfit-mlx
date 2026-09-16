@@ -2,7 +2,8 @@
 
 [Paper](https://arxiv.org/abs/2609.17475) ·
 [Project page](https://yuhuabillchen.github.io/mlx-vlm/) ·
-[Reproduction kit](../examples/justfit/README.md)
+[Reproduction kit](../examples/justfit/README.md) ·
+[Published components](https://huggingface.co/billchen42/JustFit-Qwen3.8-27B-components)
 
 **JustFit** is an experimental mlx-vlm runtime for executing and serving long
 contexts under a fixed unified-memory budget. It coordinates three mechanisms:
@@ -69,6 +70,7 @@ accurate than INT8, and not a 200K long-context comprehension evaluation.
 The [reproduction kit](../examples/justfit/README.md) contains:
 
 - a component-preparation helper;
+- immutable public target and component revisions with SHA-256 manifests;
 - a server launcher with the effective JustFit controls made explicit;
 - a deterministic streaming capacity client;
 - the public, path-sanitized JSON for the three repeated limit runs.
@@ -101,8 +103,12 @@ For implementation contracts and version-scoped validation, also see
 This is research software. The page geometry currently targets the evaluated
 Qwen3.8 configuration (head dimension 256, page size 256, Q4 TurboQuant) and
 does not claim general paged-attention support for every mlx-vlm model. The
-converted checkpoint label used in the experiments is a local artifact label;
-an upstream public checkpoint revision was not retrospectively verified.
+converted checkpoint label used in the experiments remains a local artifact
+label. A post-publication tensor audit matched all 1,349 non-vision tensors to
+the pinned public MXFP4 target, all 333 production BF16 vision-backing tensors
+to the published component, and the MTP weights by SHA-256. The local target
+container is not claimed to be byte-identical because its inactive
+checkpoint-side vision representation was quantized differently.
 
 ## Citation
 

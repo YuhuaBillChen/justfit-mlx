@@ -22,7 +22,7 @@ On an Apple-silicon Mac with a working MLX environment:
 ```bash
 git clone https://github.com/YuhuaBillChen/mlx-vlm.git
 cd mlx-vlm
-git checkout justfit-repro-v1
+git checkout justfit-repro-v2
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
@@ -40,27 +40,55 @@ git checkout production/qwen-paged-continuous-batching
 git rev-parse HEAD
 ```
 
-## 2. Prepare checkpoint-side components
+## 2. Download the pinned public artifacts
 
-Set `MODEL_PATH` to a compatible converted Qwen3.8-27B MXFP4 VLM checkpoint.
-The paper's local artifact label was `Qwen3.8-27B-mxfp4-mtp-vq8`; this repository
-does not redistribute those weights or claim a retrospectively verified public
-model revision.
-
-Extract the output head and vision tower from the same checkpoint:
+The public reproduction path uses immutable Hugging Face revisions. Download
+the target checkpoint and the exact PhaseSwap/MTP artifacts:
 
 ```bash
-export MODEL_PATH=/absolute/path/to/Qwen3.8-27B-mxfp4-mtp-vq8
-python examples/justfit/prepare_components.py \
-  --model "$MODEL_PATH" \
-  --output ./justfit-components
+python -m pip install -U huggingface_hub
+
+hf download mlx-community/Qwen3.8-27B-mxfp4 \
+  --revision 97ab0819817ab1c61d7d39f9169fc71999915641 \
+  --local-dir ./justfit-models/qwen38-mxfp4
+hf download billchen42/JustFit-Qwen3.8-27B-components \
+  --revision 13e0462fa911a1bcbdccbaa759120500c0f90582 \
+  --local-dir ./justfit-components
+
+export MODEL_PATH="$PWD/justfit-models/qwen38-mxfp4"
+export MTP_PATH="$PWD/justfit-components/mtp"
+export VISION_PATH="$PWD/justfit-components/vision-bf16.safetensors"
 ```
 
-The measured target artifact did not contain native MTP tensors; the recorded
-runs used a compatible standalone Qwen3.8 MTP checkpoint. Set its path directly:
+The paper's local target artifact was repacked under the label
+`Qwen3.8-27B-mxfp4-mtp-vq8`. A post-publication tensor-level audit found that
+all 1,349 non-vision tensors (14,292,384,768 bytes) match the pinned public
+MXFP4 checkpoint. The published BF16 vision backing matches the production
+PhaseSwap file for all 333 tensors, and the published MTP weight file has the
+same SHA-256 as the measured artifact. The local target container itself is not
+claimed to be byte-identical because its inactive checkpoint-side vision tower
+used a different quantized representation.
+
+Verify the published component files before running:
 
 ```bash
-export MTP_PATH=/absolute/path/to/compatible-Qwen3.8-MTP-checkpoint
+shasum -a 256 \
+  "$VISION_PATH" \
+  "$MTP_PATH/model.safetensors" \
+  "$MTP_PATH/config.json"
+```
+
+Expected digests are recorded in
+[`components-manifest.json`](components-manifest.json).
+
+Extract only the untied output head from the pinned target checkpoint:
+
+```bash
+python examples/justfit/prepare_components.py \
+  --model "$MODEL_PATH" \
+  --output ./justfit-extracted \
+  --head-only
+export LM_HEAD_PATH="$PWD/justfit-extracted/language-head.safetensors"
 ```
 
 If a different target checkpoint does contain top-level `mtp.*` tensors, create
@@ -80,9 +108,6 @@ runtime module from them; it does not imply a discrete-VRAM transfer.
 ## 3. Start the server
 
 ```bash
-export LM_HEAD_PATH="$PWD/justfit-components/language-head.safetensors"
-export VISION_PATH="$PWD/justfit-components/vision-tower.safetensors"
-
 # Start with the safer smoke profile.
 LANES=1 KV_CAPACITY=32768 MAX_TOKENS=512 \
   examples/justfit/run_server.sh
@@ -98,7 +123,6 @@ for the forced-length capacity protocol.
 In another terminal:
 
 ```bash
-export MODEL_PATH=/absolute/path/to/Qwen3.8-27B-mxfp4-mtp-vq8
 python examples/justfit/capacity_client.py \
   --model "$MODEL_PATH" \
   --tokenizer "$MODEL_PATH" \
@@ -123,7 +147,6 @@ CAPACITY_MODE=1 LANES=1 KV_CAPACITY=229376 MAX_TOKENS=16384 \
   OUTPUT_GUARANTEE=16384 examples/justfit/run_server.sh
 
 # Terminal 2
-export MODEL_PATH=/absolute/path/to/Qwen3.8-27B-mxfp4-mtp-vq8
 python examples/justfit/capacity_client.py \
   --model "$MODEL_PATH" \
   --tokenizer "$MODEL_PATH" \
@@ -163,17 +186,20 @@ manufacture an aggregate result.
 ## Reproduction-kit smoke evidence
 
 On 2026-09-15, the tagged source flow was exercised on the paper's M4 Pro / 24
-GiB host with APC disabled. `prepare_components.py` produced a 675,430,400-byte
-language head and a 617,072,992-byte vision tower. Two consecutive requests on
+GiB host with APC disabled. The local measured-checkpoint flow produced a
+675,430,400-byte language head and a 617,072,992-byte quantized vision tower.
+Two consecutive requests on
 one server each reported exactly 8,192 prompt tokens, 64 completion tokens,
 `finish_reason=length`, `[DONE]`, and no stream error. Their TTFT / wall times
 were 65.64 / 68.23 seconds and 64.25 / 66.84 seconds. The second request reused
 the persistent paged pool after the first request released its page ownership.
 
-This smoke validates the public launcher, component extraction, streaming
-client, phase-swapped head, paged Q4 prefill/decode, and page reuse. It uses the
-compatible standalone MTP artifact described above; it does not make that
-checkpoint redistributable or turn the smoke into a quality benchmark.
+This smoke validates the launcher, component extraction, streaming client,
+phase-swapped head, paged Q4 prefill/decode, and page reuse against the local
+measured-checkpoint layout. The public component repository removes the former
+weight-availability gap; its BF16 vision file is the exact production
+PhaseSwap backing, not the smaller quantized tower reported by that smoke. The
+smoke remains a lifecycle check rather than a quality benchmark.
 
 ## Minimal validation suite
 
