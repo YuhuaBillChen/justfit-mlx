@@ -1521,7 +1521,11 @@ class ResponseGenerator:
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        if self.draft_model is not None and args.logits_processors is not None:
+        if (
+            self.draft_model is not None
+            and self.draft_kind != "mtp"
+            and args.logits_processors is not None
+        ):
             raise ValueError(
                 "Structured response_format is not supported with speculative decoding."
             )

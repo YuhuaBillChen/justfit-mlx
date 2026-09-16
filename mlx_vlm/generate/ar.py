@@ -1880,8 +1880,6 @@ class GenerationBatch:
             return None
         if self._mtp_repromotion_state is None or self._next_tokens is None:
             return None
-        if self.logits_processors and any(self.logits_processors):
-            return None
         if self.thinking_budget_criteria and any(self.thinking_budget_criteria):
             return None
 
@@ -1904,6 +1902,8 @@ class GenerationBatch:
             token_dtype=self._next_tokens.dtype,
             greedy_sampling=self.greedy_sampling,
             paged_cache_factory=self._paged_cache_factory,
+            logits_processors=list(self.logits_processors),
+            token_context=[list(ctx) for ctx in self.token_context],
         )
         batch._num_tokens = list(self._num_tokens)
         if self._rope_deltas is not None:
@@ -2038,6 +2038,10 @@ class SpeculativeGenerationBatch:
         greedy_sampling: bool = False,
         paged_cache_factory=None,
         thinking_budget_criteria: Optional[List[Any]] = None,
+        logits_processors: Optional[
+            List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
+        ] = None,
+        token_context: Optional[List[List[int]]] = None,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -2066,6 +2070,17 @@ class SpeculativeGenerationBatch:
                 "thinking_budget_criteria must match the speculative batch size."
             )
         self.thinking_budget_criteria = list(thinking_budget_criteria)
+        self.logits_processors = list(logits_processors or [None] * len(uids))
+        self.token_context = [
+            list(ctx) for ctx in (token_context or [[] for _ in uids])
+        ]
+        if (
+            len(self.logits_processors) != len(uids)
+            or len(self.token_context) != len(uids)
+        ):
+            raise ValueError("Processor state must match the speculative batch size.")
+        if any(self.logits_processors) and draft_kind != "mtp":
+            raise ValueError("Speculative logits processors require MTP.")
         self._forced_next_tokens: List[Optional[int]] = [None] * len(uids)
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
@@ -2118,6 +2133,8 @@ class SpeculativeGenerationBatch:
         self._finished.extend(other._finished)
         self._last_tokens.extend(other._last_tokens)
         self.thinking_budget_criteria.extend(other.thinking_budget_criteria)
+        self.logits_processors.extend(other.logits_processors)
+        self.token_context.extend(other.token_context)
         self._forced_next_tokens.extend(other._forced_next_tokens)
         self._sent_first = False
         self._rounds_iter = None
@@ -2150,6 +2167,15 @@ class SpeculativeGenerationBatch:
                 **speculative_prefill_kwargs("mtp", self.draft_model),
             )
         logits = output.logits[:, -1, :]
+        if any(self.logits_processors):
+            logits = mx.concatenate(
+                [
+                    self._process_mtp_logits(
+                        row, self._last_tokens[row], logits[i : i + 1]
+                    )
+                    for i, row in enumerate(active_slots)
+                ], axis=0,
+            )
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         first_tokens = _sample_with_positions(
             self.sampler,
@@ -2170,6 +2196,8 @@ class SpeculativeGenerationBatch:
         self._forced_next_tokens = [
             self._forced_next_tokens[i] for i in active_slots
         ]
+        self.logits_processors = [self.logits_processors[i] for i in active_slots]
+        self.token_context = [self.token_context[i] for i in active_slots]
         self.first_tokens = first_tokens
         self.hidden = speculative_hidden_state("mtp", output)
         self.shared_kv_states = output.shared_kv_states
@@ -2238,6 +2266,8 @@ class SpeculativeGenerationBatch:
             max_tokens=[self.max_tokens[i] for i in active_slots],
             greedy_sampling=self.greedy_sampling,
             paged_cache_factory=getattr(self, "_paged_cache_factory", None),
+            logits_processors=[self.logits_processors[i] for i in active_slots],
+            token_context=[self.token_context[i] for i in active_slots],
         )
         batch.compute_logprobs = False
         batch._num_tokens = [self._num_tokens[i] for i in active_slots]
@@ -2306,6 +2336,20 @@ class SpeculativeGenerationBatch:
                 )
             )
 
+    def _process_mtp_logits(
+        self, row: int, previous_token: int, logits: mx.array
+    ) -> mx.array:
+        """Consume only the predecessor of a target position we will emit."""
+        processors = self.logits_processors[row] or []
+        if processors:
+            self.token_context[row].append(int(previous_token))
+        for processor in processors:
+            if hasattr(processor, "process_last_token"):
+                logits = processor.process_last_token(int(previous_token), logits)
+            else:
+                logits = processor(mx.array(self.token_context[row]), logits)
+        return logits
+
     def _start_rounds(self):
         if self._rounds_iter is not None:
             return
@@ -2352,6 +2396,9 @@ class SpeculativeGenerationBatch:
             token_observer=self._observe_token if has_token_controls else None,
             forced_token_provider=(
                 self._take_forced_token if has_token_controls else None
+            ),
+            process_logits=(
+                self._process_mtp_logits if any(self.logits_processors) else None
             ),
         )
 
@@ -3111,6 +3158,8 @@ class PromptProcessingBatch:
                 greedy_sampling=self.greedy_sampling,
                 paged_cache_factory=self._paged_cache_factory,
                 thinking_budget_criteria=list(self.thinking_budget_criteria),
+                logits_processors=list(self.logits_processors),
+                token_context=[list(ctx) for ctx in self._token_context],
             )
             compute_logprobs = False
         else:
@@ -3422,6 +3471,7 @@ class BatchGenerator:
         self._prefill_schedule_interval = _get_prefill_schedule_interval()
         self._mixed_prefill_step_size = _get_mixed_prefill_step_size()
         self._decode_prefill_cadence_step = 0
+        self._prefill_after_decode_yield = False
         if self._prefill_schedule_interval > 1:
             logger.info(
                 "Prefill cadence enabled: one mixed prefill step per %d "
@@ -4174,6 +4224,8 @@ class BatchGenerator:
     def _next(self, **kwargs):
         generation_responses = []
         prompt_responses = []
+        resume_prefill = getattr(self, "_prefill_after_decode_yield", False)
+        self._prefill_after_decode_yield = False
 
         # Decode-first: always emit a generation step before touching prefill.
         yield_after_decode = any(
@@ -4181,7 +4233,7 @@ class BatchGenerator:
             for processors in getattr(self._generation_batch, "logits_processors", [])
             for processor in processors or []
         )
-        if len(self._generation_batch) > 0:
+        if len(self._generation_batch) > 0 and not resume_prefill:
             generation_responses = self._generation_batch.next()
             self._gen_tokens_counter += len(generation_responses)
             self._steps_counter += 1
@@ -4205,8 +4257,21 @@ class BatchGenerator:
                     mx.eval(cache_targets)
                 mx.clear_cache()
             if yield_after_decode:
+                # Flush constrained tokens before prefill, then resume the
+                # due prefill work on the next call instead of starving it
+                # behind another decode-and-return cycle.
+                self._prefill_after_decode_yield = (
+                    self.has_pending_prompts
+                    and len(self._generation_batch) < self.completion_batch_size
+                    and (
+                        not len(self._generation_batch)
+                        or self._prefill_schedule_interval <= 1
+                        or self._decode_prefill_cadence_step
+                        % self._prefill_schedule_interval == 0
+                    )
+                )
                 return prompt_responses, generation_responses
-        else:
+        elif not len(self._generation_batch):
             self._decode_prefill_cadence_step = 0
 
         if (

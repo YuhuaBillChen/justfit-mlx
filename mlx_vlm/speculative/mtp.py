@@ -216,7 +216,10 @@ def _mtp_verify_target(
     sampler: Callable[[mx.array], mx.array],
     *,
     sample_target_tokens: bool = True,
+    defer_sampling: bool = False,
 ) -> _MTPVerifyResult:
+    if defer_sampling:
+        sample_target_tokens = False
     result = None
     try:
         if sample_target_tokens:
@@ -262,7 +265,7 @@ def _mtp_verify_target(
         )
         result.hidden = verify_out.hidden_states[-1]
         result.shared_kv_states = verify_out.shared_kv_states or {}
-        if verify_out.logits is not None:
+        if verify_out.logits is not None and not defer_sampling:
             result.target_tokens = sampler(verify_out.logits)
         elif sample_target_tokens:
             # Fused greedy readout is safe for already-normalized hidden states.
@@ -482,6 +485,91 @@ def _speculative_walk_batch_deferred_uniform(
         return [accepted] * B, new_tokens
 
     return [accepted] * B, [draft_lists[row][: budgets[row]] for row in range(B)]
+
+
+def _speculative_walk_batch_processed(
+    lm: nn.Module,
+    target_hidden: mx.array,
+    draft_tokens: mx.array,
+    sampler: Callable[[mx.array], mx.array],
+    budgets: List[int],
+    *,
+    active_idx: List[int],
+    first_bonus: List[int],
+    process_logits: Callable[[int, int, mx.array], mx.array],
+    uniform_acceptance: bool = False,
+    row_ids: Optional[List[int]] = None,
+    base_positions: Optional[List[int]] = None,
+    forced_token_provider: Optional[Callable[[int], Optional[int]]] = None,
+    token_observer: Optional[Callable[[int, int], bool]] = None,
+    stop_check: Optional[Callable[[int, int], bool]] = None,
+) -> Tuple[List[int], List[List[int]]]:
+    """Apply stateful constraints only along the prefix that will be committed.
+
+    A processor consumes the preceding committed token before sampling its
+    successor. The final emitted token stays pending until the next round.
+    Drafting never touches these processors. Uniform cohorts stop *before*
+    processing the next position after any row rejects or reaches a boundary.
+    """
+    drafts = draft_tokens.tolist()
+    accepted = [0] * len(drafts)
+    emitted = [[] for _ in drafts]
+    previous = list(first_bonus)
+    done = [budget <= 0 for budget in budgets]
+    for pos in range(draft_tokens.shape[1] + 1):
+        live = [row for row in range(len(drafts)) if not done[row]]
+        if not live:
+            break
+        with mx.stream(generation_stream):
+            logits = _mtp_logits_from_hidden(
+                lm, target_hidden[mx.array(live), pos : pos + 1, :]
+            )[:, 0, :]
+            processed = [
+                process_logits(active_idx[row], previous[row], logits[i : i + 1])
+                for i, row in enumerate(live)
+            ]
+            logits = mx.concatenate(processed, axis=0)
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            tokens = _sample_mtp_target(
+                sampler,
+                logprobs,
+                [row_ids[row] for row in live] if row_ids is not None else None,
+                (
+                    [base_positions[row] for row in live]
+                    if base_positions is not None else None
+                ),
+                pos,
+            )
+        # Resolve the mask-backed graph before any processor rewrites a buffer.
+        mx.eval(tokens)
+        for row, sampled in zip(live, tokens.reshape(-1).tolist()):
+            forced = (
+                forced_token_provider(active_idx[row])
+                if forced_token_provider is not None
+                else None
+            )
+            token = int(sampled if forced is None else forced)
+            emitted[row].append(token)
+            boundary = (
+                bool(token_observer(active_idx[row], token))
+                if token_observer else False
+            )
+            stopped = bool(stop_check(active_idx[row], token)) if stop_check else False
+            done[row] = (
+                forced is not None
+                or boundary
+                or stopped
+                or len(emitted[row]) >= budgets[row]
+                or pos == len(drafts[row])
+                or token != drafts[row][pos]
+            )
+            # A terminal/mismatched token is the bonus, not a retained draft.
+            accepted[row] = pos if done[row] else pos + 1
+            previous[row] = token
+        if uniform_acceptance and any(done):
+            accepted = [min(pos, count) for count in accepted]
+            break
+    return accepted, emitted
 
 
 def _sampler_supports_positioned_target(
@@ -949,6 +1037,7 @@ def _mtp_rounds_batch(
     paged_cache_factory=None,
     token_observer: Optional[Callable[[int, int], bool]] = None,
     forced_token_provider: Optional[Callable[[int], Optional[int]]] = None,
+    process_logits: Optional[Callable[[int, int, mx.array], mx.array]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
 
@@ -1076,12 +1165,16 @@ def _mtp_rounds_batch(
                     verify_input = mx.concatenate(
                         [b_arr[:, None], draft_tokens], axis=1
                     )
+                    processor_verify_kwargs = (
+                        {"defer_sampling": True} if process_logits is not None else {}
+                    )
                     verify = _mtp_verify_target(
                         lm,
                         verify_input,
                         prompt_cache,
                         sampler,
                         sample_target_tokens=greedy_sampling,
+                        **processor_verify_kwargs,
                     )
                     hidden_full = verify.hidden  # [B_active, bs, H]
 
@@ -1093,7 +1186,7 @@ def _mtp_rounds_batch(
             uniform_acceptance = n_active > 1 and _requires_uniform_batch_acceptance(
                 draft_model, lm
             )
-            if has_token_controls:
+            if has_token_controls and process_logits is None:
                 forced_tokens = [
                     (
                         forced_token_provider(active_idx[row])
@@ -1102,7 +1195,31 @@ def _mtp_rounds_batch(
                     )
                     for row in range(n_active)
                 ]
-            if verify.target_tokens is not None:
+            if process_logits is not None:
+                sampler_rng.target_eval(hidden_full)
+                accepted_list, new_tokens_list = _speculative_walk_batch_processed(
+                    lm,
+                    hidden_full,
+                    draft_tokens,
+                    sampler,
+                    budgets,
+                    active_idx=active_idx,
+                    first_bonus=b_active,
+                    process_logits=process_logits,
+                    uniform_acceptance=uniform_acceptance,
+                    row_ids=[row_ids[idx] for idx in active_idx],
+                    base_positions=[emitted[idx] for idx in active_idx],
+                    forced_token_provider=forced_token_provider,
+                    token_observer=token_observer,
+                    stop_check=lambda row, token: (
+                        (eos_token_ids is not None and token in eos_token_ids)
+                        or (stop_check is not None and stop_check(row, token))
+                    ),
+                )
+                sampler_rng.target_sampled(
+                    sync_draft=not _sampler_supports_positioned_target(sampler)
+                )
+            elif verify.target_tokens is not None:
                 sampler_rng.target_eval(verify.target_tokens, hidden_full)
                 accepted_list, new_tokens_list = _speculative_walk_batch(
                     draft_tokens, verify.target_tokens, budgets
@@ -1142,7 +1259,7 @@ def _mtp_rounds_batch(
                 sampler_rng.target_sampled(
                     sync_draft=not _sampler_supports_positioned_target(sampler)
                 )
-            if has_token_controls:
+            if has_token_controls and process_logits is None:
                 _apply_mtp_token_controls(
                     accepted_list,
                     new_tokens_list,

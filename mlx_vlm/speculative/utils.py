@@ -180,6 +180,7 @@ def run_speculative_server_rounds(
     paged_cache_factory=None,
     token_observer: Optional[Callable[[int, int], bool]] = None,
     forced_token_provider: Optional[Callable[[int], Optional[int]]] = None,
+    process_logits: Optional[Callable[[int, int, mx.array], mx.array]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
     _validate_speculative_sampling(draft_model, greedy_sampling)
@@ -243,6 +244,7 @@ def run_speculative_server_rounds(
             paged_cache_factory=paged_cache_factory,
             token_observer=token_observer,
             forced_token_provider=forced_token_provider,
+            process_logits=process_logits,
         )
         return
 
