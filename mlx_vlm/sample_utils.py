@@ -131,6 +131,8 @@ def make_logits_processors(
         def logit_bias_processor(_, logits):
             return logits.at[:, indices].add(values)
 
+        # Static bias has no prefix state: speculative proposals may reuse it.
+        logit_bias_processor.draft_safe = True
         logits_processors.append(logit_bias_processor)
 
     repetition_penalties = [

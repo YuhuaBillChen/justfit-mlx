@@ -27,6 +27,37 @@ from .common import (
 )
 
 
+class _DraftBiasSampler:
+    """Request-local, stateless proposal constraints; target sampler is untouched."""
+
+    def __init__(self, sampler, processors):
+        self.sampler = sampler
+        self.processors = processors
+
+    def __getattr__(self, name):
+        return getattr(self.sampler, name)
+
+    def __call__(self, logits):
+        return self.sampler(logits)
+
+    def select_rows(self, rows):
+        return type(self)(self.sampler, [self.processors[i] for i in rows])
+
+    def sample_draft(self, logits, *, greedy):
+        if logits.shape[0] != len(self.processors):
+            raise ValueError("Draft bias rows must match the active proposal batch.")
+        shape = logits.shape
+        values = logits.reshape(shape[0], -1, shape[-1])
+        processed = []
+        for row, processors in enumerate(self.processors):
+            scores = values[row]
+            for processor in processors:
+                scores = processor(None, scores)
+            processed.append(scores[None])
+        logits = mx.concatenate(processed, axis=0).reshape(shape)
+        return mx.argmax(logits, axis=-1) if greedy else self.sampler(logits)
+
+
 @dataclass
 class _MTPVerifyResult:
     hidden: mx.array
@@ -997,7 +1028,9 @@ def _mtp_draft_block_active(
                 hidden[row_idx : row_idx + 1],
                 None,
                 block_size,
-                sampler,
+                sampler.select_rows([row_idx])
+                if isinstance(sampler, _DraftBiasSampler)
+                else sampler,
                 token_dtype,
                 **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
             )
@@ -1038,6 +1071,7 @@ def _mtp_rounds_batch(
     token_observer: Optional[Callable[[int, int], bool]] = None,
     forced_token_provider: Optional[Callable[[int], Optional[int]]] = None,
     process_logits: Optional[Callable[[int, int, mx.array], mx.array]] = None,
+    draft_logits_processors=None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
 
@@ -1051,6 +1085,11 @@ def _mtp_rounds_batch(
     lm = model.language_model if hasattr(model, "language_model") else model
 
     B = first_bonus.shape[0]
+    draft_sampler = sampler
+    if draft_logits_processors and any(draft_logits_processors):
+        if len(draft_logits_processors) != B:
+            raise ValueError("Draft processor rows must match the MTP batch.")
+        draft_sampler = _DraftBiasSampler(sampler, draft_logits_processors)
     row_ids = list(range(B)) if row_ids is None else list(row_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
     if (
@@ -1090,7 +1129,7 @@ def _mtp_rounds_batch(
             prompt_tokens,
             hidden,
             first_bonus,
-            sampler,
+            draft_sampler,
             token_dtype,
             **prefill_kwargs,
         )
@@ -1142,6 +1181,11 @@ def _mtp_rounds_batch(
         b_active = [b[active_idx[j]] for j in range(n_active)]
         positions_active = [positions[active_idx[j]] for j in range(n_active)]
         b_arr = mx.array(b_active, dtype=token_dtype)
+        active_draft_sampler = (
+            draft_sampler.select_rows(active_idx)
+            if isinstance(draft_sampler, _DraftBiasSampler)
+            else draft_sampler
+        )
 
         # Draft (autoregressive K-step). hidden / shared_kv state was set
         # via set_shared_kv above; the drafter pulls it from there.
@@ -1153,7 +1197,7 @@ def _mtp_rounds_batch(
                 b_active,
                 hidden,
                 bs,
-                sampler,
+                active_draft_sampler,
                 token_dtype,
                 positions_active,
                 greedy_sampling=greedy_sampling,
@@ -1287,7 +1331,7 @@ def _mtp_rounds_batch(
                     draft_tokens,
                     accepted_list,
                     new_tokens_list,
-                    sampler,
+                    active_draft_sampler,
                     token_dtype,
                     **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
                 )

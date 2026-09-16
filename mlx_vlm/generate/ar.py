@@ -2354,6 +2354,8 @@ class SpeculativeGenerationBatch:
         if self._rounds_iter is not None:
             return
 
+        logits_processors = getattr(self, "logits_processors", [])
+
         residency = getattr(self.model, "phase_residency_manager", None)
         if residency is not None and residency.contains("mtp_drafter") is True:
             if not hasattr(self, "_drafter_lease_owner"):
@@ -2398,8 +2400,12 @@ class SpeculativeGenerationBatch:
                 self._take_forced_token if has_token_controls else None
             ),
             process_logits=(
-                self._process_mtp_logits if any(self.logits_processors) else None
+                self._process_mtp_logits if any(logits_processors) else None
             ),
+            draft_logits_processors=[
+                [p for p in processors or [] if getattr(p, "draft_safe", False)]
+                for processors in logits_processors
+            ],
         )
 
     def release_drafter(self) -> None:
@@ -3879,7 +3885,6 @@ class BatchGenerator:
                 )
                 _release_cache_resources(warm_cache)
                 return None
-
         apc_meta = [
             {
                 "full_input_ids": full_ids[i],

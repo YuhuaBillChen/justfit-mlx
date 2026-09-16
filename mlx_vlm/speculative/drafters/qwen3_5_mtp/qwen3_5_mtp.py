@@ -213,7 +213,10 @@ class Qwen3_5MTPDraftModel(nn.Module):
         return mx.argmax(self._lm_head_fn(hidden), axis=-1)
 
     def _set_seed_from_hidden(self, hidden: mx.array, sampler, greedy: bool) -> None:
-        if greedy:
+        sample_draft = getattr(sampler, "sample_draft", None)
+        if callable(sample_draft):
+            self._seed_token = sample_draft(self._lm_head_fn(hidden), greedy=greedy)
+        elif greedy:
             self._seed_token = self._greedy_token(hidden)
         else:
             self._seed_token = sampler(self._lm_head_fn(hidden))
@@ -432,7 +435,10 @@ class Qwen3_5MTPDraftModel(nn.Module):
         while len(tokens) < block_size - 1:
             h_prev = self._forward_token(tok, h_prev, token_dtype)
             self._round_appended += 1
-            if greedy:
+            sample_draft = getattr(sampler, "sample_draft", None)
+            if callable(sample_draft):
+                tok = sample_draft(self._lm_head_fn(h_prev), greedy=greedy)
+            elif greedy:
                 tok = self._greedy_token(h_prev)
             else:
                 tok = sampler(self._lm_head_fn(h_prev))
