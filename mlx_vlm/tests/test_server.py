@@ -1802,6 +1802,48 @@ def test_active_phase_admission_limits_media_to_one_per_turn(monkeypatch):
     assert gen.requests.get_nowait() is texts[1]
 
 
+def test_active_phase_admission_defers_media_above_context_limit(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_MEDIA_ADMISSION_MAX_WAIT_MS", "0")
+    monkeypatch.setenv("MLX_VLM_MEDIA_ACTIVE_CONTEXT_LIMIT_TOKENS", "100352")
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.requests = Queue()
+    gen._stop = False
+    media = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=453,
+        args=server_generation.GenerationArguments(),
+        images=[object()],
+    )
+    text = server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1,
+        args=server_generation.GenerationArguments(),
+    )
+    gen.requests.put(media)
+    gen.requests.put(text)
+
+    admitted, should_stop = gen._collect_active_phase_requests(
+        capacity=1,
+        active={1: {"prompt_tokens": 131072, "generated_tokens": 1}},
+    )
+
+    assert admitted == []
+    assert not should_stop
+    assert gen.requests.get_nowait() is media
+    assert gen.requests.get_nowait() is text
+
+    gen.requests.put(media)
+    admitted, should_stop = gen._collect_active_phase_requests(
+        capacity=1,
+        active={1: {"prompt_tokens": 98304, "generated_tokens": 1024}},
+    )
+
+    assert admitted == [media]
+    assert not should_stop
+
+
 def test_media_embedding_temporarily_releases_active_generation_head(monkeypatch):
     events = []
 

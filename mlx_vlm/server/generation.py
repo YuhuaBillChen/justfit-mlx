@@ -203,6 +203,24 @@ def get_media_admission_max_wait_s() -> float:
         return 2.0
 
 
+def get_media_active_context_limit_tokens() -> Optional[int]:
+    """Maximum live text positions beside an admitted media request."""
+
+    raw = os.environ.get("MLX_VLM_MEDIA_ACTIVE_CONTEXT_LIMIT_TOKENS", "")
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid MLX_VLM_MEDIA_ACTIVE_CONTEXT_LIMIT_TOKENS=%r; disabling "
+            "the media context gate.",
+            raw,
+        )
+        return None
+    return value if value > 0 else None
+
+
 def get_batch_kv_slot_budget():
     """Maximum rectangular KV token slots across an active batch.
 
@@ -2195,7 +2213,9 @@ class ResponseGenerator:
         event = getattr(request, "cancel_event", None)
         return event is not None and event.is_set()
 
-    def _collect_active_phase_requests(self, capacity: Optional[int]):
+    def _collect_active_phase_requests(
+        self, capacity: Optional[int], active: Optional[dict] = None
+    ):
         """Admit text and one sufficiently old media row at a safe boundary.
 
         Media used to remain queued until the entire active cohort drained,
@@ -2210,6 +2230,12 @@ class ResponseGenerator:
         now = time.perf_counter()
         media_admitted = False
         fairness_blocked = False
+        active_retained_tokens = sum(
+            max(0, int(info.get("prompt_tokens", 0) or 0))
+            + max(0, int(info.get("generated_tokens", 0) or 0))
+            for info in (active or {}).values()
+        )
+        media_context_limit = get_media_active_context_limit_tokens()
 
         for _ in range(scan):
             try:
@@ -2232,9 +2258,19 @@ class ResponseGenerator:
                 not text_only
                 and now - item.queued_at >= get_media_admission_max_wait_s()
             )
+            media_context_safe = (
+                media_context_limit is None
+                or active_retained_tokens <= media_context_limit
+            )
             if has_room and not fairness_blocked and text_only:
                 admitted.append(item)
-            elif has_room and not fairness_blocked and media_due and not media_admitted:
+            elif (
+                has_room
+                and not fairness_blocked
+                and media_due
+                and media_context_safe
+                and not media_admitted
+            ):
                 admitted.append(item)
                 media_admitted = True
                 logger.info(
@@ -2757,7 +2793,7 @@ class ResponseGenerator:
                     and (capacity is None or capacity > 0)
                 ):
                     new_items, should_stop = self._collect_active_phase_requests(
-                        collection_capacity
+                        collection_capacity, active
                     )
                 else:
                     new_items, should_stop = self._collect_pending_requests(
