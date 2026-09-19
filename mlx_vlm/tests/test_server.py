@@ -1907,8 +1907,12 @@ def test_media_embedding_restores_generation_head_after_failure(monkeypatch):
             apc_semantic_hash=None,
         )
 
-    residency.release.assert_called_once_with("lm_head", "generation")
-    residency.acquire.assert_called_once_with("lm_head", "generation")
+    assert [c.args for c in residency.release.call_args_list] == [
+        ("input_embedding", "generation"), ("lm_head", "generation")
+    ]
+    assert [c.args for c in residency.acquire.call_args_list] == [
+        ("input_embedding", "generation"), ("lm_head", "generation")
+    ]
 
 
 def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):

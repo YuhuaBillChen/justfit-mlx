@@ -87,6 +87,19 @@ class DiskBackedInputEmbeddingProvider:
         self.cleanup()
 
 
+class CurrentInputEmbedding:
+    """Resolve the current table without retaining an old swapped-out module."""
+
+    def __init__(self, owner):
+        self.owner = owner
+
+    def __call__(self, input_ids):
+        embedding = self.owner.embed_tokens
+        if embedding is None:
+            raise RuntimeError("Text embedding requested while its table is unloaded")
+        return embedding(input_ids)
+
+
 class ChunkedInputEmbeddingProvider:
     """Build Qwen3.5 multimodal embeddings one prefill chunk at a time."""
 
@@ -221,6 +234,13 @@ class Model(Qwen3VLModel):
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config, config)
 
+    def encode_image_features(self, pixel_values, grid_thw, *, batch_size=0):
+        """Compute visual features without touching the text embedding table."""
+        dtype = self.vision_tower.patch_embed.proj.weight.dtype
+        return encode_vision_microbatches(
+            self.vision_tower, pixel_values.astype(dtype), grid_thw, batch_size
+        )
+
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,
@@ -253,7 +273,7 @@ class Model(Qwen3VLModel):
                 ),
                 input_embedding_provider=(
                     ChunkedInputEmbeddingProvider(
-                        self.language_model.model.embed_tokens,
+                        CurrentInputEmbedding(self.language_model.model),
                         None,
                         (),
                         self.config.image_token_index,
@@ -266,9 +286,6 @@ class Model(Qwen3VLModel):
                 rope_deltas=rope_deltas,
             )
 
-        dtype = self.vision_tower.patch_embed.proj.weight.dtype
-        pixel_values = pixel_values.astype(dtype)
-
         vision_cache = kwargs.get("vision_cache", None)
         cached = kwargs.get("cached_image_features", None)
         if cached is None and vision_cache is not None:
@@ -277,11 +294,10 @@ class Model(Qwen3VLModel):
             hidden_states = cached
         else:
             # Get the ouptut hidden states from the vision model
-            hidden_states = encode_vision_microbatches(
-                self.vision_tower,
+            hidden_states = self.encode_image_features(
                 pixel_values,
                 grid_thw,
-                vision_image_batch_size if image_grid_thw is not None else 0,
+                batch_size=vision_image_batch_size if image_grid_thw is not None else 0,
             )
             if vision_cache is not None and kwargs.get("_image_key") is not None:
                 mx.eval(hidden_states)
@@ -306,7 +322,7 @@ class Model(Qwen3VLModel):
             return InputEmbeddingsFeatures(
                 inputs_embeds=None,
                 input_embedding_provider=ChunkedInputEmbeddingProvider(
-                    self.language_model.model.embed_tokens,
+                    CurrentInputEmbedding(self.language_model.model),
                     hidden_states,
                     visual_positions,
                     self.config.image_token_index,

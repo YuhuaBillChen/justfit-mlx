@@ -1589,6 +1589,15 @@ class ResponseGenerator:
                 "input_embedding", language_model.prefill_embedding_phase_swap,
                 retain_on_release=True,
             )
+        vision_embedding_component = os.environ.get("MLX_VLM_VISION_EMBEDDING_SWAP_PATH")
+        if vision_embedding_component and not embedding_component:
+            if getattr(config, "model_type", None) != "qwen3_5":
+                raise ValueError("Vision-only embedding swap requires Qwen3.5.")
+            self.component_residency.register(
+                "input_embedding",
+                LanguageEmbeddingPhaseSwap(language_model, vision_embedding_component),
+                retain_on_release=True,
+            )
         if isinstance(draft_model, LazyDrafter):
             dependencies = tuple(
                 name for name in ("input_embedding", "lm_head")
@@ -2077,6 +2086,54 @@ class ResponseGenerator:
         phase_swap = (
             getattr(self, "vision_phase_swap", None) if media_uses_vision else None
         )
+        # Models exposing this interface can finish vision before constructing
+        # text embedding providers. Cache hits need no tower residency at all.
+        encode_features = getattr(self.model, "encode_image_features", None)
+        if (
+            phase_swap is not None
+            and pixel_values is not None
+            and callable(encode_features)
+            and data_kwargs.get("video_grid_thw") is None
+            and data_kwargs.get("pixel_values_videos") is None
+        ):
+            features = None
+            if self.vision_cache is not None and images is not None:
+                features = self.vision_cache.get(images)
+            if features is None:
+                residency = getattr(self, "component_residency", None)
+                managed = residency is not None and residency.contains("vision_tower")
+                embedding_released = False
+                tower_acquired = False
+                try:
+                    if residency is not None and residency.contains("input_embedding"):
+                        mx.synchronize()
+                        embedding_released = residency.unload_if_idle("input_embedding")
+                    if managed:
+                        residency.acquire("vision_tower", "media_embedding")
+                    else:
+                        phase_swap.load()
+                    tower_acquired = True
+                    features = encode_features(
+                        pixel_values,
+                        data_kwargs.get("image_grid_thw"),
+                        batch_size=_get_nonnegative_env_int("MLX_VLM_VISION_IMAGE_BATCH_SIZE"),
+                    )
+                    mx.eval(features)
+                    mx.synchronize()
+                finally:
+                    # Do not reload the text table if tower reclamation fails.
+                    if tower_acquired:
+                        mx.synchronize()
+                        if managed:
+                            residency.release("vision_tower", "media_embedding")
+                        else:
+                            phase_swap.unload()
+                    if embedding_released:
+                        residency.ensure_loaded("input_embedding")
+                if self.vision_cache is not None and images is not None:
+                    self.vision_cache.put(images, features)
+            data_kwargs["cached_image_features"] = features
+            phase_swap = None
         if phase_swap is not None:
             residency = getattr(self, "component_residency", None)
             if residency is not None and residency.contains("vision_tower"):
@@ -2135,6 +2192,7 @@ class ResponseGenerator:
         # Remove cache kwargs before passing to BatchGenerator
         data_kwargs.pop("vision_cache", None)
         data_kwargs.pop("_image_key", None)
+        data_kwargs.pop("cached_image_features", None)
         gen_kwargs = {
             **data_kwargs,
             **{k: v for k, v in embed.to_dict().items() if v is not None},
@@ -2320,6 +2378,16 @@ class ResponseGenerator:
             and residency.contains("lm_head")
             and "generation" in residency.owners("lm_head")
         )
+        release_embedding = bool(
+            active
+            and media_uses_vision
+            and residency is not None
+            and residency.contains("input_embedding")
+            and "generation" in residency.owners("input_embedding")
+        )
+        if release_embedding:
+            mx.synchronize()
+            residency.release("input_embedding", "generation")
         if release_head:
             mx.synchronize()
             residency.release("lm_head", "generation")
@@ -2333,6 +2401,8 @@ class ResponseGenerator:
                 apc_semantic_hash=apc_semantic_hash,
             )
         finally:
+            if release_embedding:
+                residency.acquire("input_embedding", "generation")
             if release_head:
                 residency.acquire("lm_head", "generation")
                 logger.info("Restored active decode residency after media embedding.")
