@@ -189,6 +189,20 @@ def get_lm_head_mixed_prefill_max_tokens() -> int:
     return max(0, value)
 
 
+def get_media_admission_max_wait_s() -> float:
+    """Maximum time media may be bypassed by text in an active cohort."""
+
+    raw = os.environ.get("MLX_VLM_MEDIA_ADMISSION_MAX_WAIT_MS", "2000")
+    try:
+        return max(0.0, float(raw)) / 1000.0
+    except ValueError:
+        logger.warning(
+            "Invalid MLX_VLM_MEDIA_ADMISSION_MAX_WAIT_MS=%r; using 2000ms.",
+            raw,
+        )
+        return 2.0
+
+
 def get_batch_kv_slot_budget():
     """Maximum rectangular KV token slots across an active batch.
 
@@ -2181,12 +2195,21 @@ class ResponseGenerator:
         event = getattr(request, "cancel_event", None)
         return event is not None and event.is_set()
 
-    def _collect_active_phase_text_requests(self, capacity: Optional[int]):
-        """Admit queued text rows while leaving media at the cohort boundary."""
+    def _collect_active_phase_requests(self, capacity: Optional[int]):
+        """Admit text and one sufficiently old media row at a safe boundary.
+
+        Media used to remain queued until the entire active cohort drained,
+        which can starve an image request behind a long-running decode.  The
+        worker still admits at most one media row per scheduler turn so vision
+        residency does not oscillate for a burst of queued requests.
+        """
         admitted = []
         deferred = []
         should_stop = False
         scan = self.requests.qsize()
+        now = time.perf_counter()
+        media_admitted = False
+        fairness_blocked = False
 
         for _ in range(scan):
             try:
@@ -2203,18 +2226,80 @@ class ResponseGenerator:
                     self._request_log_id(item),
                 )
                 continue
-            if (
-                capacity is None or len(admitted) < capacity
-            ) and self._is_text_only_request(item):
+            has_room = capacity is None or len(admitted) < capacity
+            text_only = self._is_text_only_request(item)
+            media_due = (
+                not text_only
+                and now - item.queued_at >= get_media_admission_max_wait_s()
+            )
+            if has_room and not fairness_blocked and text_only:
                 admitted.append(item)
+            elif has_room and not fairness_blocked and media_due and not media_admitted:
+                admitted.append(item)
+                media_admitted = True
+                logger.info(
+                    "Admitted waiting media request at active decode boundary: "
+                    "request=%s wait_ms=%.1f",
+                    self._request_log_id(item),
+                    max(0.0, (now - item.queued_at) * 1000.0),
+                )
             else:
                 deferred.append(item)
+                # Once an overdue media row cannot be admitted, do not let
+                # later text rows repeatedly bypass it in this scheduler turn.
+                if media_due:
+                    fairness_blocked = True
 
         for item in deferred:
             self.requests.put(item)
         if self._stop and not admitted and not deferred:
             should_stop = True
         return admitted, should_stop
+
+    def _gpu_embed_at_active_decode_boundary(
+        self,
+        raw_inputs: dict,
+        images,
+        *,
+        active: bool,
+        apc_semantic_hash: Optional[int],
+    ) -> Tuple[mx.array, dict]:
+        """Embed media without overlapping vision weights with an active head.
+
+        The generation worker calls this only between completed scheduler
+        steps.  Synchronize outstanding GPU use, temporarily return the
+        generation head lease, run the vision phase, then restore the lease
+        before decode resumes.  Active KV and request state remain untouched.
+        """
+
+        media_uses_vision = raw_inputs.get("pixel_values") is not None or any(
+            raw_inputs.get(name) is not None
+            for name in ("pixel_values_videos", "image_grid_thw", "video_grid_thw")
+        )
+        residency = getattr(self, "component_residency", None)
+        release_head = bool(
+            active
+            and media_uses_vision
+            and residency is not None
+            and residency.contains("lm_head")
+            and "generation" in residency.owners("lm_head")
+        )
+        if release_head:
+            mx.synchronize()
+            residency.release("lm_head", "generation")
+            gc.collect()
+            mx.clear_cache()
+            logger.info("Paused active decode residency for media embedding.")
+        try:
+            return self._gpu_embed(
+                raw_inputs,
+                images,
+                apc_semantic_hash=apc_semantic_hash,
+            )
+        finally:
+            if release_head:
+                residency.acquire("lm_head", "generation")
+                logger.info("Restored active decode residency after media embedding.")
 
     def _partition_lm_head_phase_admission(self, pending, active):
         """Keep unqualified mixed prefills at a safe cohort boundary.
@@ -2671,7 +2756,7 @@ class ResponseGenerator:
                     and phase_cohorts
                     and (capacity is None or capacity > 0)
                 ):
-                    new_items, should_stop = self._collect_active_phase_text_requests(
+                    new_items, should_stop = self._collect_active_phase_requests(
                         collection_capacity
                     )
                 else:
@@ -2883,9 +2968,10 @@ class ResponseGenerator:
                     # already happened on the caller thread.
                     if self.apc_manager is not None:
                         self.apc_manager.prepare_prefill(prompt_tokens)
-                    input_ids, gen_kwargs = self._gpu_embed(
+                    input_ids, gen_kwargs = self._gpu_embed_at_active_decode_boundary(
                         raw_inputs,
                         images,
+                        active=bool(active),
                         apc_semantic_hash=request.apc_semantic_hash,
                     )
                     has_embeds = bool(

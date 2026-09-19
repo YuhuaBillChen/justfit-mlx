@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import gc
 import json
 import logging
 import math
@@ -1695,7 +1696,8 @@ def test_kv_budget_disabled_preserves_existing_unbounded_admission(monkeypatch):
     assert deferred == []
 
 
-def test_active_phase_admission_skips_media_and_preserves_it_for_next_cohort():
+def test_active_phase_admission_bounds_media_wait_without_starving_text(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_MEDIA_ADMISSION_MAX_WAIT_MS", "2000")
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     gen.requests = Queue()
     gen._stop = False
@@ -1715,11 +1717,20 @@ def test_active_phase_admission_skips_media_and_preserves_it_for_next_cohort():
     gen.requests.put(media)
     gen.requests.put(text)
 
-    admitted, should_stop = gen._collect_active_phase_text_requests(capacity=1)
+    admitted, should_stop = gen._collect_active_phase_requests(capacity=1)
 
     assert admitted == [text]
     assert not should_stop
     assert gen.requests.get_nowait() is media
+
+    media.queued_at = time.perf_counter() - 3.0
+    gen.requests.put(media)
+
+    admitted, should_stop = gen._collect_active_phase_requests(capacity=1)
+
+    assert admitted == [media]
+    assert not should_stop
+    assert gen.requests.empty()
 
 
 def test_active_phase_admission_drops_cancelled_media_before_vision_load():
@@ -1746,24 +1757,28 @@ def test_active_phase_admission_drops_cancelled_media_before_vision_load():
     gen.requests.put(media)
     gen.requests.put(text)
 
-    admitted, should_stop = gen._collect_active_phase_text_requests(capacity=1)
+    admitted, should_stop = gen._collect_active_phase_requests(capacity=1)
 
     assert admitted == [text]
     assert not should_stop
     assert gen.requests.empty()
 
 
-def test_active_phase_text_admission_supports_unbounded_capacity():
+def test_active_phase_admission_limits_media_to_one_per_turn(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_MEDIA_ADMISSION_MAX_WAIT_MS", "0")
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     gen.requests = Queue()
     gen._stop = False
-    media = server_generation.QueuedGenerationRequest(
-        rqueue=Queue(),
-        raw_inputs={},
-        prompt_tokens=1,
-        args=server_generation.GenerationArguments(),
-        images=[object()],
-    )
+    media = [
+        server_generation.QueuedGenerationRequest(
+            rqueue=Queue(),
+            raw_inputs={},
+            prompt_tokens=1,
+            args=server_generation.GenerationArguments(),
+            images=[object()],
+        )
+        for _ in range(2)
+    ]
     texts = [
         server_generation.QueuedGenerationRequest(
             rqueue=Queue(),
@@ -1773,15 +1788,85 @@ def test_active_phase_text_admission_supports_unbounded_capacity():
         )
         for _ in range(2)
     ]
-    gen.requests.put(media)
+    for request in media:
+        gen.requests.put(request)
     for text in texts:
         gen.requests.put(text)
 
-    admitted, should_stop = gen._collect_active_phase_text_requests(capacity=None)
+    admitted, should_stop = gen._collect_active_phase_requests(capacity=None)
 
-    assert admitted == texts
+    assert admitted == [media[0]]
     assert not should_stop
-    assert gen.requests.get_nowait() is media
+    assert gen.requests.get_nowait() is media[1]
+    assert gen.requests.get_nowait() is texts[0]
+    assert gen.requests.get_nowait() is texts[1]
+
+
+def test_media_embedding_temporarily_releases_active_generation_head(monkeypatch):
+    events = []
+
+    class Residency:
+        def contains(self, name):
+            return name == "lm_head"
+
+        def owners(self, name):
+            assert name == "lm_head"
+            return frozenset({"generation"})
+
+        def release(self, name, owner):
+            events.append(("release", name, owner))
+
+        def acquire(self, name, owner):
+            events.append(("acquire", name, owner))
+
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = Residency()
+    gen._gpu_embed = MagicMock(
+        side_effect=lambda *_args, **_kwargs: events.append(("embed",))
+    )
+    monkeypatch.setattr(mx, "synchronize", lambda: events.append(("sync",)))
+    monkeypatch.setattr(mx, "clear_cache", lambda: events.append(("clear",)))
+    monkeypatch.setattr(gc, "collect", lambda: events.append(("gc",)))
+
+    result = gen._gpu_embed_at_active_decode_boundary(
+        {"pixel_values": object()},
+        [object()],
+        active=True,
+        apc_semantic_hash=17,
+    )
+
+    assert result is None
+    assert events == [
+        ("sync",),
+        ("release", "lm_head", "generation"),
+        ("gc",),
+        ("clear",),
+        ("embed",),
+        ("acquire", "lm_head", "generation"),
+    ]
+
+
+def test_media_embedding_restores_generation_head_after_failure(monkeypatch):
+    residency = MagicMock()
+    residency.contains.return_value = True
+    residency.owners.return_value = frozenset({"generation"})
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = residency
+    gen._gpu_embed = MagicMock(side_effect=RuntimeError("vision failed"))
+    monkeypatch.setattr(mx, "synchronize", lambda: None)
+    monkeypatch.setattr(mx, "clear_cache", lambda: None)
+    monkeypatch.setattr(gc, "collect", lambda: None)
+
+    with pytest.raises(RuntimeError, match="vision failed"):
+        gen._gpu_embed_at_active_decode_boundary(
+            {"pixel_values": object()},
+            [object()],
+            active=True,
+            apc_semantic_hash=None,
+        )
+
+    residency.release.assert_called_once_with("lm_head", "generation")
+    residency.acquire.assert_called_once_with("lm_head", "generation")
 
 
 def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
