@@ -131,14 +131,15 @@ b27ad7963b3752b5cab9d225f9c0b033d0d59066e7ff357dac17d690a6ff7994
 e0d0d5dc68f59559940e1b2dafc40a34700b9ae7ff963de268225a54550af563
 ```
 
-Now extract the model's output head. This creates a separate local file used by
-JustFit's phase-aware residency manager:
+Now extract the model's output head and input embedding. These create local
+backing files used by JustFit's phase-aware residency manager. The embedding is
+already in the model download, so this step does not download another copy:
 
 ```bash
 python examples/justfit/prepare_components.py \
   --model ./justfit-qwen38 \
   --output ./justfit-extracted \
-  --head-only
+  --language-only
 ```
 
 Confirm that all required files exist:
@@ -148,9 +149,10 @@ test -f justfit-qwen38/config.json && echo "model: OK"
 test -f justfit-components/mtp/model.safetensors && echo "MTP: OK"
 test -f justfit-components/vision-bf16.safetensors && echo "vision: OK"
 test -f justfit-extracted/language-head.safetensors && echo "head: OK"
+test -f justfit-extracted/input-embedding.safetensors && echo "embedding: OK"
 ```
 
-You should see four lines ending in `OK`.
+You should see five lines ending in `OK`.
 
 ## 5. Create a local API key
 
@@ -188,6 +190,7 @@ MODEL_PATH=justfit-qwen38 \
 MTP_PATH="$PWD/justfit-components/mtp" \
 VISION_PATH="$PWD/justfit-components/vision-bf16.safetensors" \
 LM_HEAD_PATH="$PWD/justfit-extracted/language-head.safetensors" \
+INPUT_EMBEDDING_PATH="$PWD/justfit-extracted/input-embedding.safetensors" \
 HOST=127.0.0.1 PORT=8080 API_KEY="$JUSTFIT_API_KEY" \
 LANES=1 KV_CAPACITY=73728 MAX_TOKENS=8192 OUTPUT_GUARANTEE=8192 \
 TOKEN_QUEUE_TIMEOUT=1800 \
@@ -247,6 +250,7 @@ MODEL_PATH=justfit-qwen38 \
 MTP_PATH="$PWD/justfit-components/mtp" \
 VISION_PATH="$PWD/justfit-components/vision-bf16.safetensors" \
 LM_HEAD_PATH="$PWD/justfit-extracted/language-head.safetensors" \
+INPUT_EMBEDDING_PATH="$PWD/justfit-extracted/input-embedding.safetensors" \
 HOST=0.0.0.0 PORT=8080 API_KEY="$JUSTFIT_API_KEY" \
 LANES=1 KV_CAPACITY=73728 MAX_TOKENS=8192 OUTPUT_GUARANTEE=8192 \
 TOKEN_QUEUE_TIMEOUT=1800 \

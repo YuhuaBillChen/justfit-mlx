@@ -97,15 +97,25 @@ shasum -a 256 \
 Expected digests are recorded in
 [`components-manifest.json`](components-manifest.json).
 
-Extract only the untied output head from the pinned target checkpoint:
+Extract the untied output head and input embedding from the pinned target
+checkpoint. The input embedding is already part of the target download; it is
+not duplicated in the component repository.
 
 ```bash
 python examples/justfit/prepare_components.py \
   --model "$MODEL_PATH" \
   --output ./justfit-extracted \
-  --head-only
+  --language-only
 export LM_HEAD_PATH="$PWD/justfit-extracted/language-head.safetensors"
+export INPUT_EMBEDDING_PATH="$PWD/justfit-extracted/input-embedding.safetensors"
 ```
+
+The pinned checkpoint produces a 675,430,400-byte input-embedding tensor
+payload. The production backing's provenance is recorded under
+`derived_components` in
+[`components-manifest.json`](components-manifest.json). Do not require a
+locally generated container file to have the same SHA-256: safetensors header
+metadata can vary by MLX version while the tensors remain identical.
 
 If a different target checkpoint does contain top-level `mtp.*` tensors, create
 the standalone directory with mlx-vlm's family splitter instead:
@@ -119,7 +129,10 @@ export MTP_PATH="$PWD/justfit-components/mtp"
 ```
 
 The component files are backing artifacts. PhaseSwap reconstructs the matching
-runtime module from them; it does not imply a discrete-VRAM transfer.
+runtime module from them; it does not imply a discrete-VRAM transfer. The
+separate input-embedding backing lets an admitted image request release the
+text embedding table before loading the vision tower, then restore it before
+text prefill resumes.
 
 ## 3. Start the server
 
