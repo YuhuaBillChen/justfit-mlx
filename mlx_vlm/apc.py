@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
+from .apc_probe import stage, traced
 import numpy as np
 
 from ._stream_cleanup import clear_mlx_streams
@@ -72,6 +73,11 @@ DEFAULT_BLOCK_SIZE = 16
 DEFAULT_NUM_BLOCKS = 2048
 DEFAULT_DISK_MAX_GB = 20
 SEED_PARENT_HASH = 0
+# Above this payload size, exact APC snapshots are serialized one top-level
+# cache entry at a time. This bounds MLX's contiguous-write staging without
+# penalizing the many small exact snapshots used by ordinary conversations.
+EXACT_BOUNDED_SAVE_MIN_BYTES = 256 << 20
+_SAFETENSORS_COPY_CHUNK_BYTES = 8 << 20
 
 
 def _env_truthy(name: str, default: str = "") -> bool:
@@ -665,10 +671,11 @@ class PagedTurboQuantDiskRestore:
         """Read physical page runs lazily in their on-disk page-major layout."""
 
         for entries in self.run_entries:
-            values = tuple(
-                _read_safetensors_tensor(self.path, self.data_start, entry)
-                for entry in entries
-            )
+            with stage("read_packed_page_run"):
+                values = tuple(
+                    _read_safetensors_tensor(self.path, self.data_start, entry)
+                    for entry in entries
+                )
             if any(value is None for value in values):
                 raise OSError(f"failed to read paged APC payload from {self.path}")
             yield values
@@ -861,6 +868,133 @@ def _read_safetensors_metadata(path: Path) -> Optional[dict]:
     if header is None:
         return None
     return header[1]
+
+
+def _copy_file_range(
+    source: Any,
+    destination: Any,
+    offset: int,
+    length: int,
+) -> None:
+    """Copy an exact byte range without allocating proportional to its size."""
+    source.seek(int(offset))
+    remaining = int(length)
+    while remaining:
+        payload = source.read(min(remaining, _SAFETENSORS_COPY_CHUNK_BYTES))
+        if not payload:
+            raise OSError("unexpected EOF while assembling safetensors payload")
+        destination.write(payload)
+        remaining -= len(payload)
+
+
+def _safetensors_group_name(name: str) -> str:
+    """Return the top-level cache-entry prefix for an exact snapshot tensor."""
+    match = re.match(r"^(c\d+)(?:_|$)", name)
+    return match.group(1) if match is not None else name
+
+
+def _save_safetensors_bounded(
+    path: Path,
+    arrays: Dict[str, mx.array],
+    *,
+    metadata: Dict[str, str],
+) -> None:
+    """Save one compatible file while bounding MLX staging to one cache entry.
+
+    MLX's writer makes non-contiguous inputs contiguous and evaluates all of
+    them before writing. Exact paged-cache snapshots are borrowed page views,
+    so a long prefix can otherwise transiently duplicate the complete KV
+    snapshot. Small standard safetensors shards keep dtype encoding delegated
+    to MLX; their payloads are then concatenated into one normal file for the
+    existing restore path. Temporary shards live in a subdirectory so an
+    interrupted process cannot make the APC index treat one as a checkpoint.
+    """
+    groups: "OrderedDict[str, Dict[str, mx.array]]" = OrderedDict()
+    for name, value in arrays.items():
+        groups.setdefault(_safetensors_group_name(name), {})[name] = value
+    if not groups:
+        # Keep the same behavior as MLX for metadata-only/invalid snapshots.
+        mx.save_safetensors(str(path), arrays, metadata=metadata)
+        return
+
+    tag = f"{os.getpid()}-{threading.get_ident()}"
+    parts_dir = path.parent / f".{path.stem}.{tag}.parts"
+    part_paths: List[Path] = []
+    try:
+        parts_dir.mkdir()
+        for index, group in enumerate(groups.values()):
+            part = parts_dir / f"part-{index:04d}.safetensors"
+            with stage(f"serialize_group_{index}"):
+                mx.save_safetensors(str(part), group, metadata={})
+            part_paths.append(part)
+            # The next group may reuse the writer's contiguous staging block.
+            mx.clear_cache()
+
+        entries: Dict[str, dict] = {}
+        sources: List[Tuple[Path, int, List[Tuple[str, dict]]]] = []
+        payload_offset = 0
+        for part in part_paths:
+            parsed = _read_safetensors_header(part)
+            if parsed is None:
+                raise OSError(f"invalid temporary safetensors shard: {part}")
+            part_entries, _, data_start = parsed
+            ordered_entries: List[Tuple[str, dict]] = []
+            for name, entry in part_entries.items():
+                bounds = _safetensors_tensor_bounds(entry)
+                if bounds is None:
+                    raise OSError(f"invalid temporary tensor entry: {name}")
+                start, end, _ = bounds
+                final_entry = dict(entry)
+                final_entry["data_offsets"] = [
+                    payload_offset,
+                    payload_offset + end - start,
+                ]
+                entries[name] = final_entry
+                payload_offset += end - start
+                ordered_entries.append((name, entry))
+            sources.append((part, data_start, ordered_entries))
+
+        header: Dict[str, Any] = dict(entries)
+        header["__metadata__"] = dict(metadata)
+        encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        header_size = (len(encoded) + 7) & ~7
+        with stage("assemble_safetensors"), open(path, "wb") as destination:
+            destination.write(header_size.to_bytes(8, "little"))
+            destination.write(encoded)
+            destination.write(b" " * (header_size - len(encoded)))
+            for part, data_start, ordered_entries in sources:
+                with open(part, "rb") as source:
+                    for _, entry in ordered_entries:
+                        start, end, _ = _safetensors_tensor_bounds(entry)
+                        _copy_file_range(
+                            source,
+                            destination,
+                            data_start + start,
+                            end - start,
+                        )
+                # Bound temporary disk use while the final file grows.
+                part.unlink()
+            destination.flush()
+    except Exception:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    finally:
+        try:
+            remaining_parts = list(parts_dir.iterdir())
+        except OSError:
+            remaining_parts = []
+        for part in remaining_parts:
+            try:
+                part.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            parts_dir.rmdir()
+        except OSError:
+            pass
 
 
 def _numel(shape: Sequence[int]) -> int:
@@ -1808,6 +1942,7 @@ class DiskBlockStore:
                 pass
         return size
 
+    @traced("load_exact_cache_file")
     def _load_exact_cache_file(
         self,
         path: Path,
@@ -3235,6 +3370,7 @@ class DiskBlockStore:
         metadata[f"{prefix}_tree"] = json.dumps(structure, separators=(",", ":"))
         return True
 
+    @traced("write_exact_cache_snapshot")
     def _write_exact_cache_snapshot(
         self,
         path: Path,
@@ -3272,8 +3408,15 @@ class DiskBlockStore:
         # so its state cannot change during the write.
         tag = f"{os.getpid()}-{threading.get_ident()}"
         tmp = path.parent / f"{path.stem}.{tag}{self.SUFFIX}"
+        payload_bytes = sum(int(value.nbytes) for value in arrays.values())
+        bounded = payload_bytes >= EXACT_BOUNDED_SAVE_MIN_BYTES
+        trace_t0 = time.perf_counter()
         try:
-            mx.save_safetensors(str(tmp), arrays, metadata=metadata)
+            if bounded:
+                from .apc_single_pass import save_single_pass
+                save_single_pass(tmp, arrays, metadata=metadata)
+            else:
+                mx.save_safetensors(str(tmp), arrays, metadata=metadata)
             os.replace(tmp, path)
         finally:
             # A failed MLX serialization can leave a zero-byte sibling. It is
@@ -3282,6 +3425,14 @@ class DiskBlockStore:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
+        if bounded or _env_truthy("APC_DISK_TRACE"):
+            print(
+                "APC_DISK_TRACE exact_write "
+                f"mode={'single_pass' if bounded else 'mlx'} "
+                f"payload_bytes={payload_bytes} "
+                f"total={time.perf_counter() - trace_t0:.3f}s",
+                flush=True,
+            )
         try:
             self._disk_bytes += path.stat().st_size
         except OSError:
@@ -4950,18 +5101,22 @@ def _prompt_cache_is_batch_shaped(caches: Sequence[Any]) -> bool:
     return all(can_extract_row(cache) for cache in caches)
 
 
+@traced("snapshot_prompt_cache_row")
 def snapshot_prompt_cache_row(
     caches: Sequence[Any],
     batch_idx: int = 0,
     *,
     min_capacity_tokens: Optional[int] = None,
     clone: bool = True,
+    detach: bool = True,
 ) -> Optional[List[Any]]:
     """Row-normalize a prompt cache for APC store/lookup.
 
     Batch-shaped layouts (every entry has ``extract``) are extracted first.
     Single-row caches are cloned by default. Stores can borrow the normalized
     row with ``clone=False`` and decide whether to clone or write it synchronously.
+    Synchronous disk-only stores may also set ``detach=False`` to borrow page
+    views during batch-row extraction; other callers retain owning row semantics.
     Quantized layers with an explicit
     checkpoint contract retain their native packed representation.
     """
@@ -4969,7 +5124,7 @@ def snapshot_prompt_cache_row(
         return []
     source: Sequence[Any] = caches
     if _prompt_cache_is_batch_shaped(caches):
-        row = extract_prompt_cache_from_batch(caches, batch_idx)
+        row = extract_prompt_cache_from_batch(caches, batch_idx, detach=detach)
         if row is None:
             return None
         source = row

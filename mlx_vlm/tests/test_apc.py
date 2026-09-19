@@ -1521,6 +1521,94 @@ def test_exact_cache_disk_write_stats_only_count_committed_files(tmp_path, monke
     manager.close()
 
 
+def test_exact_cache_large_write_is_bounded_and_roundtrips(tmp_path, monkeypatch):
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    monkeypatch.setattr(apc_module, "EXACT_BOUNDED_SAVE_MIN_BYTES", 1)
+    token_ids = list(range(40))
+    recurrent = ArraysCache(size=3)
+    recurrent[0] = mx.arange(24, dtype=mx.float32).reshape(1, 3, 8)
+    recurrent[1] = mx.arange(12, dtype=mx.float16).reshape(1, 3, 4)
+    recurrent[2] = mx.arange(6, dtype=mx.bfloat16).reshape(1, 3, 2)
+    kv = KVCache()
+    kv.keys = mx.arange(160, dtype=mx.float16).reshape(1, 2, 40, 2)
+    kv.values = mx.arange(160, dtype=mx.uint32).reshape(1, 2, 40, 2)
+    kv.offset = len(token_ids)
+    mx.eval(recurrent.state, kv.keys, kv.values)
+
+    calls = []
+    original = apc_module.mx.save_safetensors
+
+    def record_group(path, arrays, **kwargs):
+        if tuple(arrays) != ('dtype',):
+            calls.append(tuple(arrays))
+        return original(path, arrays, **kwargs)
+
+    monkeypatch.setattr(apc_module.mx, "save_safetensors", record_group)
+    disk = DiskBlockStore(tmp_path, namespace="bounded-exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [recurrent, kv], extra_hash=31)
+    disk.flush()
+    assert len(calls) == 5
+    assert all(
+        names and len({name.split("_", 1)[0] for name in names}) == 1
+        for names in calls
+    )
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="bounded-exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    restored, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=31)
+    assert matched == len(token_ids)
+    assert restored is not None
+    _assert_allclose(restored[0][0], recurrent[0])
+    _assert_allclose(restored[0][1], recurrent[1])
+    _assert_allclose(restored[0][2], recurrent[2])
+    _assert_allclose(restored[1].keys[..., : len(token_ids), :], kv.keys)
+    assert bool(
+        mx.array_equal(
+            restored[1].values[..., : len(token_ids), :], kv.values
+        ).item()
+    )
+    assert restored[1].values.dtype == mx.uint32
+    manager.close()
+
+
+def test_exact_cache_bounded_write_removes_partial_files(tmp_path, monkeypatch):
+    from mlx_vlm.models.cache import KVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    monkeypatch.setattr(apc_module, "EXACT_BOUNDED_SAVE_MIN_BYTES", 1)
+    token_ids = list(range(40))
+    caches = []
+    for value in (1, 2):
+        kv = KVCache()
+        kv.keys = mx.full((1, 1, len(token_ids), 2), value, dtype=mx.float16)
+        kv.values = mx.full((1, 1, len(token_ids), 2), value, dtype=mx.float16)
+        kv.offset = len(token_ids)
+        caches.append(kv)
+
+    original = apc_module.mx.save_safetensors
+    calls = [0]
+
+    def fail_second_group(path, arrays, **kwargs):
+        from mlx_vlm.apc_single_pass import PayloadSink
+        if isinstance(path, PayloadSink):
+            calls[0] += 1
+            if calls[0] == 2:
+                raise RuntimeError("synthetic bounded-write failure")
+        return original(path, arrays, **kwargs)
+
+    monkeypatch.setattr(apc_module.mx, "save_safetensors", fail_second_group)
+    disk = DiskBlockStore(tmp_path, namespace="failed-bounded-exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert not manager.store_exact_cache(token_ids, caches)
+    disk.flush()
+    assert manager.stats_snapshot()["disk_write_failures"] == 1
+    assert not list(disk.dir.iterdir())
+    manager.close()
+
+
 def test_model_apc_mode_distinguishes_block_and_exact_custom_cache():
     from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
 

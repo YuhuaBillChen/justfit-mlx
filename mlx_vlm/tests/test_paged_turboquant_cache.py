@@ -204,8 +204,9 @@ def test_base_attention_dispatches_paged_prefill_without_reading_pool_as_dense()
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
 @pytest.mark.parametrize("eager_release", [False, True])
+@pytest.mark.parametrize("head_group_size", [0, 2])
 def test_direct_inverse_prefill_never_materializes_contiguous_kv(
-    monkeypatch, eager_release
+    monkeypatch, eager_release, head_group_size
 ):
     mx.random.seed(8110)
     query_length = 8
@@ -216,7 +217,9 @@ def test_direct_inverse_prefill_never_materializes_contiguous_kv(
         bits=4,
         capacity_pages=4,
         config=PagedTurboQuantConfig(
-            prefill_impl="direct_inverse", prefill_eager_release=eager_release
+            prefill_impl="direct_inverse",
+            prefill_eager_release=eager_release,
+            prefill_kv_head_group_size=head_group_size,
         ),
     )
     pool_keys, pool_values = paged.update_and_fetch(keys, values)

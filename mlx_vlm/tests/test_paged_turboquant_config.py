@@ -35,16 +35,18 @@ class TestPagedTurboQuantConfig(unittest.TestCase):
             "MLX_VLM_PAGED_PREFILL_IMPL": "direct_inverse",
             "MLX_VLM_PAGED_PREFILL_EAGER_RELEASE": "1",
             "MLX_VLM_TQ_MTP_QTILE": "1",
+            "MLX_VLM_PAGED_PREFILL_KV_HEAD_GROUP_SIZE": "2",
         }
         config = Config.from_env(source)
         source.clear()
-        self.assertEqual(config, Config("direct_inverse", True, True))
+        self.assertEqual(config, Config("direct_inverse", True, True, 2))
 
     def test_empty_legacy_values_preserve_disabled_behavior(self):
         self.assertEqual(Config.from_env({
             "MLX_VLM_PAGED_PREFILL_IMPL": "",
             "MLX_VLM_PAGED_PREFILL_EAGER_RELEASE": "",
             "MLX_VLM_TQ_MTP_QTILE": "",
+            "MLX_VLM_PAGED_PREFILL_KV_HEAD_GROUP_SIZE": "",
         }), Config())
 
     def test_invalid_environment_fails_before_execution(self):
@@ -52,6 +54,7 @@ class TestPagedTurboQuantConfig(unittest.TestCase):
             "MLX_VLM_PAGED_PREFILL_IMPL",
             "MLX_VLM_PAGED_PREFILL_EAGER_RELEASE",
             "MLX_VLM_TQ_MTP_QTILE",
+            "MLX_VLM_PAGED_PREFILL_KV_HEAD_GROUP_SIZE",
         ):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 Config.from_env({name: "typo"})
@@ -62,13 +65,20 @@ class TestPagedTurboQuantConfig(unittest.TestCase):
                 with self.subTest(name=name, value=value), self.assertRaises(TypeError):
                     Config(**{name: value})
 
+    def test_head_group_size_requires_a_nonnegative_integer(self):
+        for value in ("2", None, True):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                Config(prefill_kv_head_group_size=value)
+        with self.assertRaises(ValueError):
+            Config(prefill_kv_head_group_size=-1)
+
     def test_execution_policy_is_immutable(self):
         config = Config()
         with self.assertRaises(FrozenInstanceError):
             config.mtp_qtile = True
 
     def test_effective_settings_round_trip_through_json(self):
-        config = Config("direct_inverse", True, True)
+        config = Config("direct_inverse", True, True, 2)
         record = json.loads(json.dumps(config.to_dict()))
         self.assertEqual(Config(**record), config)
         record["mtp_qtile"] = False

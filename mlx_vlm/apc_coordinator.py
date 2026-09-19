@@ -219,6 +219,7 @@ class APCCoordinator:
             prompt_cache,
             batch_idx or 0,
             clone=False,
+            detach=not direct_disk_write,
         )
         if snapshot is None:
             return False

@@ -25,6 +25,7 @@ class PagedTurboQuantConfig:
     prefill_impl: Literal["compatibility", "direct_inverse"] = "compatibility"
     prefill_eager_release: bool = False
     mtp_qtile: bool = False
+    prefill_kv_head_group_size: int = 0
 
     def __post_init__(self) -> None:
         if self.prefill_impl not in ("compatibility", "direct_inverse"):
@@ -32,6 +33,10 @@ class PagedTurboQuantConfig:
         for name in ("prefill_eager_release", "mtp_qtile"):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be a bool")
+        if type(self.prefill_kv_head_group_size) is not int:
+            raise TypeError("prefill_kv_head_group_size must be an int")
+        if self.prefill_kv_head_group_size < 0:
+            raise ValueError("prefill_kv_head_group_size must be nonnegative")
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> PagedTurboQuantConfig:
@@ -50,10 +55,23 @@ class PagedTurboQuantConfig:
                 raise ValueError(f"{name} must be '0' or '1', got {value!r}")
             return value == "1"
 
+        def nonnegative_int(name: str) -> int:
+            value = source.get(name, "0") or "0"
+            try:
+                parsed = int(value)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be a nonnegative integer") from exc
+            if parsed < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+            return parsed
+
         return cls(
             prefill_impl=source.get("MLX_VLM_PAGED_PREFILL_IMPL") or "compatibility",
             prefill_eager_release=flag("MLX_VLM_PAGED_PREFILL_EAGER_RELEASE"),
             mtp_qtile=flag("MLX_VLM_TQ_MTP_QTILE"),
+            prefill_kv_head_group_size=nonnegative_int(
+                "MLX_VLM_PAGED_PREFILL_KV_HEAD_GROUP_SIZE"
+            ),
         )
 
     def to_dict(self) -> dict[str, str | bool]:

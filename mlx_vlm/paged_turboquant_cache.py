@@ -472,6 +472,7 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
                 scale=scale,
                 mask=mask,
                 page_size=PAGED_TURBOQUANT_PAGE_SIZE,
+                kv_head_group_size=self.config.prefill_kv_head_group_size,
             )
             if self.config.prefill_eager_release:
                 mx.eval(result)

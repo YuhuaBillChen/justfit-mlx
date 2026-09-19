@@ -855,13 +855,13 @@ METAL_FUNC void tq_radix(thread float* x) {
         int token = int(threadgroup_position_in_grid.y);
         int head = int(threadgroup_position_in_grid.z);
         int token_count = seq_lens[0];
-        if (token >= token_count || head >= NumKVHeads) return;
+        if (token >= token_count || head >= GroupHeads) return;
 
         int logical_page = token / PageSize;
         int page_token = token - logical_page * PageSize;
         int physical_page = physical_page_ids[logical_page];
         int norm_index =
-            (physical_page * NumKVHeads + head) * PageSize + page_token;
+            (physical_page * NumKVHeads + HeadOffset + head) * PageSize + page_token;
         int key_word_base = norm_index * KPackedWidth;
         int val_word_base = norm_index * VPackedWidth;
         threadgroup float buf[Dim];
@@ -987,6 +987,7 @@ def paged_mse_q4_prefill_direct_inverse_attention(
     scale: float,
     mask,
     page_size: int = PAGED_TURBOQUANT_PAGE_SIZE,
+    kv_head_group_size: int = 0,
 ) -> mx.array:
     """Directly dequantize paged Q4 K/V to BF16, then use stock SDPA."""
 
@@ -999,41 +1000,64 @@ def paged_mse_q4_prefill_direct_inverse_attention(
     kv_heads = int(key_pages.norms.shape[1])
     if dim != 256 or query_heads % kv_heads:
         raise ValueError("unsupported paged direct-inverse prefill geometry")
+    if kv_head_group_size < 0:
+        raise ValueError("kv_head_group_size must be nonnegative")
+    if kv_head_group_size == 0:
+        kv_head_group_size = kv_heads
+    if kv_heads % kv_head_group_size:
+        raise ValueError("kv_head_group_size must divide the KV head count")
     kernel = _paged_mse_q4_direct_inverse_kernel(dim, page_size)
     if kernel is None:
         raise RuntimeError("paged direct-inverse dequant kernel is unavailable")
-    keys, values = kernel(
-        inputs=[
-            key_pages.norms,
-            key_pages.indices,
-            key_codec.codebook,
-            key_codec.signs,
-            value_pages.norms,
-            value_pages.indices,
-            value_codec.codebook,
-            value_codec.signs,
-            schedule.physical_page_ids,
-            schedule.seq_lens,
-        ],
-        template=[
-            ("T", queries.dtype),
-            ("Dim", dim),
-            ("PageSize", page_size),
-            ("NumKVHeads", kv_heads),
-            ("KPackedWidth", key_pages.indices.shape[-1]),
-            ("VPackedWidth", value_pages.indices.shape[-1]),
-        ],
-        grid=(16, token_count, kv_heads),
-        threadgroup=(16, 1, 1),
-        output_shapes=[
-            (1, kv_heads, token_count, dim),
-            (1, kv_heads, token_count, dim),
-        ],
-        output_dtypes=[queries.dtype, queries.dtype],
-    )
-    return mx.fast.scaled_dot_product_attention(
-        queries, keys, values, scale=scale, mask=mask
-    )
+    query_heads_per_kv_head = query_heads // kv_heads
+    outputs = []
+    for head_offset in range(0, kv_heads, kv_head_group_size):
+        keys, values = kernel(
+            inputs=[
+                key_pages.norms,
+                key_pages.indices,
+                key_codec.codebook,
+                key_codec.signs,
+                value_pages.norms,
+                value_pages.indices,
+                value_codec.codebook,
+                value_codec.signs,
+                schedule.physical_page_ids,
+                schedule.seq_lens,
+            ],
+            template=[
+                ("T", queries.dtype),
+                ("Dim", dim),
+                ("PageSize", page_size),
+                ("NumKVHeads", kv_heads),
+                ("GroupHeads", kv_head_group_size),
+                ("HeadOffset", head_offset),
+                ("KPackedWidth", key_pages.indices.shape[-1]),
+                ("VPackedWidth", value_pages.indices.shape[-1]),
+            ],
+            grid=(16, token_count, kv_head_group_size),
+            threadgroup=(16, 1, 1),
+            output_shapes=[
+                (1, kv_head_group_size, token_count, dim),
+                (1, kv_head_group_size, token_count, dim),
+            ],
+            output_dtypes=[queries.dtype, queries.dtype],
+        )
+        query_start = head_offset * query_heads_per_kv_head
+        query_stop = (head_offset + kv_head_group_size) * query_heads_per_kv_head
+        output = mx.fast.scaled_dot_product_attention(
+            queries[:, query_start:query_stop],
+            keys,
+            values,
+            scale=scale,
+            mask=mask,
+        )
+        if kv_head_group_size < kv_heads:
+            mx.eval(output)
+        outputs.append(output)
+    if len(outputs) == 1:
+        return outputs[0]
+    return mx.concatenate(outputs, axis=1)
 
 
 def paged_mse_q4_verify_attention(
