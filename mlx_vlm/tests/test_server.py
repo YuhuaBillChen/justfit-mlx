@@ -1844,44 +1844,6 @@ def test_active_phase_admission_defers_media_above_context_limit(monkeypatch):
     assert not should_stop
 
 
-def test_idle_media_releases_retained_paged_pool(monkeypatch):
-    events = []
-
-    class Stats:
-        used_layer_pages = 0
-        high_water_layer_pages = 8192
-        pool_nbytes = 123456
-
-    class Registry:
-        def stats(self):
-            events.append("stats")
-            return Stats()
-
-        def release(self):
-            events.append("release")
-            return Stats()
-
-    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-    gen._paged_registry = Registry()
-    media = server_generation.QueuedGenerationRequest(
-        rqueue=Queue(),
-        raw_inputs={},
-        prompt_tokens=453,
-        args=server_generation.GenerationArguments(),
-        images=[object()],
-    )
-    monkeypatch.setattr(server_generation.gc, "collect", lambda: events.append("gc"))
-    monkeypatch.setattr(
-        server_generation.mx, "clear_cache", lambda: events.append("clear_cache")
-    )
-
-    released = gen._release_idle_paged_registry_before_media([media])
-
-    assert released
-    assert gen._paged_registry is None
-    assert events == ["stats", "release", "gc", "clear_cache"]
-
-
 def test_media_embedding_temporarily_releases_active_generation_head(monkeypatch):
     events = []
 

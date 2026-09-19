@@ -2292,40 +2292,6 @@ class ResponseGenerator:
             should_stop = True
         return admitted, should_stop
 
-    def _release_idle_paged_registry_before_media(self, requests) -> bool:
-        """Drop an idle KV pool before loading the vision tower.
-
-        Returning request pages makes their slots reusable but intentionally
-        keeps the registry's high-water allocations resident.  After a long
-        text request that retained pool can overlap the next vision-tower load
-        even though there are no live page owners.  At an idle cohort boundary
-        it is safe to close the registry; the following request constructs a
-        fresh, lazily allocated pool after media embedding.
-        """
-
-        if not any(not self._is_text_only_request(request) for request in requests):
-            return False
-        registry = getattr(self, "_paged_registry", None)
-        if registry is None:
-            return False
-        stats = registry.stats()
-        if stats.used_layer_pages:
-            raise RuntimeError(
-                "Cannot release paged TurboQuant pool for media while "
-                f"{stats.used_layer_pages} layer-pages remain live."
-            )
-        final_stats = registry.release()
-        self._paged_registry = None
-        gc.collect()
-        mx.clear_cache()
-        logger.info(
-            "Released idle Paged TurboQuant pool before media embedding: "
-            "high_water_pages=%d pool_bytes=%d",
-            final_stats.high_water_layer_pages,
-            final_stats.pool_nbytes,
-        )
-        return True
-
     def _gpu_embed_at_active_decode_boundary(
         self,
         raw_inputs: dict,
@@ -2946,9 +2912,6 @@ class ResponseGenerator:
                         batch_gen.close()
                         batch_gen = None
                         self._unload_deferred_drafter()
-
-                if new_items and batch_gen is None and not active:
-                    self._release_idle_paged_registry_before_media(new_items)
 
                 for request in new_items:
                     if self._request_cancelled_before_admission(request):
