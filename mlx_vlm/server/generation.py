@@ -1,5 +1,6 @@
 import gc
 import logging
+import math
 import os
 import time
 from collections import deque
@@ -53,7 +54,13 @@ from ..sample_utils import (
 from ..speculative.utils import speculative_stats_since, speculative_stats_snapshot
 from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
-from ..utils import ThinkingBudgetCriteria, load, prepare_inputs, resolve_eos_token_ids
+from ..utils import (
+    ThinkingBudgetCriteria,
+    load,
+    load_image,
+    prepare_inputs,
+    resolve_eos_token_ids,
+)
 from .draft_lifecycle import LazyDrafter
 from .language_lifecycle import (
     ComponentResidencyManager,
@@ -109,6 +116,62 @@ def get_max_num_seqs():
     except ValueError:
         return None
     return n if n > 0 else None
+
+
+def _get_nonnegative_env_int(name: str) -> int:
+    raw = os.environ.get(name, "0")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; disabling that image limit.", name, raw)
+        return 0
+
+
+def bound_vision_images(images):
+    """Load and shrink images to the configured per-image vision budget.
+
+    ``MLX_VLM_MAX_IMAGE_EDGE`` and ``MLX_VLM_MAX_IMAGE_PIXELS`` are separate
+    limits: a portrait can fit under the edge cap while still creating too
+    many vision patches.  The aspect ratio is preserved and images are never
+    enlarged.
+    """
+
+    if not images:
+        return images
+    max_edge = _get_nonnegative_env_int("MLX_VLM_MAX_IMAGE_EDGE")
+    max_pixels = _get_nonnegative_env_int("MLX_VLM_MAX_IMAGE_PIXELS")
+    if max_edge <= 0 and max_pixels <= 0:
+        return images
+
+    from PIL import Image
+
+    bounded = []
+    for source in images:
+        image = load_image(source)
+        width, height = image.size
+        scale = 1.0
+        if max_edge > 0:
+            scale = min(scale, max_edge / max(width, height))
+        if max_pixels > 0:
+            scale = min(scale, math.sqrt(max_pixels / (width * height)))
+        if scale < 1.0:
+            new_size = (
+                max(1, int(width * scale)),
+                max(1, int(height * scale)),
+            )
+            logger.info(
+                "Vision image bounded: original=%dx%d resized=%dx%d "
+                "max_edge=%d max_pixels=%d",
+                width,
+                height,
+                new_size[0],
+                new_size[1],
+                max_edge,
+                max_pixels,
+            )
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
+        bounded.append(image)
+    return bounded
 
 
 def get_lm_head_mixed_prefill_max_tokens() -> int:
@@ -1624,6 +1687,7 @@ class ResponseGenerator:
             else True
         )
         image_token_index = getattr(self.model.config, "image_token_index", None)
+        images = bound_vision_images(images)
         return prepare_inputs(
             self.processor,
             images=images,
@@ -2006,6 +2070,11 @@ class ResponseGenerator:
             embedding_kwargs = dict(data_kwargs)
             if getattr(self, "chunk_local_input_embeddings", False):
                 embedding_kwargs["chunked"] = True
+            vision_batch_size = _get_nonnegative_env_int(
+                "MLX_VLM_VISION_IMAGE_BATCH_SIZE"
+            )
+            if vision_batch_size > 0:
+                embedding_kwargs["vision_image_batch_size"] = vision_batch_size
             embed = self.model.get_input_embeddings(
                 input_ids,
                 pixel_values,

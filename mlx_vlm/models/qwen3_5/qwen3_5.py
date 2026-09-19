@@ -20,6 +20,40 @@ from .vision import VisionModel
 logger = logging.getLogger("mlx_vlm.generate")
 
 
+def encode_vision_microbatches(
+    vision_tower, pixel_values, grid_thw, image_batch_size: int
+):
+    """Encode complete images in bounded groups without changing their order."""
+
+    if image_batch_size <= 0 or grid_thw is None:
+        return vision_tower(pixel_values, grid_thw)[0]
+    rows = grid_thw.tolist()
+    if len(rows) <= image_batch_size:
+        return vision_tower(pixel_values, grid_thw)[0]
+
+    patch_counts = [int(row[0]) * int(row[1]) * int(row[2]) for row in rows]
+    if sum(patch_counts) != pixel_values.shape[0]:
+        raise ValueError(
+            "Vision grid and pixel patches do not match: "
+            f"grid={sum(patch_counts)}, pixels={pixel_values.shape[0]}"
+        )
+
+    outputs = []
+    patch_offset = 0
+    for grid_offset in range(0, len(rows), image_batch_size):
+        group_counts = patch_counts[grid_offset : grid_offset + image_batch_size]
+        patch_end = patch_offset + sum(group_counts)
+        group_output, _ = vision_tower(
+            pixel_values[patch_offset:patch_end],
+            grid_thw[grid_offset : grid_offset + len(group_counts)],
+        )
+        mx.eval(group_output)
+        outputs.append(group_output)
+        patch_offset = patch_end
+        mx.clear_cache()
+    return mx.concatenate(outputs, axis=0)
+
+
 class DiskBackedInputEmbeddingProvider:
     """Serve exact BF16 prompt embeddings from a request-local raw file."""
 
@@ -200,6 +234,7 @@ class Model(Qwen3VLModel):
         video_grid_thw = kwargs.get("video_grid_thw", None)
         mask = kwargs.get("mask", None)
         chunked = bool(kwargs.pop("chunked", False))
+        vision_image_batch_size = int(kwargs.pop("vision_image_batch_size", 0) or 0)
         if chunked and input_ids.shape[0] != 1:
             raise ValueError(
                 "chunk-local Qwen3.5 input embeddings require batch size 1"
@@ -242,7 +277,12 @@ class Model(Qwen3VLModel):
             hidden_states = cached
         else:
             # Get the ouptut hidden states from the vision model
-            hidden_states, _ = self.vision_tower(pixel_values, grid_thw)
+            hidden_states = encode_vision_microbatches(
+                self.vision_tower,
+                pixel_values,
+                grid_thw,
+                vision_image_batch_size if image_grid_thw is not None else 0,
+            )
             if vision_cache is not None and kwargs.get("_image_key") is not None:
                 mx.eval(hidden_states)
                 vision_cache.put(kwargs["_image_key"], hidden_states)

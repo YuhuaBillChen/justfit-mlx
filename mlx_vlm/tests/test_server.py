@@ -63,6 +63,30 @@ def test_response_generator_prefill_step_override_wins_over_environment(monkeypa
     assert overridden_generator.prefill_step_size == 3072
 
 
+def test_bound_vision_images_enforces_edge_and_pixel_limits(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_MAX_IMAGE_EDGE", "2048")
+    monkeypatch.setenv("MLX_VLM_MAX_IMAGE_PIXELS", "524288")
+
+    portrait = Image.new("RGB", (1049, 1176))
+    wide = Image.new("RGB", (4096, 512))
+    small = Image.new("RGB", (1049, 384))
+    bounded = server_generation.bound_vision_images([portrait, wide, small])
+
+    assert max(bounded[0].size) <= 2048
+    assert bounded[0].width * bounded[0].height <= 524288
+    assert max(bounded[1].size) <= 2048
+    assert bounded[1].width * bounded[1].height <= 524288
+    assert bounded[2].size == small.size
+
+
+def test_bound_vision_images_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_MAX_IMAGE_EDGE", raising=False)
+    monkeypatch.delenv("MLX_VLM_MAX_IMAGE_PIXELS", raising=False)
+    image = Image.new("RGB", (1049, 1176))
+
+    assert server_generation.bound_vision_images([image])[0] is image
+
+
 def test_response_generator_clears_worker_streams(monkeypatch):
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     error = RuntimeError("worker failed")
