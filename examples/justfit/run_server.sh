@@ -54,7 +54,10 @@ export MLX_VLM_PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-4}"
 export MLX_VLM_MIXED_PREFILL_STEP_SIZE="${MIXED_PREFILL_STEP_SIZE:-64}"
 export MLX_VLM_PAGED_PREFILL_EAGER_RELEASE=1
 export MLX_VLM_PAGED_PREFILL_IMPL=direct_inverse
-export MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS="${LM_HEAD_MIXED_PREFILL_MAX_TOKENS:-8192}"
+# Zero disables the old per-request suffix gate. Paged KV reservations and the
+# process guard remain the capacity controls. Set a positive value only when a
+# deployment intentionally wants a separately qualified phase-policy cap.
+export MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS="${LM_HEAD_MIXED_PREFILL_MAX_TOKENS:-0}"
 export MLX_VLM_QUANTIZE_LAST_KV_LAYER=1
 export MLX_VLM_SPECULATIVE_SINGLETON_ONLY=1
 export MLX_VLM_MTP_REPROMOTE=1

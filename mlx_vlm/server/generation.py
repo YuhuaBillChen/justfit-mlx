@@ -175,7 +175,13 @@ def bound_vision_images(images):
 
 
 def get_lm_head_mixed_prefill_max_tokens() -> int:
-    """Largest prompt allowed to join a phase-swapped active cohort."""
+    """Optional legacy cap for joining a phase-swapped active cohort.
+
+    A value of zero disables this extra phase-policy cap. Paged KV admission,
+    lane capacity, and the process footprint guard remain authoritative. The
+    cap is retained only for deployments that have independently qualified a
+    maximum mixed-prefill suffix.
+    """
 
     raw = os.environ.get("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "0")
     try:
@@ -2408,11 +2414,12 @@ class ResponseGenerator:
                 logger.info("Restored active decode residency after media embedding.")
 
     def _partition_lm_head_phase_admission(self, pending, active):
-        """Keep unqualified mixed prefills at a safe cohort boundary.
+        """Apply an explicitly configured legacy mixed-prefill suffix cap.
 
-        Paged prefill is B1. Requests collected together therefore become
-        mixed-prefill work after the first row reaches decode. Admit one cold
-        request plus only peers within the explicitly qualified mixed limit.
+        Component residency alone is not a reason to serialize long prompts:
+        the LM head remains resident while a decode cohort is active, and the
+        paged scheduler separately enforces real KV reservations. Deployments
+        may still opt into a measured suffix cap by setting a positive limit.
         """
 
         residency = getattr(self, "component_residency", None)
@@ -2424,6 +2431,8 @@ class ResponseGenerator:
             return list(pending), []
 
         limit = get_lm_head_mixed_prefill_max_tokens()
+        if limit <= 0:
+            return list(pending), []
         admitted = []
         deferred = []
         cold_slot_available = not active

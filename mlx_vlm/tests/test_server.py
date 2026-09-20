@@ -170,6 +170,31 @@ def test_lm_head_phase_admission_defers_unqualified_mixed_prefill(monkeypatch):
     assert deferred == [second_long]
 
 
+def test_lm_head_phase_admission_has_no_implicit_8k_gate(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", raising=False)
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(
+        contains=lambda name: name == "lm_head"
+    )
+    requests = [SimpleNamespace(prompt_tokens=131072)] + [
+        SimpleNamespace(prompt_tokens=8192) for _ in range(3)
+    ]
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        requests, active={}
+    )
+
+    assert admitted == requests
+    assert deferred == []
+
+    admitted, deferred = gen._partition_lm_head_phase_admission(
+        [requests[0]], active={1: {}}
+    )
+
+    assert admitted == [requests[0]]
+    assert deferred == []
+
+
 def test_lm_head_phase_admission_is_unchanged_without_swapped_head():
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     gen.component_residency = SimpleNamespace(contains=lambda _name: False)
@@ -1389,6 +1414,40 @@ def test_paged_kv_budget_reserves_output_guarantee_not_requested_ceiling(
     assert admitted == [first, second]
     assert deferred == []
     assert gen._request_context_budget(first) == 384
+
+
+def test_paged_b4_admission_uses_pool_budget_without_implicit_suffix_gate(
+    monkeypatch,
+):
+    monkeypatch.setenv("MLX_VLM_PAGED_TQ", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER", "1")
+    monkeypatch.setenv("MLX_VLM_PAGED_KV_CAPACITY_TOKENS", "204800")
+    monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "8192")
+    monkeypatch.delenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", raising=False)
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.component_residency = SimpleNamespace(
+        contains=lambda name: name == "lm_head"
+    )
+    requests = [
+        server_generation.QueuedGenerationRequest(
+            rqueue=Queue(),
+            raw_inputs={},
+            prompt_tokens=prompt_tokens,
+            args=server_generation.GenerationArguments(max_tokens=12288),
+        )
+        for prompt_tokens in (131072, 8192, 8192, 8192)
+    ]
+
+    phase_admitted, phase_deferred = gen._partition_lm_head_phase_admission(
+        requests, active={}
+    )
+    admitted, deferred = gen._partition_kv_budget_admission(
+        phase_admitted, active={}, admission_capacity=4
+    )
+
+    assert phase_deferred == []
+    assert admitted == requests
+    assert deferred == []
 
 
 def test_paged_kv_budget_tracks_elastic_output_already_consumed(monkeypatch):
