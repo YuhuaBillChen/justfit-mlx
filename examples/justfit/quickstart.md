@@ -8,6 +8,11 @@ The setup below gives one request a **65,536-token input budget** and an
 **8,192-token output ceiling** (73,728 total positions). Keep this page open and
 copy each command in order.
 
+> **Use the release tag shown here.** This guide intentionally stays on the
+> immutable `justfit-repro-v4` release while using a conservative 64K+8K daily
+> profile. The same release contains larger research configurations, but a
+> measured capacity boundary is not automatically a beginner default.
+
 > **Time and space:** allow roughly 30–60 minutes for the first installation,
 > depending on download speed, and keep at least 30 GB of disk space free.
 > The server takes roughly 20 seconds to load after the files are downloaded.
@@ -31,7 +36,7 @@ df -h "$HOME"
 
 The first command should print `arm64`.
 
-## 1. Install Git and Python
+## 1. Install native Git and Python
 
 First install Apple's command-line tools:
 
@@ -39,20 +44,70 @@ First install Apple's command-line tools:
 xcode-select --install
 ```
 
-If macOS says they are already installed, continue. Check for Git and a recent
-Python:
+If macOS says they are already installed, continue. Confirm that this is an
+Apple-silicon shell:
 
 ```bash
+test "$(uname -m)" = "arm64" || {
+  echo "Open a native arm64 Terminal, not an Intel/Rosetta shell."
+  exit 1
+}
 git --version
-python3 --version
 ```
 
-Python 3.11 or 3.12 is recommended. If `python3` is missing or older, install
-[Homebrew](https://brew.sh/) and then run:
+MLX requires an arm64 Python. An older Intel Homebrew installation under
+`/usr/local` can silently provide an x86_64 `python3`, for which no MLX wheel
+exists. Install the native Apple-silicon edition of
+[Homebrew](https://brew.sh/) if `/opt/homebrew/bin/brew` is missing:
 
 ```bash
-brew install python@3.12 git
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 ```
+
+Then install and verify the exact native Python used by this guide:
+
+```bash
+/opt/homebrew/bin/brew install python@3.12 git
+/opt/homebrew/bin/python3.12 --version
+file /opt/homebrew/bin/python3.12
+```
+
+The last line must contain `arm64`. Do not continue if it says `x86_64`.
+
+### Raise the Metal wired-memory ceiling
+
+Having 24 GB of unified memory does **not** mean macOS will let Metal wire
+21.5 GiB by default. The published M4 Pro configuration used
+`iogpu.wired_limit_mb=22016`; without it, the model can hit the lower system
+ceiling even though Activity Monitor still shows free unified memory.
+
+Check the current ceiling and raise it only when it is lower than the tested
+value:
+
+```bash
+current_wired_mb="$(/usr/sbin/sysctl -n iogpu.wired_limit_mb)"
+echo "Current Metal wired-memory ceiling: ${current_wired_mb} MiB"
+
+if [ "$current_wired_mb" -lt 22016 ]; then
+  sudo /usr/sbin/sysctl -w iogpu.wired_limit_mb=22016
+fi
+
+test "$(/usr/sbin/sysctl -n iogpu.wired_limit_mb)" -ge 22016 || {
+  echo "Metal wired-memory ceiling is still below 22016 MiB."
+  exit 1
+}
+```
+
+This raises a ceiling; it does not reserve 21.5 GiB immediately. It also
+reduces the memory left for macOS and other GPU applications, so run only one
+27B server and close other large GPU workloads. The setting resets after a
+reboot; repeat this check before restarting JustFit.
+
+The paper's boundary experiments additionally used a separate 21,000 MiB
+process-footprint guard. This beginner launcher does not silently install that
+machine-specific guard. The tested 64K-input + 8K-output serving smoke peaked
+at 16,520 MiB, well below that boundary; the fully cold 240K+16K experiment
+remains a separate, explicitly guarded protocol.
 
 ## 2. Download the JustFit source
 
@@ -63,7 +118,7 @@ the same source:
 cd "$HOME"
 git clone https://github.com/YuhuaBillChen/mlx-vlm.git
 cd mlx-vlm
-git checkout justfit-repro-v3
+git checkout justfit-repro-v4
 ```
 
 If you cloned the repository previously, update it instead:
@@ -71,7 +126,7 @@ If you cloned the repository previously, update it instead:
 ```bash
 cd "$HOME/mlx-vlm"
 git fetch fork 2>/dev/null || git fetch origin
-git checkout justfit-repro-v3
+git checkout justfit-repro-v4
 ```
 
 ## 3. Create an isolated Python environment
@@ -80,7 +135,7 @@ This keeps JustFit's Python packages separate from the rest of your Mac:
 
 ```bash
 cd "$HOME/mlx-vlm"
-python3 -m venv .venv
+/opt/homebrew/bin/python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e .
@@ -131,14 +186,15 @@ b27ad7963b3752b5cab9d225f9c0b033d0d59066e7ff357dac17d690a6ff7994
 e0d0d5dc68f59559940e1b2dafc40a34700b9ae7ff963de268225a54550af563
 ```
 
-Now extract the model's output head. This creates a separate local file used by
-JustFit's phase-aware residency manager:
+Now extract the model's output head and input embedding. These create local
+backing files used by JustFit's phase-aware residency manager. The embedding is
+already in the model download, so this step does not download another copy:
 
 ```bash
 python examples/justfit/prepare_components.py \
   --model ./justfit-qwen38 \
   --output ./justfit-extracted \
-  --head-only
+  --language-only
 ```
 
 Confirm that all required files exist:
@@ -148,9 +204,10 @@ test -f justfit-qwen38/config.json && echo "model: OK"
 test -f justfit-components/mtp/model.safetensors && echo "MTP: OK"
 test -f justfit-components/vision-bf16.safetensors && echo "vision: OK"
 test -f justfit-extracted/language-head.safetensors && echo "head: OK"
+test -f justfit-extracted/input-embedding.safetensors && echo "embedding: OK"
 ```
 
-You should see four lines ending in `OK`.
+You should see five lines ending in `OK`.
 
 ## 5. Create a local API key
 
@@ -188,6 +245,7 @@ MODEL_PATH=justfit-qwen38 \
 MTP_PATH="$PWD/justfit-components/mtp" \
 VISION_PATH="$PWD/justfit-components/vision-bf16.safetensors" \
 LM_HEAD_PATH="$PWD/justfit-extracted/language-head.safetensors" \
+INPUT_EMBEDDING_PATH="$PWD/justfit-extracted/input-embedding.safetensors" \
 HOST=127.0.0.1 PORT=8080 API_KEY="$JUSTFIT_API_KEY" \
 LANES=1 KV_CAPACITY=73728 MAX_TOKENS=8192 OUTPUT_GUARANTEE=8192 \
 TOKEN_QUEUE_TIMEOUT=1800 \
@@ -205,6 +263,11 @@ Leave this Terminal running. Press `Control-C` when you want to stop JustFit.
 
 > Run only one copy of the 27B server. Two MLX model servers can exceed unified
 > memory and make the Mac unresponsive.
+
+This 64K+8K profile is deliberately below the paper's boundary configuration.
+Do not increase `KV_CAPACITY` just because a newer experimental capacity number
+appears in a development log: the pool, output guarantee, process guard, APC
+mode, and concurrency must be qualified as one configuration.
 
 ## 7. Send the first message
 
@@ -247,6 +310,7 @@ MODEL_PATH=justfit-qwen38 \
 MTP_PATH="$PWD/justfit-components/mtp" \
 VISION_PATH="$PWD/justfit-components/vision-bf16.safetensors" \
 LM_HEAD_PATH="$PWD/justfit-extracted/language-head.safetensors" \
+INPUT_EMBEDDING_PATH="$PWD/justfit-extracted/input-embedding.safetensors" \
 HOST=0.0.0.0 PORT=8080 API_KEY="$JUSTFIT_API_KEY" \
 LANES=1 KV_CAPACITY=73728 MAX_TOKENS=8192 OUTPUT_GUARANTEE=8192 \
 TOKEN_QUEUE_TIMEOUT=1800 \
@@ -299,7 +363,8 @@ Install Hermes using its official installer:
 
 ```bash
 curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-source "$HOME/.zshrc"
+export PATH="$HOME/.local/bin:$PATH"
+hermes --version
 ```
 
 Configure the local endpoint:
@@ -350,7 +415,7 @@ client timeout to at least 1,800 seconds.
 
   ```bash
   cd "$HOME/mlx-vlm"
-  git checkout justfit-repro-v3
+  git checkout justfit-repro-v4
   ```
 
 Your model downloads remain in `~/mlx-vlm/justfit-qwen38` and
@@ -390,7 +455,7 @@ Confirm all three points:
 
 ### The server says a required path is missing
 
-Run the four `test -f` commands in [Step 4](#4-download-the-model-and-justfit-components).
+Run the five `test -f` commands in [Step 4](#4-download-the-model-and-justfit-components).
 Repeat only the download or extraction step whose `OK` line is missing.
 
 ### The first answer is slow
@@ -398,6 +463,15 @@ Repeat only the download or extraction step whose `OK` line is missing.
 The first request initializes Metal kernels and loads phase-specific
 components. A long prompt also requires a long prefill. Watch the server
 Terminal: progress lines mean it is working.
+
+### Disk use grows after repeated long conversations
+
+Persistent APC can keep exact prefix checkpoints on disk so a later request can
+reuse a matching prefix. Long prefixes produce large files. This is expected,
+but cache retention should be bounded and monitored; a warm APC restore is not
+the same measurement as a cold prefill. The immutable v4 runtime uses the
+qualified bounded single-pass writer, while capacity evidence still reports
+cold and warm-prefix protocols separately.
 
 ### The Mac becomes very slow or unresponsive
 
@@ -413,7 +487,7 @@ terminal client reports this condition explicitly.
 
 ## What this setup does not claim
 
-- It is not the paper's 192K-input + 16K-output boundary experiment.
+- It is not the paper's fully cold 240K-input + 16K-output boundary experiment.
 - It does not prove 64K-prompt coding quality; it provides the memory envelope
   required by Hermes and a tested agent connectivity path.
 - It is a single-lane profile. Multi-request B2/B4 experiments use a shared

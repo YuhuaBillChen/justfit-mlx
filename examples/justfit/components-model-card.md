@@ -19,7 +19,9 @@ Published checkpoint-side components for the
 and [paper](https://arxiv.org/abs/2609.17475).
 
 This repository does not duplicate the target model. Download the pinned
-`mlx-community/Qwen3.8-27B-mxfp4` target separately.
+`mlx-community/Qwen3.8-27B-mxfp4` target separately. The JustFit preparation
+script extracts the input-embedding backing from that target locally, avoiding
+another 644 MiB network download.
 
 ## Files
 

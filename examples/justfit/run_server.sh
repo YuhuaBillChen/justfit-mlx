@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-required=(MODEL_PATH MTP_PATH LM_HEAD_PATH VISION_PATH)
+required=(MODEL_PATH MTP_PATH LM_HEAD_PATH INPUT_EMBEDDING_PATH VISION_PATH)
 for name in "${required[@]}"; do
   value="${!name:-}"
   if [[ -z "$value" ]]; then
@@ -10,7 +10,12 @@ for name in "${required[@]}"; do
   fi
 done
 
-for path in "$MODEL_PATH/config.json" "$MTP_PATH/config.json" "$LM_HEAD_PATH" "$VISION_PATH"; do
+for path in \
+  "$MODEL_PATH/config.json" \
+  "$MTP_PATH/config.json" \
+  "$LM_HEAD_PATH" \
+  "$INPUT_EMBEDDING_PATH" \
+  "$VISION_PATH"; do
   if [[ ! -e "$path" ]]; then
     echo "required path does not exist: $path" >&2
     exit 2
@@ -59,6 +64,7 @@ export MLX_VLM_TQ_LAZY_VERIFY_APPEND=1
 export MLX_VLM_TQ_FUSED_DEQUANT=1
 export MLX_VLM_CHUNK_LOCAL_INPUT_EMBEDS=1
 export MLX_VLM_LANGUAGE_HEAD_PHASE_SWAP_PATH="$LM_HEAD_PATH"
+export MLX_VLM_VISION_EMBEDDING_SWAP_PATH="$INPUT_EMBEDDING_PATH"
 export MLX_VLM_CAPACITY_IGNORE_EOS="$CAPACITY_MODE"
 export MLX_VLM_TOKEN_QUEUE_TIMEOUT="${TOKEN_QUEUE_TIMEOUT:-0}"
 

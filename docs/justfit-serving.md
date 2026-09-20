@@ -13,7 +13,7 @@ server for three common clients:
 
 The recommended Hermes profile reserves **65,536 input positions plus 8,192
 generated positions**, for a total KV capacity of **73,728 positions**. This is
-a single-lane service profile, not the 192K+16K capacity experiment and not a
+a single-lane service profile, not the fully cold 240K+16K capacity experiment and not a
 four-lane aggregate budget.
 
 ## 1. Install and download
@@ -43,7 +43,7 @@ hf download billchen42/JustFit-Qwen3.8-27B-components \
 python examples/justfit/prepare_components.py \
   --model ./justfit-qwen38 \
   --output ./justfit-extracted \
-  --head-only
+  --language-only
 ```
 
 ## 2. Start the 64K-input + 8K-output profile
@@ -58,6 +58,7 @@ MODEL_PATH=justfit-qwen38 \
 MTP_PATH="$PWD/justfit-components/mtp" \
 VISION_PATH="$PWD/justfit-components/vision-bf16.safetensors" \
 LM_HEAD_PATH="$PWD/justfit-extracted/language-head.safetensors" \
+INPUT_EMBEDDING_PATH="$PWD/justfit-extracted/input-embedding.safetensors" \
 HOST=127.0.0.1 PORT=8080 API_KEY="$JUSTFIT_API_KEY" \
 LANES=1 KV_CAPACITY=73728 MAX_TOKENS=8192 OUTPUT_GUARANTEE=8192 \
 TOKEN_QUEUE_TIMEOUT=1800 \

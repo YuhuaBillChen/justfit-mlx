@@ -23,15 +23,23 @@ def save_component(module, path: Path) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract JustFit LM-head and vision-tower backing files."
+        description=(
+            "Extract JustFit language-head, input-embedding, and optional "
+            "vision-tower backing files."
+        )
     )
     parser.add_argument("--model", required=True, help="Local path or Hugging Face id")
     parser.add_argument("--revision", help="Optional immutable Hugging Face revision")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
+        "--language-only",
         "--head-only",
+        dest="language_only",
         action="store_true",
-        help="Extract only the language head when using the published vision backing.",
+        help=(
+            "Extract the language head and input embedding, but not the vision "
+            "tower. --head-only is retained as a compatibility alias."
+        ),
     )
     args = parser.parse_args()
 
@@ -46,7 +54,15 @@ def main() -> None:
     head_bytes = save_component(head, head_path)
     print(f"wrote {head_path} ({head_bytes} parameter bytes)")
 
-    if not args.head_only:
+    text_model = getattr(language_model, "model", language_model)
+    input_embedding = getattr(text_model, "embed_tokens", None)
+    if input_embedding is None:
+        raise ValueError("checkpoint does not expose a text input embedding table")
+    embedding_path = args.output / "input-embedding.safetensors"
+    embedding_bytes = save_component(input_embedding, embedding_path)
+    print(f"wrote {embedding_path} ({embedding_bytes} parameter bytes)")
+
+    if not args.language_only:
         vision = getattr(model, "vision_tower", None)
         if vision is None:
             raise ValueError("checkpoint does not expose model.vision_tower")

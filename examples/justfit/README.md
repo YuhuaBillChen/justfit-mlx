@@ -13,7 +13,14 @@ This kit accompanies the
 > is included; no knowledge of the paper or benchmark harness is required.
 
 This README is the **research reproduction guide**. Use it when you want to
-reproduce the paper's smoke checks, 192K+16K boundary run, or validation suite.
+reproduce the paper's smoke checks, full 240K+16K native-window run, or
+validation suite.
+
+> **Release status:** the commands below are pinned to the immutable
+> `justfit-repro-v4` release. It includes the bounded single-pass APC writer,
+> full-native-window B1 evidence, the fully cold and ordered-warm B2 boundaries,
+> and the current-version B4 confirmation. Each result keeps its protocol and
+> runtime provenance; cold and warm-prefix measurements are not pooled.
 
 This directory makes the public JustFit branch runnable without copying the
 author's machine-specific launcher. It supports two useful levels of evidence:
@@ -38,15 +45,20 @@ On an Apple-silicon Mac with a working MLX environment:
 ```bash
 git clone https://github.com/YuhuaBillChen/mlx-vlm.git
 cd mlx-vlm
-git checkout justfit-repro-v3
+git checkout justfit-repro-v4
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
 ```
 
-This tag contains the tested reproduction kit. The three repeated limit runs use
-`143967472416aece96eeae392eaf931426acad3c` as their measured runtime
-provenance; the `mlx_vlm/` tree is identical between that commit and this tag.
+This tag contains the tested reproduction kit. The earlier corrected
+192K+16K repeat cohort uses `0ad2f1665b9021aeaeea55c3ccdd861b45643610`;
+the full-window, EVO10, and current B4 records carry their later runtime
+provenance in the checked-in result files. The tag itself adds documentation
+and evidence without changing the measured runtime modules.
+The earlier 4.985-tok/s cohort remains preserved in the immutable
+[`justfit-repro-v3`](https://github.com/YuhuaBillChen/mlx-vlm/tree/justfit-repro-v3/examples/justfit/results)
+tag and is not pooled with the updated measurements.
 
 The evolving branch is useful for daily use, but an experiment should always
 record an immutable commit:
@@ -97,15 +109,25 @@ shasum -a 256 \
 Expected digests are recorded in
 [`components-manifest.json`](components-manifest.json).
 
-Extract only the untied output head from the pinned target checkpoint:
+Extract the untied output head and input embedding from the pinned target
+checkpoint. The input embedding is already part of the target download; it is
+not duplicated in the component repository.
 
 ```bash
 python examples/justfit/prepare_components.py \
   --model "$MODEL_PATH" \
   --output ./justfit-extracted \
-  --head-only
+  --language-only
 export LM_HEAD_PATH="$PWD/justfit-extracted/language-head.safetensors"
+export INPUT_EMBEDDING_PATH="$PWD/justfit-extracted/input-embedding.safetensors"
 ```
+
+The pinned checkpoint produces a 675,430,400-byte input-embedding tensor
+payload. The production backing's provenance is recorded under
+`derived_components` in
+[`components-manifest.json`](components-manifest.json). Do not require a
+locally generated container file to have the same SHA-256: safetensors header
+metadata can vary by MLX version while the tensors remain identical.
 
 If a different target checkpoint does contain top-level `mtp.*` tensors, create
 the standalone directory with mlx-vlm's family splitter instead:
@@ -119,7 +141,27 @@ export MTP_PATH="$PWD/justfit-components/mtp"
 ```
 
 The component files are backing artifacts. PhaseSwap reconstructs the matching
-runtime module from them; it does not imply a discrete-VRAM transfer.
+runtime module from them; it does not imply a discrete-VRAM transfer. The
+separate input-embedding backing lets an admitted image request release the
+text embedding table before loading the vision tower, then restore it before
+text prefill resumes.
+
+### Persistent APC and disk usage
+
+APC is a prefix-reuse optimization, not part of the forced-length capacity
+definition. For a cold measurement, use a fresh cache namespace and require
+zero main-request prefix hits; record any warm restore as a separate cohort.
+Some historical arms explicitly disabled APC, while later EVO8–EVO10 arms kept
+APC enabled with fresh namespaces, so the two protocols must not be relabeled
+as identical. Persistent exact checkpoints can be large because they contain
+retained model state for the cached prefix. Put the cache on a volume with
+sufficient free space, and do not interpret a fast restore as prefill
+throughput.
+
+The v4 runtime replaces the former temporary-shard assembly of large exact
+checkpoints with a bounded single-pass safetensors writer. Warm-prefix results
+report restore and incremental-prefill behavior separately from fully cold
+prefill; fast restore is not relabeled as measured cold PP.
 
 ## 3. Start the server
 
@@ -151,26 +193,26 @@ Confirm that the server reports `Paged TurboQuant enabled`, the client sees
 `[DONE]`, reported prompt/completion lengths match, and a second request can run
 after the first releases its pages.
 
-## 5. Reproduce the B1 limit protocol
+## 5. Reproduce the fully cold B1 native-window protocol
 
-This profile is a boundary test, not a production default. The reported runs
-took roughly 103 minutes each and had only 23–40 MiB of sampled margin below a
-21,000-MiB guard. Close competing GPU workloads and monitor the whole process.
+This profile is a boundary test, not a production default. The fully cold run
+took about 114 minutes and peaked at 20,357 MiB under a 21,000-MiB guard. Close
+competing GPU workloads and monitor the whole process.
 
 ```bash
 # Terminal 1
-CAPACITY_MODE=1 LANES=1 KV_CAPACITY=229376 MAX_TOKENS=16384 \
+CAPACITY_MODE=1 LANES=1 KV_CAPACITY=262144 MAX_TOKENS=16384 \
   OUTPUT_GUARANTEE=16384 examples/justfit/run_server.sh
 
 # Terminal 2
 python examples/justfit/capacity_client.py \
   --model "$MODEL_PATH" \
   --tokenizer "$MODEL_PATH" \
-  --prompt-tokens 196608 \
+  --prompt-tokens 245760 \
   --output-tokens 16384 \
   --tokenizer-offset 36 \
   --timeout 14400 \
-  --output b1-192k-16k.json
+  --output b1-240k-16k.json
 ```
 
 The `36`-token offset is specific to the recorded checkpoint/template pair:
@@ -179,9 +221,11 @@ did not. The client validates the final server-reported prompt length. If your
 checkpoint reports a different value, do not edit the result—record the
 template revision and calibrate the offset for a new cohort.
 
-The checked-in [`results/limit-runs.json`](results/limit-runs.json) is the
-path-sanitized record used in the arXiv paper. The authoritative definitions
-are:
+The checked-in [`results/limit-runs.json`](results/limit-runs.json) preserves
+the corrected 192K+16K cold cohort. Full-window and B2 evidence is in
+[`results/evo10-capacity.json`](results/evo10-capacity.json); the current B4
+confirmation is published separately after its run. The authoritative
+definitions are:
 
 - PP = uncached prefill tokens / summed prefill work seconds;
 - B1 TG = 16,383 tokens after the first / first-to-last-token interval;
@@ -190,11 +234,13 @@ are:
 
 ## Concurrent profiles
 
-Set `LANES=2` or `LANES=4`, keep the pool total at 229,376 positions, and submit
-several clients concurrently. Admission reserves page-rounded prompt state plus
-the configured output guarantee and safety allowance. B2/B4 totals are shared
-pool occupancy; aggregate TG must be calculated only over the common active
-interval if it is to be compared with the paper.
+Set `LANES=2` or `LANES=4`, size the pool for the exact qualified workload, and
+submit several clients concurrently. Admission reserves page-rounded prompt
+state plus the configured output guarantee and safety allowance. B2/B4 totals
+are shared pool occupancy. Report aggregate TG only over a real common-active
+interval. If admission phases the requests so that no such interval exists,
+report wall-output throughput and the admission schedule instead of
+manufacturing a common-active rate.
 
 Do not treat two sequential requests as B2, or add per-request decode rates to
 manufacture an aggregate result.

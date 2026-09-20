@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "system": "JustFit EVO10",
+  "hardware": "Apple M4 Pro MacBook Pro, 24 GiB unified memory",
+  "model_label": "Qwen3.8-27B MXFP4",
+  "guard_mib": 21000,
+  "runtime_provenance": {
+    "measurement_base_commit": "0ad2f1665b9021aeaeea55c3ccdd861b45643610",
+    "measurement_note": "EVO10 measurements used the archived source fingerprint for the then-dirty single-pass APC implementation.",
+    "public_evo10_commit": "3c0da3be",
+    "public_release_lineage_commit": "fca8ca4ea57b64bcb4ddc2e712c4b6fd76c6b04d"
+  },
+  "b1_native_window": {
+    "protocol": "one fully cold run plus two fresh-process warm-prefix extensions",
+    "input_tokens": 245760,
+    "output_tokens": 16384,
+    "retained_positions": 262144,
+    "cold": {
+      "prefill_tps": 60.54550360444093,
+      "decode_tps": 5.936003720604893,
+      "wall_seconds": 6820.029269083025,
+      "peak_footprint_mib": 20357
+    },
+    "warm_extensions": [
+      {
+        "cached_tokens": 161792,
+        "incremental_prefill_tokens": 83968,
+        "decode_tps": 5.987441661264378,
+        "peak_footprint_mib": 20449
+      },
+      {
+        "cached_tokens": 161792,
+        "incremental_prefill_tokens": 83968,
+        "decode_tps": 5.98574455165388,
+        "peak_footprint_mib": 20450
+      }
+    ],
+    "reporting_note": "The two warm arms are completion repeats, not independent fully cold prefills."
+  },
+  "b2_fully_cold": {
+    "lanes": [
+      {"input_tokens": 131072, "output_tokens": 16384},
+      {"input_tokens": 131072, "output_tokens": 16384}
+    ],
+    "aggregate_retained_positions": 294912,
+    "prefill_tps": 81.39917538229663,
+    "common_active_decode_tps": 10.340863051634374,
+    "wall_output_tps": 5.1134827303334465,
+    "peak_footprint_mib": 20858,
+    "paged_high_water_layer_pages": 18400,
+    "paged_capacity_layer_pages": 18432
+  },
+  "b2_ordered_warm_prefix_ceiling": {
+    "lanes": [
+      {"input_tokens": 163840, "output_tokens": 16384},
+      {"input_tokens": 131072, "output_tokens": 16384}
+    ],
+    "aggregate_retained_positions": 327680,
+    "completed_attempts": 3,
+    "common_active_decode_tps": [
+      9.732157972112798,
+      9.73772136465837,
+      9.734556829671329
+    ],
+    "peak_footprint_mib": [20953, 20456, 20432],
+    "reporting_note": "All three attempts share the final retained shape but not identical prefill work. This is an ordered warm-prefix operational boundary."
+  },
+  "first_failed_warm_b2": {
+    "requested_positions": 335872,
+    "peak_footprint_mib": 21097,
+    "status": "guard during restore"
+  },
+  "measurement_definitions": {
+    "decode_tps": "aggregate first-to-last token rate over the common-active interval for B2; singleton first-to-last token rate for B1",
+    "peak": "sampled whole-process footprint",
+    "page_high_water": "simultaneously occupied fixed-pool page slots; not cumulative processed positions"
+  }
+}

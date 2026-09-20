@@ -16,7 +16,7 @@ contexts under a fixed unified-memory budget. It coordinates three mechanisms:
   bounding the lifetime of floating-point attention operands.
 - **PhaseSwap** assigns explicit leases to components whose useful lifetimes do
   not cover the whole request: the output head, vision tower, input embedding
-  adapter when configured, and deferred MTP drafter.
+  table when configured, and deferred MTP drafter.
 - **StateTrans** changes between singleton MTP and multi-request AR at safe
   cohort boundaries while retaining surviving target KV and recurrent state.
   Completed or cancelled requests return page IDs to the resident pool only
@@ -24,10 +24,9 @@ contexts under a fixed unified-memory budget. It coordinates three mechanisms:
 
 The production entry point is the
 [`production/qwen-paged-continuous-batching`](https://github.com/YuhuaBillChen/mlx-vlm/tree/production/qwen-paged-continuous-batching)
-branch. Commit
-[`143967472416aece96eeae392eaf931426acad3c`](https://github.com/YuhuaBillChen/mlx-vlm/commit/143967472416aece96eeae392eaf931426acad3c)
-is the pinned unified-residency revision used for the three repeated
-single-request limit runs.
+branch. The immutable `justfit-repro-v4` tag packages the current runtime,
+Quick Start, and result manifests. Every measured cohort records its own source
+commit; results from different cold/warm protocols are not pooled.
 
 ## Measured results
 
@@ -37,15 +36,22 @@ fixed MXFP4 weights; 21,000 MiB sampled process-footprint guard. `K = 1,024`.
 | Workload | Retained positions | PP | TG | Peak footprint |
 | --- | ---: | ---: | ---: | ---: |
 | mlx-vlm baseline, B1 24K input + 6K output | 30,720 | — | did not complete the next fixed step | below guard at this point |
-| JustFit, B1 192K input + 16K output, median of 3 | 212,992 | 68.311 tok/s | 4.9853 tok/s | 20,975 MiB |
-| JustFit, B2 2×(96K input + 16K output) | 229,376 aggregate | 90.44 tok/s | 12.55 aggregate tok/s | 20,310 MiB |
-| JustFit, B4 128K+12K and 3×(8K+12K) | 204,800 aggregate | 83.16 tok/s | 20.78 aggregate tok/s | 20,623 MiB |
+| JustFit, B1 240K input + 16K output, fully cold | 262,144 | 60.546 tok/s | 5.936 tok/s | 20,357 MiB |
+| JustFit, B2 2×(128K input + 16K output), fully cold | 294,912 aggregate | 81.399 tok/s | 10.341 aggregate tok/s | 20,858 MiB |
+| JustFit, B2 160K+16K and 128K+16K, ordered warm-prefix restore | 327,680 aggregate | protocol-dependent incremental PP | 9.735 aggregate tok/s median | 20,432–20,953 MiB |
+| JustFit, B4 128K+12K and 3×(8K+12K), current confirmation | 204,800 aggregate | pending current result | pending current result | pending current result |
 
-All three B1 limit attempts completed 196,608 uncached input positions and
-16,384 generated tokens. Their sampled peaks were 20,977, 20,975 and
-20,960 MiB; all output-token sequences agreed, and all postflight/page-reuse
-checks passed. The minimum sampled guard margin was only 23 MiB, so this is a
-capacity boundary rather than a recommended service profile.
+The complete native-window B1 cohort consists of one fully cold run plus two
+fresh-process warm-prefix extensions. All three completed 245,760 input and
+16,384 output positions, with matching output hashes and successful postflight
+reuse. The cold run measured 5.936 tok/s at 20,357 MiB; the warm extensions
+measured 5.986–5.987 tok/s at 20,449–20,450 MiB. The warm arms are repeat
+completions, not independent fully cold prefills.
+
+The 327,680-position B2 result is an ordered warm-prefix operational boundary.
+The larger 335,872-position attempt was the first measured warm B2 failure and
+hit the 21,000-MiB guard during restore. The largest fully cold B2 completion
+is separately reported at 294,912 aggregate positions.
 
 In a separate capability protocol, paged TQ4 answered 29/30 AIME 2026 problems
 correctly and generated 696,834 tokens at 15.04 token-weighted tok/s. That
@@ -54,13 +60,13 @@ accurate than INT8, and not a 200K long-context comprehension evaluation.
 
 ## What the numbers do and do not mean
 
-- “200K” means retained input **plus generated output** positions. The B1 result
-  is 196,608 input + 16,384 output, not 200K input.
+- Retained positions mean input **plus generated output**. The full-window B1
+  result is 245,760 input + 16,384 output, not 262K input.
 - The B2 and B4 totals are aggregate state across concurrent requests. Their TG
   values are aggregate common-active-interval rates, not per-request rates.
 - The capacity corpus is deterministic repetitive text with EOS suppression.
   It measures complete allocation and execution, not coding-agent task quality.
-- The B1 cold request takes about 6,165 seconds end to end. Prefix reuse is a
+- The full-window B1 cold request takes about 6,820 seconds end to end. Prefix reuse is a
   separate path and should not be conflated with cold ingestion.
 - Returning pages makes resident pool slots reusable; it does not return the
   pool's backing allocation to macOS.
@@ -75,9 +81,12 @@ The [reproduction kit](../examples/justfit/README.md) contains:
 - immutable public target and component revisions with SHA-256 manifests;
 - a server launcher with the effective JustFit controls made explicit;
 - a deterministic streaming capacity client;
-- the public, path-sanitized JSON for the three repeated limit runs.
+- public, path-sanitized JSON for the reported capacity and throughput cohorts.
 
-Start with the 8K+64 smoke profile. Only attempt 192K+16K after verifying the
+The compact EVO10 capacity manifest is
+[`examples/justfit/results/evo10-capacity.json`](../examples/justfit/results/evo10-capacity.json).
+
+Start with the 8K+64 smoke profile. Only attempt 240K+16K after verifying the
 checkpoint, component files, thermal conditions, free disk space and a process
 footprint monitor. The reported throughput and final few MiB of headroom are
 hardware-, checkpoint- and software-revision-specific.
@@ -121,7 +130,7 @@ checkpoint-side vision representation was quantized differently.
 
 ```bibtex
 @misc{chen2026justfit,
-  title         = {JustFit: 200K-Token LLM Serving on a 24 GiB Laptop with Just-in-Time State Management},
+  title         = {JustFit: 320K-Token Serving for a 27B LLM on a 24 GiB Laptop with Just-in-Time State Management},
   author        = {Yuhua Chen},
   year          = {2026},
   eprint        = {2609.17475},

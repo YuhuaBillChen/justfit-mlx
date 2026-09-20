@@ -25,6 +25,17 @@
       }
     ]
   },
+  "derived_components": [
+    {
+      "path": "justfit-extracted/input-embedding.safetensors",
+      "source": "target language_model.model.embed_tokens",
+      "tensor_payload_bytes": 675430400,
+      "tensor_count": 2,
+      "production_backing_file_bytes": 675430586,
+      "production_backing_sha256": "6c4a8a6845c9570af0b3f65948e2028416af516e8ca39342be9d51b433854fa4",
+      "verification": "tensor-identical to the pinned target; generated container headers may vary by MLX version"
+    }
+  ],
   "audit": {
     "target_non_vision_tensors": 1349,
     "target_non_vision_bytes": 14292384768,
@@ -32,6 +43,9 @@
     "language_head_tensors": 2,
     "language_head_raw_bytes": 675430400,
     "language_head_mismatches": 0,
+    "input_embedding_tensors": 2,
+    "input_embedding_raw_bytes": 675430400,
+    "input_embedding_mismatches": 0,
     "vision_backing_tensors": 333,
     "vision_backing_raw_bytes": 921460192,
     "vision_backing_mismatches": 0

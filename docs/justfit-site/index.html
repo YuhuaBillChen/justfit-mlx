@@ -3,17 +3,17 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="JustFit serves more than 200K retained LLM tokens on a 24 GiB Apple-silicon laptop through just-in-time state management.">
-  <meta property="og:title" content="JustFit — 200K-token LLM serving on a 24 GiB laptop">
+  <meta name="description" content="JustFit fills Qwen3.8-27B's native 256K window and serves up to 320K aggregate retained positions on a 24 GiB Apple-silicon laptop.">
+  <meta property="og:title" content="JustFit — 320K aggregate LLM serving on a 24 GiB laptop">
   <meta property="og:description" content="Compressed KV execution, phase-aware component residency, and state-preserving request transitions for MLX-VLM.">
   <meta property="og:url" content="https://yuhuabillchen.github.io/mlx-vlm/">
-  <meta name="citation_title" content="JustFit: 200K-Token LLM Serving on a 24 GiB Laptop with Just-in-Time State Management">
+  <meta name="citation_title" content="JustFit: 320K-Token Serving for a 27B LLM on a 24 GiB Laptop with Just-in-Time State Management">
   <meta name="citation_author" content="Yuhua Chen">
   <meta name="citation_publication_date" content="2026/09/15">
   <meta name="citation_pdf_url" content="https://arxiv.org/pdf/2609.17475">
   <link rel="canonical" href="https://yuhuabillchen.github.io/mlx-vlm/">
   <meta name="theme-color" content="#10221b">
-  <title>JustFit — 200K-token LLM serving on 24 GiB</title>
+  <title>JustFit — 320K aggregate LLM serving on 24 GiB</title>
   <link rel="stylesheet" href="styles.css">
   <script src="app.js" defer></script>
 </head>
@@ -33,7 +33,7 @@
     <header class="hero shell">
       <div class="hero-copy">
         <p class="eyebrow">Apple M4 Pro · 24 GiB unified memory · Qwen3.8-27B MXFP4</p>
-        <h1>A 27B model.<br><em>More than 200K retained tokens.</em></h1>
+        <h1>A 27B model.<br><em>Its full 256K native window.</em></h1>
         <p class="lede">JustFit coordinates compressed KV execution, component residency, and request-state transitions so temporary work does not erase the memory saved by compression.</p>
         <div class="actions">
           <a class="primary" href="https://arxiv.org/abs/2609.17475">Read on arXiv</a>
@@ -42,16 +42,16 @@
         </div>
       </div>
       <div class="hero-meter" aria-label="Measured single-request retained positions">
-        <div class="meter-number">212,992</div>
+        <div class="meter-number">262,144</div>
         <div class="meter-label">retained positions · single request</div>
         <div class="meter-rail"><i></i></div>
         <dl>
-          <div><dt>Input</dt><dd>196,608</dd></div>
+          <div><dt>Input</dt><dd>245,760</dd></div>
           <div><dt>Generated</dt><dd>16,384</dd></div>
-          <div><dt>Median TG</dt><dd>4.985 tok/s</dd></div>
-          <div><dt>Median peak</dt><dd>20,975 MiB</dd></div>
+          <div><dt>Cold TG</dt><dd>5.936 tok/s</dd></div>
+          <div><dt>Cold peak</dt><dd>20,357 MiB</dd></div>
         </dl>
-        <small>Three independent fresh-process completions under a 21,000-MiB guard.</small>
+        <small>One fully cold completion plus two fresh-process warm-prefix extensions under a 21,000-MiB guard.</small>
       </div>
     </header>
 
@@ -72,25 +72,25 @@
       <div class="results-grid">
         <article class="result-card result-main">
           <span>B1 / single request</span>
-          <strong>6.93×</strong>
+          <strong>8.53×</strong>
           <h3>completed context</h3>
-          <p>30,720 baseline positions → 212,992 JustFit positions on the same 24 GiB laptop.</p>
+          <p>30,720 baseline positions → the complete 262,144-position native window on the same 24 GiB laptop.</p>
           <div class="bar"><i class="bar-base"></i><i class="bar-fit"></i></div>
-          <small>192K input + 16K output · n=3 · peak range 20,960–20,977 MiB</small>
+          <small>240K input + 16K output · 1× cold + 2× warm-prefix extension · peaks 20,357–20,450 MiB</small>
         </article>
         <article class="result-card">
           <span>B2 / shared pool</span>
-          <strong>229,376</strong>
+          <strong>327,680</strong>
           <h3>aggregate positions</h3>
-          <p>Two simultaneous 96K-input + 16K-output requests complete at 12.55 aggregate tok/s.</p>
-          <small>20,310 MiB peak · common-active-interval TG</small>
+          <p>A 160K-input lane and a 128K-input lane each generate 16K tokens from ordered warm-prefix restores.</p>
+          <small>9.735 aggregate tok/s median · operational warm-prefix ceiling, distinct from the 294,912-position fully cold B2 result</small>
         </article>
         <article class="result-card">
           <span>B4 / unequal requests</span>
           <strong>204,800</strong>
           <h3>aggregate positions</h3>
           <p>One 128K+12K stream and three 8K+12K streams complete together.</p>
-          <small>20.78 aggregate tok/s · 11.55 wall-output tok/s</small>
+          <small><span id="b4-throughput">Current-version confirmation pending</span></small>
         </article>
         <article class="result-card">
           <span>Capability / separate protocol</span>
@@ -140,7 +140,7 @@
               <div><dt>Vision tower</dt><dd id="vision">detached</dd></div>
             </dl>
           </div>
-          <p class="schematic-note">Schematic, not a combined measured vision+B4+200K trace. Slots are equal-capacity page groups; returning a slot does not free the resident pool backing.</p>
+          <p class="schematic-note">Schematic, not a combined measured vision+B4+long-context trace. Slots are equal-capacity page groups; returning a slot does not free the resident pool backing.</p>
         </div>
 
         <figure class="paper-figure">
@@ -185,9 +185,9 @@
         <p>The fork includes a component-preparation helper, explicit server launcher, streaming workload client, and path-sanitized result JSON.</p>
       </div>
       <ol class="repro-steps">
-        <li><b>01</b><div><h3>Pin the runnable kit</h3><code>git checkout justfit-repro-v3</code><p>Measured runtime provenance: <code>143967472416aece96eeae392eaf931426acad3c</code>. The tagged kit has the identical <code>mlx_vlm/</code> tree.</p></div></li>
+        <li><b>01</b><div><h3>Pin the runnable kit</h3><code>git checkout justfit-repro-v4</code><p>The immutable tag contains the current JustFit runtime, Quick Start, and version-scoped result manifests. Each reported cohort records its own measured runtime commit.</p></div></li>
         <li><b>02</b><div><h3>Download pinned public artifacts</h3><code>hf download mlx-community/Qwen3.8-27B-mxfp4 --revision 97ab0819817ab1c61d7d39f9169fc71999915641 --local-dir ./justfit-models/qwen38-mxfp4<br>hf download billchen42/JustFit-Qwen3.8-27B-components --revision 13e0462fa911a1bcbdccbaa759120500c0f90582 --local-dir ./justfit-components</code><p>The component revision contains the exact production BF16 vision backing and byte-identical MTP weights.</p></div></li>
-        <li><b>03</b><div><h3>Extract the head and run an 8K smoke profile</h3><code>export MODEL_PATH="$PWD/justfit-models/qwen38-mxfp4" MTP_PATH="$PWD/justfit-components/mtp" VISION_PATH="$PWD/justfit-components/vision-bf16.safetensors"<br>python examples/justfit/prepare_components.py --model "$MODEL_PATH" --output ./justfit-extracted --head-only<br>LM_HEAD_PATH="$PWD/justfit-extracted/language-head.safetensors" LANES=1 KV_CAPACITY=32768 MAX_TOKENS=512 examples/justfit/run_server.sh</code><p>Verify the published SHA-256 values in the component manifest before running.</p></div></li>
+        <li><b>03</b><div><h3>Extract language backings and run an 8K smoke profile</h3><code>export MODEL_PATH="$PWD/justfit-models/qwen38-mxfp4" MTP_PATH="$PWD/justfit-components/mtp" VISION_PATH="$PWD/justfit-components/vision-bf16.safetensors"<br>python examples/justfit/prepare_components.py --model "$MODEL_PATH" --output ./justfit-extracted --language-only<br>LM_HEAD_PATH="$PWD/justfit-extracted/language-head.safetensors" INPUT_EMBEDDING_PATH="$PWD/justfit-extracted/input-embedding.safetensors" LANES=1 KV_CAPACITY=32768 MAX_TOKENS=512 examples/justfit/run_server.sh</code><p>The input embedding is extracted from the target locally, not downloaded again. Verify the component manifest before running.</p></div></li>
         <li><b>04</b><div><h3>Archive the evidence</h3><p>Commit, checkpoint hashes, effective environment, stream completion, process peak, failures, and page-reuse postflight.</p></div></li>
       </ol>
       <div class="repro-links">
@@ -196,14 +196,15 @@
         <a href="https://github.com/YuhuaBillChen/mlx-vlm/blob/production/qwen-paged-continuous-batching/examples/justfit/README.md">Full reproduction guide ↗</a>
         <a href="https://huggingface.co/billchen42/JustFit-Qwen3.8-27B-components">Pinned components ↗</a>
         <a href="https://github.com/YuhuaBillChen/mlx-vlm/blob/production/qwen-paged-continuous-batching/examples/justfit/results/limit-runs.json">Limit-run JSON ↗</a>
+        <a href="https://github.com/YuhuaBillChen/mlx-vlm/blob/production/qwen-paged-continuous-batching/examples/justfit/results/evo10-capacity.json">EVO10 capacity JSON ↗</a>
         <a href="https://github.com/YuhuaBillChen/mlx-vlm/blob/production/qwen-paged-continuous-batching/docs/justfit.md">Method and source map ↗</a>
       </div>
-      <aside class="boundary"><strong>Boundary, not default.</strong><p>The 192K+16K workload takes about 103 minutes and approaches the guard within 23 MiB. It is a full-execution memory stress test using repetitive text and EOS suppression—not a daily service preset or coding benchmark.</p></aside>
+      <aside class="boundary"><strong>Boundary, not default.</strong><p>The fully cold 240K+16K run takes about 114 minutes and peaks at 20,357 MiB. It is a full-execution memory stress test using repetitive text and EOS suppression—not a daily service preset or coding benchmark. The Quick Start deliberately uses a 64K-input + 8K-output profile.</p></aside>
     </section>
   </main>
 
   <footer>
-    <div class="shell"><div><b>JustFit</b><p>Independent systems research by Yuhua Chen.</p></div><div><a href="https://www.yuhuachen.com">yuhuachen.com</a><a href="https://github.com/YuhuaBillChen/mlx-vlm">GitHub</a><a href="https://arxiv.org/abs/2609.17475">arXiv</a><a href="JustFit_Preprint_v20.pdf">Archived PDF</a></div></div>
+    <div class="shell"><div><b>JustFit</b><p>Independent systems research by Yuhua Chen.</p></div><div><a href="https://www.yuhuachen.com">yuhuachen.com</a><a href="https://github.com/YuhuaBillChen/mlx-vlm">GitHub</a><a href="https://arxiv.org/abs/2609.17475">arXiv abstract</a><a href="https://arxiv.org/pdf/2609.17475">Paper PDF</a></div></div>
   </footer>
 </body>
 </html>
