@@ -89,8 +89,8 @@
           <span>B4 / unequal requests</span>
           <strong>204,800</strong>
           <h3>aggregate positions</h3>
-          <p>One 128K+12K stream and three 8K+12K streams complete together.</p>
-          <small><span id="b4-throughput">Current-version confirmation pending</span></small>
+          <p>A 128K+12K agent stream begins first; three 8K+12K streams then join it and all four complete from one shared pool.</p>
+          <small><span id="b4-throughput">22.570 common-active tok/s · 12.147 wall-output tok/s · 18,915 MiB · no implicit 8K prompt gate</span></small>
         </article>
         <article class="result-card">
           <span>Capability / separate protocol</span>
@@ -197,6 +197,7 @@
         <a href="https://huggingface.co/billchen42/JustFit-Qwen3.8-27B-components">Pinned components ↗</a>
         <a href="https://github.com/YuhuaBillChen/mlx-vlm/blob/production/qwen-paged-continuous-batching/examples/justfit/results/limit-runs.json">Limit-run JSON ↗</a>
         <a href="https://github.com/YuhuaBillChen/mlx-vlm/blob/production/qwen-paged-continuous-batching/examples/justfit/results/evo10-capacity.json">EVO10 capacity JSON ↗</a>
+        <a href="https://github.com/YuhuaBillChen/mlx-vlm/blob/production/qwen-paged-continuous-batching/examples/justfit/results/b4-throughput.json">B4 throughput JSON ↗</a>
         <a href="https://github.com/YuhuaBillChen/mlx-vlm/blob/production/qwen-paged-continuous-batching/docs/justfit.md">Method and source map ↗</a>
       </div>
       <aside class="boundary"><strong>Boundary, not default.</strong><p>The fully cold 240K+16K run takes about 114 minutes and peaks at 20,357 MiB. It is a full-execution memory stress test using repetitive text and EOS suppression—not a daily service preset or coding benchmark. The Quick Start deliberately uses a 64K-input + 8K-output profile.</p></aside>

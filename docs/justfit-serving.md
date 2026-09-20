@@ -13,8 +13,8 @@ server for three common clients:
 
 The recommended Hermes profile reserves **65,536 input positions plus 8,192
 generated positions**, for a total KV capacity of **73,728 positions**. This is
-a single-lane service profile, not the fully cold 240K+16K capacity experiment and not a
-four-lane aggregate budget.
+a single-lane service profile, not the fully cold 240K+16K capacity experiment
+and not a four-lane aggregate budget.
 
 ## 1. Install and download
 
@@ -26,7 +26,7 @@ the OpenAI-compatible endpoint.
 ```bash
 git clone https://github.com/YuhuaBillChen/mlx-vlm.git
 cd mlx-vlm
-git checkout production/qwen-paged-continuous-batching
+git checkout justfit-repro-v4
 
 python3 -m venv .venv
 source .venv/bin/activate

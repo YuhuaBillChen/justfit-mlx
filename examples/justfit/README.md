@@ -222,8 +222,9 @@ template revision and calibrate the offset for a new cohort.
 
 The checked-in [`results/limit-runs.json`](results/limit-runs.json) preserves
 the corrected 192K+16K cold cohort. Full-window and B2 evidence is in
-[`results/evo10-capacity.json`](results/evo10-capacity.json); the current B4
-confirmation is published separately after its run. The authoritative
+[`results/evo10-capacity.json`](results/evo10-capacity.json). The current
+long-incumbent B4 qualification is in
+[`results/b4-throughput.json`](results/b4-throughput.json). The authoritative
 definitions are:
 
 - PP = uncached prefill tokens / summed prefill work seconds;
@@ -240,6 +241,14 @@ are shared pool occupancy. Report aggregate TG only over a real common-active
 interval. If admission phases the requests so that no such interval exists,
 report wall-output throughput and the admission schedule instead of
 manufacturing a common-active rate.
+
+The launcher does not impose the historical 8K per-request mixed-prefill
+suffix gate. That value was one qualification workload, not a model or KV
+boundary. Paged reservations, the lane limit, and the process footprint guard
+remain active. A deployment may opt back into a separately qualified positive
+cap with `LM_HEAD_MIXED_PREFILL_MAX_TOKENS=N`; leaving it unset is recommended.
+This is separate from `OUTPUT_GUARANTEE=8192`, which reserves continued decode
+capacity for every admitted lane and remains enabled.
 
 Do not treat two sequential requests as B2, or add per-request decode rates to
 manufacture an aggregate result.

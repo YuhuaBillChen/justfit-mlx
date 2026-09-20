@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "system": "JustFit mixed-prefill admission qualification",
+  "hardware": "Apple M4 Pro MacBook Pro, 24 GiB unified memory",
+  "model_label": "Qwen3.8-27B MXFP4",
+  "guard_mib": 21000,
+  "runtime_provenance": {
+    "runtime_commit": "eb232953ac293bf6158215ab20e4c92d67fd272f",
+    "generation_py_sha256": "c2c960671804f6c2b9369a00f4510173ada5773fd0bafdbd4e88a3b835de07c2",
+    "launcher_sha256": "3063787c7fb13254ebac449bdf8b0dcecbb325f0b69265e45a381fde42f29bba",
+    "instrumentation_sha256": "44491e5eefdaa4b2afac706bae71c243e0a72b74de5ce4772974a002e874d3f8"
+  },
+  "b4_long_incumbent": {
+    "arrival_protocol": "cold-prefill the 128K lane to its first token, then admit three 8K lanes",
+    "lanes": [
+      {"input_tokens": 131072, "output_tokens": 12288},
+      {"input_tokens": 8192, "output_tokens": 12288},
+      {"input_tokens": 8192, "output_tokens": 12288},
+      {"input_tokens": 8192, "output_tokens": 12288}
+    ],
+    "aggregate_retained_positions": 204800,
+    "uncached_prefill_tokens": 155648,
+    "prefill_work_seconds": 1821.4720283750794,
+    "prefill_work_tps": 85.45176515219525,
+    "common_active_decode_seconds": 1902.7663685419975,
+    "common_active_decode_tokens": 42945,
+    "common_active_decode_tps": 22.569770366977203,
+    "wall_seconds": 4046.5206639160024,
+    "wall_output_tps": 12.146731496592277,
+    "peak_footprint_mib": 18915,
+    "guard_margin_mib": 2085,
+    "paged_high_water_layer_pages": 12608,
+    "paged_capacity_layer_pages": 12800,
+    "completion_tokens_per_lane": [12288, 12288, 12288, 12288],
+    "postflight_passed": true,
+    "paged_release_verified_by_reuse": true,
+    "guard_trips": 0,
+    "lm_head_phase_deferrals": 0,
+    "mixed_prefill_suffix_gate_tokens": 0
+  },
+  "measurement_definitions": {
+    "common_active_decode_tps": "all emitted tokens strictly inside the interval where all four request streams have begun and none has finished, divided by that interval",
+    "wall_output_tps": "all 49,152 completion tokens divided by first-request start through last-request completion; includes the fully cold 128K prefill and staggered admissions",
+    "peak": "sampled whole-process footprint",
+    "page_high_water": "simultaneously occupied fixed-pool layer-page slots, not cumulative processed positions"
+  }
+}

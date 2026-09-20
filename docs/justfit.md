@@ -39,7 +39,8 @@ fixed MXFP4 weights; 21,000 MiB sampled process-footprint guard. `K = 1,024`.
 | JustFit, B1 240K input + 16K output, fully cold | 262,144 | 60.546 tok/s | 5.936 tok/s | 20,357 MiB |
 | JustFit, B2 2×(128K input + 16K output), fully cold | 294,912 aggregate | 81.399 tok/s | 10.341 aggregate tok/s | 20,858 MiB |
 | JustFit, B2 160K+16K and 128K+16K, ordered warm-prefix restore | 327,680 aggregate | protocol-dependent incremental PP | 9.735 aggregate tok/s median | 20,432–20,953 MiB |
-| JustFit, B4 128K+12K and 3×(8K+12K), current confirmation | 204,800 aggregate | pending current result | pending current result | pending current result |
+| JustFit, B4 128K+12K and 3×(8K+12K), matched simultaneous run | 204,800 aggregate | 79.295 tok/s | 21.957 common-active; 11.249 wall-output tok/s | 20,133 MiB |
+| JustFit, B4 128K+12K incumbent then 3×(8K+12K), current PhaseSwap policy | 204,800 aggregate | 85.452 tok/s | 22.570 common-active; 12.147 wall-output tok/s | 18,915 MiB |
 
 The complete native-window B1 cohort consists of one fully cold run plus two
 fresh-process warm-prefix extensions. All three completed 245,760 input and
@@ -52,6 +53,17 @@ The 327,680-position B2 result is an ordered warm-prefix operational boundary.
 The larger 335,872-position attempt was the first measured warm B2 failure and
 hit the 21,000-MiB guard during restore. The largest fully cold B2 completion
 is separately reported at 294,912 aggregate positions.
+
+The matched B4 run at `0ad2f166` submitted all four requests together. The
+current PhaseSwap qualification instead models a long-running agent: it cold
+prefills the 128K lane to its first token, then admits three 8K lanes. The
+runtime demotes singleton MTP to batched AR, advances each new prompt in PF64
+mixed-prefill slices, and reaches a real four-row common-active interval. All
+four lanes generated 12,288 tokens, the process stayed 2,085 MiB below the
+guard, and a postflight request verified page release/reuse. These rows have
+different arrival protocols and are not pooled as matched repeats. The current
+record is preserved in
+[`examples/justfit/results/b4-throughput.json`](../examples/justfit/results/b4-throughput.json).
 
 In a separate capability protocol, paged TQ4 answered 29/30 AIME 2026 problems
 correctly and generated 696,834 tokens at 15.04 token-weighted tok/s. That
