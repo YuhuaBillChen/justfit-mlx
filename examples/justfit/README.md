@@ -145,7 +145,6 @@ runtime module from them; it does not imply a discrete-VRAM transfer. The
 separate input-embedding backing lets an admitted image request release the
 text embedding table before loading the vision tower, then restore it before
 text prefill resumes.
-
 ### Persistent APC and disk usage
 
 APC is a prefix-reuse optimization, not part of the forced-length capacity
