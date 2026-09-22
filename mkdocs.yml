@@ -1,11 +1,11 @@
-site_name: MLX-VLM
-site_description: MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) on your Mac using MLX.
-site_author: Prince Canuma
-repo_name: Blaizzy/mlx-vlm
-site_url: https://Blaizzy.github.io/mlx-vlm
-repo_url: https://github.com/Blaizzy/mlx-vlm
+site_name: JustFit
+site_description: JustFit is an MLX inference runtime for long-context local LLM serving, built on mlx-vlm.
+site_author: Yuhua Chen
+repo_name: YuhuaBillChen/justfit-mlx
+site_url: https://YuhuaBillChen.github.io/justfit-mlx
+repo_url: https://github.com/YuhuaBillChen/justfit-mlx
 
-copyright: "Copyright \u00a9 2024 - 2024 Prince Canuma"
+copyright: "Copyright \u00a9 2026 Yuhua Chen \u2014 built on mlx-vlm, Copyright \u00a9 2025 Prince Canuma"
 
 theme:
     palette:
