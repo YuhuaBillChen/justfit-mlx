@@ -64,9 +64,7 @@ markdown_extensions:
 extra:
     social:
         - icon: fontawesome/brands/github
-          link: https://github.com/Blaizzy
-        - icon: fontawesome/brands/twitter
-          link: https://twitter.com/Prince_Canuma
+          link: https://github.com/YuhuaBillChen
     version:
         provider: mike
     consent:

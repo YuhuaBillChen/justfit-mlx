@@ -62,7 +62,7 @@ By processing screenshots and visual information from your screen, the system un
 
 2. **Clone the repository**:
    ```bash
-   git clone https://github.com/Blaizzy/mlx-vlm.git
+   git clone https://github.com/YuhuaBillChen/justfit-mlx.git
    ```
 
 3. **Navigate to computer control directory**:

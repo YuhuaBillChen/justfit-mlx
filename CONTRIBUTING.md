@@ -14,7 +14,7 @@ Then check if the model has weights in the
 convert it.
 
 After that, add the model file to the
-[`mlx_vlm/models`](https://github.com/Blaizzy/mlx-vlm/tree/main/src/models)
+[`mlx_vlm/models`](https://github.com/YuhuaBillChen/justfit-mlx/tree/main/mlx_vlm/models)
 directory. You can see other examples there. We recommend starting from a model
 that is similar to the model you are porting.
 
@@ -57,7 +57,7 @@ dies loudly at weight-load; a value-changing one (a norm shift, a scale rewrite)
 loads fine and generates garbage.
 
 Additionally, add a test for the new model type to the [model
-tests](https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/tests/test_models.py),
+tests](https://github.com/YuhuaBillChen/justfit-mlx/tree/main/mlx_vlm/tests/test_models.py),
 and assert the invariant above with the shared helper:
 
 ```python
