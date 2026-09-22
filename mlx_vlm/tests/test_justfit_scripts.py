@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 
-
 ROOT = Path(__file__).resolve().parents[2]
 PREPARE = ROOT / "examples" / "justfit" / "prepare_components.py"
 RUN_SERVER = ROOT / "examples" / "justfit" / "run_server.sh"
@@ -126,7 +125,9 @@ def test_run_server_requires_and_exports_input_embedding(tmp_path):
         [str(RUN_SERVER)], env=env, capture_output=True, text=True, check=False
     )
     assert missing.returncode == 2
-    assert "missing required environment variable: INPUT_EMBEDDING_PATH" in missing.stderr
+    assert (
+        "missing required environment variable: INPUT_EMBEDDING_PATH" in missing.stderr
+    )
 
     env["INPUT_EMBEDDING_PATH"] = str(tmp_path / "embedding")
     complete = subprocess.run(

@@ -48,8 +48,12 @@ class ComponentResidencyManager:
         self._retained: set[str] = set()
 
     def register(
-        self, name: str, component: ComponentT, *,
-        dependencies: tuple[str, ...] = (), retain_on_release: bool = False,
+        self,
+        name: str,
+        component: ComponentT,
+        *,
+        dependencies: tuple[str, ...] = (),
+        retain_on_release: bool = False,
     ) -> ComponentT:
         """Register dependencies first; immutable edges cannot form a cycle."""
         dependencies = tuple(dependencies)
@@ -111,7 +115,9 @@ class ComponentResidencyManager:
                 try:
                     self.release(dependency, dependency_owner)
                 except Exception:
-                    logger.exception("Failed to roll back component dependency: %s", dependency)
+                    logger.exception(
+                        "Failed to roll back component dependency: %s", dependency
+                    )
             raise
         return component
 

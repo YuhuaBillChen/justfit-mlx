@@ -200,9 +200,7 @@ class APCCoordinator:
             snapshot_prompt_cache_row,
         )
 
-        direct_disk_write = bool(
-            getattr(self.manager, "direct_disk_writes", False)
-        )
+        direct_disk_write = bool(getattr(self.manager, "direct_disk_writes", False))
         batch_shaped = _prompt_cache_is_batch_shaped(prompt_cache)
         # A detached batch row can allocate a full cache before
         # store_exact_cache decides whether it can retain it. The explicit

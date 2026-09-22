@@ -39,7 +39,9 @@ def build_messages(tokenizer, prompt_tokens: int, tokenizer_offset: int) -> list
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--endpoint", default="http://127.0.0.1:8080/v1/chat/completions")
+    parser.add_argument(
+        "--endpoint", default="http://127.0.0.1:8080/v1/chat/completions"
+    )
     parser.add_argument("--model", required=True, help="Server-visible model id")
     parser.add_argument("--tokenizer", help="Checkpoint path; defaults to --model")
     parser.add_argument("--prompt-tokens", required=True, type=int)

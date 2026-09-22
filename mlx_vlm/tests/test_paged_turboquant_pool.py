@@ -9,7 +9,6 @@ from mlx_vlm.paged_turboquant_pool import (
     PagedTurboQuantPoolRegistry,
 )
 
-
 H_KV = 2
 D = 256
 PAGE = PAGED_TURBOQUANT_PAGE_SIZE
@@ -139,9 +138,7 @@ def test_registry_enforces_uniform_capacity_and_exact_kernel_geometry():
 def test_registry_restores_packed_apc_row_directly_into_existing_page_pool():
     from mlx_vlm.turboquant import TurboQuantKVCache
 
-    registry = PagedTurboQuantPoolRegistry(
-        {0: PagedTurboQuantLayerSpec(4, H_KV)}
-    )
+    registry = PagedTurboQuantPoolRegistry({0: PagedTurboQuantLayerSpec(4, H_KV)})
     source = TurboQuantKVCache(bits=4)
     source.update_and_fetch(*_kv(PAGE + 7))
     mx.eval(source.state)
@@ -162,9 +159,7 @@ def test_registry_marks_restored_float_tail_for_ragged_dynamic_join():
     from mlx_vlm.models.cache import BatchKVCache
     from mlx_vlm.turboquant import TurboQuantKVCache
 
-    registry = PagedTurboQuantPoolRegistry(
-        {0: PagedTurboQuantLayerSpec(16, H_KV)}
-    )
+    registry = PagedTurboQuantPoolRegistry({0: PagedTurboQuantLayerSpec(16, H_KV)})
     quantized = TurboQuantKVCache(bits=4)
     quantized.update_and_fetch(*_kv(PAGE + 7))
     float_tail = BatchKVCache([0])

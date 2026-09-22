@@ -1,8 +1,8 @@
-from bisect import bisect_left
 import logging
 import os
 import tempfile
 import time
+from bisect import bisect_left
 from typing import Optional
 
 import mlx.core as mx

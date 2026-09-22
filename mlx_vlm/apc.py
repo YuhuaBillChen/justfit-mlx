@@ -58,11 +58,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
-from .apc_probe import stage, traced
 import numpy as np
 
 from ._stream_cleanup import clear_mlx_streams
 from .apc_coordinator import APCCoordinator
+from .apc_probe import stage, traced
 from .apc_storage import APCNode, ComponentId, StateHandle
 from .kv_quant import from_config as kv_quant_from_config
 from .kv_quant import kv_quant_fingerprint
@@ -702,9 +702,7 @@ class PagedTurboQuantDiskRestore:
         def logical_chunk(value: mx.array) -> mx.array:
             if value.ndim == 3:
                 pages, heads, width = value.shape
-                return mx.transpose(value, (1, 0, 2)).reshape(
-                    1, heads, pages * width
-                )
+                return mx.transpose(value, (1, 0, 2)).reshape(1, heads, pages * width)
             if value.ndim == 4:
                 pages, heads, width, packed = value.shape
                 return mx.transpose(value, (1, 0, 2, 3)).reshape(
@@ -3414,6 +3412,7 @@ class DiskBlockStore:
         try:
             if bounded:
                 from .apc_single_pass import save_single_pass
+
                 save_single_pass(tmp, arrays, metadata=metadata)
             else:
                 mx.save_safetensors(str(tmp), arrays, metadata=metadata)
@@ -3984,11 +3983,7 @@ class APCManager:
         can_try_disk = disk is not None and prefix_len < max_len
         # Paged-Q4 restores stream directly into registry-owned pages and do
         # not require the contiguous host-RAM staging guarded here.
-        if (
-            can_try_disk
-            and not defer_paged_q4
-            and self._disk_min_free_ram_bytes > 0
-        ):
+        if can_try_disk and not defer_paged_q4 and self._disk_min_free_ram_bytes > 0:
             free_now = _free_ram_bytes()
             if free_now is not None and free_now < self._disk_min_free_ram_bytes:
                 logger.info(

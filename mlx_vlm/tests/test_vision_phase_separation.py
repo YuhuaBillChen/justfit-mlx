@@ -3,9 +3,9 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
-from mlx_vlm.server.generation import ResponseGenerator
 from mlx_vlm.models.qwen3_5.qwen3_5 import Model
 from mlx_vlm.server.component_residency import ComponentResidencyManager
+from mlx_vlm.server.generation import ResponseGenerator
 
 
 def test_video_keeps_existing_embedding_path():
@@ -21,13 +21,19 @@ def test_video_keeps_existing_embedding_path():
 
         def get_input_embeddings(self, *args, **kwargs):
             events.append("video")
-            return SimpleNamespace(to_dict=lambda: {"inputs_embeds": mx.ones((1, 1, 3))})
+            return SimpleNamespace(
+                to_dict=lambda: {"inputs_embeds": mx.ones((1, 1, 3))}
+            )
 
     gen = SimpleNamespace(model=FakeModel(), vision_cache=None, vision_phase_swap=tower)
-    ResponseGenerator._gpu_embed(gen, {
-        "input_ids": mx.array([[1]]), "pixel_values": mx.ones((1, 3)),
-        "video_grid_thw": mx.array([[1, 1, 1]]),
-    })
+    ResponseGenerator._gpu_embed(
+        gen,
+        {
+            "input_ids": mx.array([[1]]),
+            "pixel_values": mx.ones((1, 3)),
+            "video_grid_thw": mx.array([[1, 1, 1]]),
+        },
+    )
     assert events == ["load", "video", "unload"]
 
 
@@ -68,7 +74,9 @@ def test_features_finish_before_text_embedding_and_cache_hit_skips_tower(hit):
             events.append("text")
             return SimpleNamespace(to_dict=lambda: {"inputs_embeds": features})
 
-    gen = SimpleNamespace(model=FakeModel(), vision_cache=Cache(), vision_phase_swap=tower)
+    gen = SimpleNamespace(
+        model=FakeModel(), vision_cache=Cache(), vision_phase_swap=tower
+    )
     _, kwargs = ResponseGenerator._gpu_embed(
         gen, {"input_ids": mx.array([[1]]), "pixel_values": mx.ones((1, 3))}, ["image"]
     )
@@ -86,8 +94,11 @@ def test_qwen_cached_features_work_with_vision_tower_absent():
         ),
     )
     result = Model.get_input_embeddings(
-        model, mx.array([[99]]), mx.ones((1, 3)),
-        cached_image_features=mx.ones((1, 3)), chunked=True,
+        model,
+        mx.array([[99]]),
+        mx.ones((1, 3)),
+        cached_image_features=mx.ones((1, 3)),
+        chunked=True,
     )
     actual = result.input_embedding_provider(mx.array([[99]]), start=0)
     assert mx.array_equal(actual, mx.ones((1, 1, 3))).item()
@@ -96,6 +107,7 @@ def test_qwen_cached_features_work_with_vision_tower_absent():
 def test_provider_does_not_keep_retired_embedding_alive():
     import gc
     import weakref
+
     from mlx_vlm.models.qwen3_5.qwen3_5 import CurrentInputEmbedding
 
     class Table:
@@ -117,7 +129,9 @@ def test_provider_does_not_keep_retired_embedding_alive():
 @pytest.mark.parametrize("fail", [False, True])
 @pytest.mark.parametrize("pinned", [False, True])
 @pytest.mark.parametrize("active", [False, True])
-def test_managed_embedding_swap_restores_after_vision_and_respects_owners(fail, pinned, active):
+def test_managed_embedding_swap_restores_after_vision_and_respects_owners(
+    fail, pinned, active
+):
     events = []
 
     class Component:
@@ -153,15 +167,22 @@ def test_managed_embedding_swap_restores_after_vision_and_respects_owners(fail, 
 
         def get_input_embeddings(self, *args, **kwargs):
             assert embedding.loaded and not tower.loaded
-            return SimpleNamespace(to_dict=lambda: {"inputs_embeds": mx.ones((1, 1, 3))})
+            return SimpleNamespace(
+                to_dict=lambda: {"inputs_embeds": mx.ones((1, 1, 3))}
+            )
 
     gen = ResponseGenerator.__new__(ResponseGenerator)
     gen.model, gen.vision_cache = FakeModel(), None
     gen.vision_phase_swap, gen.component_residency = tower, manager
+
     def run():
-        gen._gpu_embed_at_active_decode_boundary({
-            "input_ids": mx.array([[1]]), "pixel_values": mx.ones((1, 3))
-        }, None, active=active, apc_semantic_hash=None)
+        gen._gpu_embed_at_active_decode_boundary(
+            {"input_ids": mx.array([[1]]), "pixel_values": mx.ones((1, 3))},
+            None,
+            active=active,
+            apc_semantic_hash=None,
+        )
+
     if fail:
         with pytest.raises(ValueError, match="encoding failed"):
             run()

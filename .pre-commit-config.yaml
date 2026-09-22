@@ -17,4 +17,7 @@ repos:
             - --in-place
             - --remove-all-unused-imports
             - --ignore-init-module-imports
-            - --exclude=mlx_vlm/models/base.py,mlx_vlm/models/cache.py
+            # language_lifecycle.py re-exports ComponentResidencyManager for the
+            # server and test modules that import it from there; autoflake would
+            # strip it as unused and break those imports.
+            - --exclude=mlx_vlm/models/base.py,mlx_vlm/models/cache.py,mlx_vlm/server/language_lifecycle.py

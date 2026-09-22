@@ -5,8 +5,8 @@ keeps these tests runnable on CPU-only development hosts without mocking MLX.
 """
 
 import importlib.util
-from pathlib import Path
 import unittest
+from pathlib import Path
 from unittest.mock import Mock
 
 

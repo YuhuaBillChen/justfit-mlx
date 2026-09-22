@@ -32,7 +32,9 @@ def test_incompatible_policy_join_is_rejected_before_ownership_moves():
     )
     first = registry.new_cache(0)
     second = PagedBatchTurboQuantKVCache(
-        [0], bits=4, storage=first.storage,
+        [0],
+        bits=4,
+        storage=first.storage,
         config=PagedTurboQuantConfig(mtp_qtile=True),
     )
     before = (first.sequence_lengths, second.sequence_lengths)

@@ -567,7 +567,8 @@ def _speculative_walk_batch_processed(
                 [row_ids[row] for row in live] if row_ids is not None else None,
                 (
                     [base_positions[row] for row in live]
-                    if base_positions is not None else None
+                    if base_positions is not None
+                    else None
                 ),
                 pos,
             )
@@ -583,7 +584,8 @@ def _speculative_walk_batch_processed(
             emitted[row].append(token)
             boundary = (
                 bool(token_observer(active_idx[row], token))
-                if token_observer else False
+                if token_observer
+                else False
             )
             stopped = bool(stop_check(active_idx[row], token)) if stop_check else False
             done[row] = (
@@ -1028,9 +1030,11 @@ def _mtp_draft_block_active(
                 hidden[row_idx : row_idx + 1],
                 None,
                 block_size,
-                sampler.select_rows([row_idx])
-                if isinstance(sampler, _DraftBiasSampler)
-                else sampler,
+                (
+                    sampler.select_rows([row_idx])
+                    if isinstance(sampler, _DraftBiasSampler)
+                    else sampler
+                ),
                 token_dtype,
                 **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
             )

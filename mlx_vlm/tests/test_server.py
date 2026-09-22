@@ -35,8 +35,8 @@ from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.server.language_lifecycle import ComponentResidencyManager
+from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 from mlx_vlm.tools import _infer_tool_parser
 from mlx_vlm.tools.parsers import minicpm5
@@ -133,9 +133,7 @@ def test_component_residency_waits_for_last_owner_before_unload():
     residency.acquire("lm_head", "decode")
     residency.acquire("lm_head", "final_prefill")
 
-    assert residency.owners("lm_head") == frozenset(
-        {"decode", "final_prefill"}
-    )
+    assert residency.owners("lm_head") == frozenset({"decode", "final_prefill"})
     assert residency.unload_if_idle("lm_head") is False
     assert residency.release("lm_head", "final_prefill") is False
     component.unload.assert_not_called()
@@ -148,9 +146,7 @@ def test_component_residency_waits_for_last_owner_before_unload():
 def test_lm_head_phase_admission_defers_unqualified_mixed_prefill(monkeypatch):
     monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-    gen.component_residency = SimpleNamespace(
-        contains=lambda name: name == "lm_head"
-    )
+    gen.component_residency = SimpleNamespace(contains=lambda name: name == "lm_head")
     first_long = SimpleNamespace(prompt_tokens=98304)
     short_peer = SimpleNamespace(prompt_tokens=8192)
     second_long = SimpleNamespace(prompt_tokens=98304)
@@ -173,16 +169,12 @@ def test_lm_head_phase_admission_defers_unqualified_mixed_prefill(monkeypatch):
 def test_lm_head_phase_admission_has_no_implicit_8k_gate(monkeypatch):
     monkeypatch.delenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", raising=False)
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-    gen.component_residency = SimpleNamespace(
-        contains=lambda name: name == "lm_head"
-    )
+    gen.component_residency = SimpleNamespace(contains=lambda name: name == "lm_head")
     requests = [SimpleNamespace(prompt_tokens=131072)] + [
         SimpleNamespace(prompt_tokens=8192) for _ in range(3)
     ]
 
-    admitted, deferred = gen._partition_lm_head_phase_admission(
-        requests, active={}
-    )
+    admitted, deferred = gen._partition_lm_head_phase_admission(requests, active={})
 
     assert admitted == requests
     assert deferred == []
@@ -212,9 +204,7 @@ def test_lm_head_phase_admission_uses_exact_apc_suffix(monkeypatch):
     monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
     manager = SimpleNamespace(peek_exact_prefix_length=MagicMock(return_value=96000))
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-    gen.component_residency = SimpleNamespace(
-        contains=lambda name: name == "lm_head"
-    )
+    gen.component_residency = SimpleNamespace(contains=lambda name: name == "lm_head")
     gen.apc_manager = manager
     gen.apc_mode = "exact"
     warm_peer = SimpleNamespace(
@@ -249,9 +239,7 @@ def test_lm_head_phase_admission_uses_exact_apc_suffix(monkeypatch):
 def test_lm_head_phase_admission_keeps_large_apc_suffix_deferred(monkeypatch):
     monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-    gen.component_residency = SimpleNamespace(
-        contains=lambda name: name == "lm_head"
-    )
+    gen.component_residency = SimpleNamespace(contains=lambda name: name == "lm_head")
     gen.apc_manager = SimpleNamespace(
         peek_exact_prefix_length=MagicMock(return_value=65536)
     )
@@ -281,9 +269,7 @@ def test_lm_head_phase_admission_bounds_short_request_bypass(monkeypatch):
     monkeypatch.setenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", "8192")
     monkeypatch.setenv("MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS", "1")
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-    gen.component_residency = SimpleNamespace(
-        contains=lambda name: name == "lm_head"
-    )
+    gen.component_residency = SimpleNamespace(contains=lambda name: name == "lm_head")
     long_peer = SimpleNamespace(prompt_tokens=16384, kv_bypass_count=0)
     short_peer = SimpleNamespace(prompt_tokens=8192, kv_bypass_count=0)
 
@@ -1172,9 +1158,7 @@ def test_server_initializes_language_head_phase_swap_for_continuous_batching(
 
     monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
     monkeypatch.setenv("MLX_VLM_MAX_NUM_SEQS", "4")
-    monkeypatch.setenv(
-        "MLX_VLM_LANGUAGE_HEAD_PHASE_SWAP_PATH", "head.safetensors"
-    )
+    monkeypatch.setenv("MLX_VLM_LANGUAGE_HEAD_PHASE_SWAP_PATH", "head.safetensors")
     monkeypatch.setattr(
         server_generation,
         "load_model_resources",
@@ -1379,9 +1363,7 @@ def test_paged_kv_budget_accounts_for_each_requests_tail_page(monkeypatch):
         args=server_generation.GenerationArguments(max_tokens=0),
     )
 
-    admitted, deferred = gen._partition_kv_budget_admission(
-        [one_token], active=active
-    )
+    admitted, deferred = gen._partition_kv_budget_admission([one_token], active=active)
 
     assert admitted == []
     assert deferred == [one_token]
@@ -1407,9 +1389,7 @@ def test_paged_kv_budget_reserves_output_guarantee_not_requested_ceiling(
         args=server_generation.GenerationArguments(max_tokens=768),
     )
 
-    admitted, deferred = gen._partition_kv_budget_admission(
-        [first, second], active={}
-    )
+    admitted, deferred = gen._partition_kv_budget_admission([first, second], active={})
 
     assert admitted == [first, second]
     assert deferred == []
@@ -1425,9 +1405,7 @@ def test_paged_b4_admission_uses_pool_budget_without_implicit_suffix_gate(
     monkeypatch.setenv("MLX_VLM_PAGED_OUTPUT_GUARANTEE_TOKENS", "8192")
     monkeypatch.delenv("MLX_VLM_LM_HEAD_MIXED_PREFILL_MAX_TOKENS", raising=False)
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-    gen.component_residency = SimpleNamespace(
-        contains=lambda name: name == "lm_head"
-    )
+    gen.component_residency = SimpleNamespace(contains=lambda name: name == "lm_head")
     requests = [
         server_generation.QueuedGenerationRequest(
             rqueue=Queue(),
@@ -1967,10 +1945,12 @@ def test_media_embedding_restores_generation_head_after_failure(monkeypatch):
         )
 
     assert [c.args for c in residency.release.call_args_list] == [
-        ("input_embedding", "generation"), ("lm_head", "generation")
+        ("input_embedding", "generation"),
+        ("lm_head", "generation"),
     ]
     assert [c.args for c in residency.acquire.call_args_list] == [
-        ("input_embedding", "generation"), ("lm_head", "generation")
+        ("input_embedding", "generation"),
+        ("lm_head", "generation"),
     ]
 
 
@@ -5946,9 +5926,7 @@ class TestResponseGenerator:
 
         assert gen.requests.empty()
 
-    def test_stream_validation_checks_paged_pool_without_max_kv_size(
-        self, monkeypatch
-    ):
+    def test_stream_validation_checks_paged_pool_without_max_kv_size(self, monkeypatch):
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         gen.wait_until_ready = lambda: None
         gen._preprocess_request = lambda prompt, images, audio, videos: {

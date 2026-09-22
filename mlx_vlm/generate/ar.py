@@ -1268,10 +1268,7 @@ def _make_cache(
         and (kv_key_bits is None or float(kv_key_bits) == 4.0)
         and (kv_value_bits is None or float(kv_value_bits) == 4.0)
     )
-    if (
-        paged_cache_factory is not None
-        and tuple(int(x) for x in left_padding) != (0,)
-    ):
+    if paged_cache_factory is not None and tuple(int(x) for x in left_padding) != (0,):
         raise ValueError("paged TurboQuant requires one cold, unpadded prefill row")
 
     def to_batch_cache(c, quantize=True, layer_key=None):
@@ -1583,13 +1580,9 @@ class GenerationBatch:
         if fast_capture:
             fwd_kwargs["skip_logits"] = True
 
-        with _paged_append_reservation(
-            self._paged_cache_factory, self.prompt_cache, 1
-        ):
+        with _paged_append_reservation(self._paged_cache_factory, self.prompt_cache, 1):
             sampled = (
-                None
-                if capture_mtp
-                else self._fused_greedy_step(inputs, fwd_kwargs)
+                None if capture_mtp else self._fused_greedy_step(inputs, fwd_kwargs)
             )
             if sampled is None:
                 output = self._language_model(
@@ -2075,9 +2068,8 @@ class SpeculativeGenerationBatch:
         self.token_context = [
             list(ctx) for ctx in (token_context or [[] for _ in uids])
         ]
-        if (
-            len(self.logits_processors) != len(uids)
-            or len(self.token_context) != len(uids)
+        if len(self.logits_processors) != len(uids) or len(self.token_context) != len(
+            uids
         ):
             raise ValueError("Processor state must match the speculative batch size.")
         if any(self.logits_processors) and draft_kind != "mtp":
@@ -2159,9 +2151,7 @@ class SpeculativeGenerationBatch:
         active_tokens = mx.array(
             [[self._last_tokens[i]] for i in active_slots], dtype=self.token_dtype
         )
-        with _paged_append_reservation(
-            self._paged_cache_factory, self.prompt_cache, 1
-        ):
+        with _paged_append_reservation(self._paged_cache_factory, self.prompt_cache, 1):
             output = self.model(
                 active_tokens,
                 cache=self.prompt_cache,
@@ -2175,7 +2165,8 @@ class SpeculativeGenerationBatch:
                         row, self._last_tokens[row], logits[i : i + 1]
                     )
                     for i, row in enumerate(active_slots)
-                ], axis=0,
+                ],
+                axis=0,
             )
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         first_tokens = _sample_with_positions(
@@ -2194,9 +2185,7 @@ class SpeculativeGenerationBatch:
         self.thinking_budget_criteria = [
             self.thinking_budget_criteria[i] for i in active_slots
         ]
-        self._forced_next_tokens = [
-            self._forced_next_tokens[i] for i in active_slots
-        ]
+        self._forced_next_tokens = [self._forced_next_tokens[i] for i in active_slots]
         self.logits_processors = [self.logits_processors[i] for i in active_slots]
         self.token_context = [self.token_context[i] for i in active_slots]
         self.first_tokens = first_tokens
@@ -2280,9 +2269,7 @@ class SpeculativeGenerationBatch:
         ]
         rope_deltas = getattr(self, "_rope_deltas", None)
         if rope_deltas is not None:
-            batch._rope_deltas = rope_deltas[
-                mx.array(active_slots, dtype=mx.int32)
-            ]
+            batch._rope_deltas = rope_deltas[mx.array(active_slots, dtype=mx.int32)]
 
         if self._sent_first:
             # Append the already-emitted bonus token and prepare its successor.
@@ -2877,7 +2864,10 @@ class PromptProcessingBatch:
             )
             if embedding_phase_swap is not None:
                 residency = getattr(self.model, "phase_residency_manager", None)
-                if residency is not None and residency.contains("input_embedding") is True:
+                if (
+                    residency is not None
+                    and residency.contains("input_embedding") is True
+                ):
                     residency.unload_if_idle("input_embedding")
                 else:
                     embedding_phase_swap.unload()
@@ -2912,8 +2902,7 @@ class PromptProcessingBatch:
             **self._speculative_prefill.kwargs,
         }
         skip_logits = bool(
-            getattr(self.model, "supports_skip_logits", False)
-            and not finished_rows
+            getattr(self.model, "supports_skip_logits", False) and not finished_rows
         )
         phase_swap = getattr(self.model, "prefill_head_phase_swap", None)
         residency = getattr(self.model, "phase_residency_manager", None)
@@ -2933,9 +2922,7 @@ class PromptProcessingBatch:
                     residency.acquire("lm_head", "prompt_logits")
                     prompt_logits_owner = True
                 else:
-                    prompt_logits_owner = not bool(
-                        getattr(phase_swap, "loaded", False)
-                    )
+                    prompt_logits_owner = not bool(getattr(phase_swap, "loaded", False))
                     phase_swap.load()
         if any(self._cached_tokens_per_row):
             _reserve_warm_prompt_capacity(
@@ -3044,10 +3031,7 @@ class PromptProcessingBatch:
         phase_swap = getattr(self.model, "prefill_head_phase_swap", None)
         if phase_swap is not None:
             residency = getattr(self.model, "phase_residency_manager", None)
-            if (
-                residency is not None
-                and residency.contains("lm_head") is True
-            ):
+            if residency is not None and residency.contains("lm_head") is True:
                 residency.acquire("lm_head", "generation")
             else:
                 phase_swap.load()
@@ -3687,8 +3671,7 @@ class BatchGenerator:
             "prefix_has_media": lambda pl: self._apc_prefix_has_media_tokens(
                 ids_list, pl
             ),
-            "defer_paged_q4": getattr(self, "_paged_cache_factory", None)
-            is not None,
+            "defer_paged_q4": getattr(self, "_paged_cache_factory", None) is not None,
         }
         if coordinator is not None:
             return coordinator.lookup(ids_list, **lookup_kwargs)
@@ -4278,7 +4261,8 @@ class BatchGenerator:
                         not len(self._generation_batch)
                         or self._prefill_schedule_interval <= 1
                         or self._decode_prefill_cadence_step
-                        % self._prefill_schedule_interval == 0
+                        % self._prefill_schedule_interval
+                        == 0
                     )
                 )
                 return prompt_responses, generation_responses
@@ -4301,9 +4285,7 @@ class BatchGenerator:
         if (
             len(self._generation_batch) > 0
             and self._prefill_schedule_interval > 1
-            and self._decode_prefill_cadence_step
-            % self._prefill_schedule_interval
-            != 0
+            and self._decode_prefill_cadence_step % self._prefill_schedule_interval != 0
         ):
             return prompt_responses, generation_responses
 

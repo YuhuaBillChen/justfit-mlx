@@ -71,11 +71,17 @@ def test_lazy_drafter_rejects_a_changed_resolved_kind():
 
 
 def test_lifetime_statistics_survive_unload_and_repromotion(monkeypatch):
-    from mlx_vlm.speculative.common import speculative_stats_snapshot, speculative_stats_since
+    from mlx_vlm.speculative.common import (
+        speculative_stats_since,
+        speculative_stats_snapshot,
+    )
 
     monkeypatch.setattr("mlx_vlm.server.draft_lifecycle.mx.clear_cache", lambda: None)
     lazy = LazyDrafter(
-        path="unused", kind="mtp", config=None, target_model=None,
+        path="unused",
+        kind="mtp",
+        config=None,
+        target_model=None,
         loader=lambda *args: (SimpleNamespace(), "mtp"),
         validator=lambda *args: None,
     )

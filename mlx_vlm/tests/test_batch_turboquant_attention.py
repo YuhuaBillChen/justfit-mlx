@@ -21,7 +21,6 @@ from mlx_vlm.turboquant import (
     TurboQuantKVCache,
     _contiguous_batch_slice,
     _should_eval_cache_append,
-    _TurboQuantAttentionMixin,
 )
 
 H, D = 4, 64  # kv heads, head_dim
@@ -218,9 +217,7 @@ class TestSegmentedBatchStorage:
         )
 
         def make_cache():
-            return _make_cache(
-                model, [0], kv_bits=4, kv_quant_scheme="turboquant"
-            )
+            return _make_cache(model, [0], kv_bits=4, kv_quant_scheme="turboquant")
 
         active, pending = make_cache(), make_cache()
         active_out = model(mx.array([[1, 2, 3, 4]]), cache=active)

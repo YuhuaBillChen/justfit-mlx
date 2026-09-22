@@ -1,11 +1,11 @@
 """Cohort retirement must precede component/dependency reclamation."""
 
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
-import weakref
 
-import pytest
 import mlx.core as mx
+import pytest
 
 from mlx_vlm.generate.ar import (
     BatchGenerator,
@@ -25,8 +25,11 @@ def managed_batch(monkeypatch):
     manager.register("lm_head", head)
     manager.register("input_embedding", embedding, retain_on_release=True)
     lazy = LazyDrafter(
-        path="unused", kind="mtp", config=None,
-        loader=lambda *args: (Mock(spec=[]), "mtp"), validator=lambda *args: None,
+        path="unused",
+        kind="mtp",
+        config=None,
+        loader=lambda *args: (Mock(spec=[]), "mtp"),
+        validator=lambda *args: None,
         target_model=None,
     )
     manager.register("mtp_drafter", lazy, dependencies=("input_embedding", "lm_head"))
@@ -46,8 +49,10 @@ def test_drafter_alias_dropped_before_last_owner_unload(monkeypatch):
     loaded_ref = weakref.ref(batch.draft_model)
     manager.acquire("lm_head", "generation")
     rounds = Mock()
+
     def assert_loaded():
         assert lazy.loaded
+
     rounds.close.side_effect = assert_loaded
     batch._rounds_iter = rounds
     batch.release_drafter()
@@ -102,9 +107,11 @@ def test_close_releases_drafter_before_head_and_keeps_embedding(monkeypatch):
     generator = object.__new__(BatchGenerator)
     generator.model = batch.model
     generator._generation_batch = batch
+
     def assert_detached():
         assert not lazy.loaded
         assert batch.draft_model is lazy
+
     head.unload.side_effect = assert_detached
     generator.close()
     head.unload.assert_called_once_with()
@@ -150,9 +157,14 @@ def test_warm_spill_uses_embedding_lease_guard(monkeypatch, decode_active):
     model.prefill_head_phase_swap = None
     model.supports_skip_logits = True
     batch = PromptProcessingBatch(
-        model=model, uids=[1], input_ids=[[1, 2, 3]], max_tokens=[1],
-        inputs_embeds=mx.ones((1, 3, 4)), prompt_kwargs={},
-        prefill_step_size=2, warm_cache=[SimpleNamespace(state=mx.array([1]))],
+        model=model,
+        uids=[1],
+        input_ids=[[1, 2, 3]],
+        max_tokens=[1],
+        inputs_embeds=mx.ones((1, 3, 4)),
+        prompt_kwargs={},
+        prefill_step_size=2,
+        warm_cache=[SimpleNamespace(state=mx.array([1]))],
     )
     # Constructor spill has finished and temporary providers have retired.
     batch._embedding_phase_swap_pending = True
@@ -171,9 +183,11 @@ def test_new_request_restores_embedding_after_cancelled_spill():
     server.component_residency = manager
     server.vision_cache = None
     server.model = Mock()
+
     def get_embeddings(*args, **kwargs):
         assert state["loaded"]
         return SimpleNamespace(to_dict=lambda: {}, input_embedding_provider=None)
+
     server.model.get_input_embeddings.side_effect = get_embeddings
     server._gpu_embed({"input_ids": mx.array([[1]])})
     embedding.load.assert_called_once_with()

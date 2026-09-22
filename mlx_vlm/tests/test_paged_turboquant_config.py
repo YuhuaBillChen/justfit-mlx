@@ -11,7 +11,6 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest.mock import patch
 
-
 _spec = importlib.util.spec_from_file_location(
     "_paged_config_under_test",
     Path(__file__).resolve().parents[1] / "paged_turboquant_config.py",
@@ -42,12 +41,17 @@ class TestPagedTurboQuantConfig(unittest.TestCase):
         self.assertEqual(config, Config("direct_inverse", True, True, 2))
 
     def test_empty_legacy_values_preserve_disabled_behavior(self):
-        self.assertEqual(Config.from_env({
-            "MLX_VLM_PAGED_PREFILL_IMPL": "",
-            "MLX_VLM_PAGED_PREFILL_EAGER_RELEASE": "",
-            "MLX_VLM_TQ_MTP_QTILE": "",
-            "MLX_VLM_PAGED_PREFILL_KV_HEAD_GROUP_SIZE": "",
-        }), Config())
+        self.assertEqual(
+            Config.from_env(
+                {
+                    "MLX_VLM_PAGED_PREFILL_IMPL": "",
+                    "MLX_VLM_PAGED_PREFILL_EAGER_RELEASE": "",
+                    "MLX_VLM_TQ_MTP_QTILE": "",
+                    "MLX_VLM_PAGED_PREFILL_KV_HEAD_GROUP_SIZE": "",
+                }
+            ),
+            Config(),
+        )
 
     def test_invalid_environment_fails_before_execution(self):
         for name in (

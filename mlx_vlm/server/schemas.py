@@ -515,18 +515,12 @@ class GenerationTimings(BaseModel):
             draft_rounds=getattr(metrics, "draft_rounds", None),
             draft_n=getattr(metrics, "draft_n", None),
             draft_n_accepted=getattr(metrics, "draft_n_accepted", None),
-            capacity_exhausted=bool(
-                getattr(metrics, "capacity_exhausted", False)
-            ),
-            guaranteed_output_tokens=getattr(
-                metrics, "guaranteed_output_tokens", None
-            ),
+            capacity_exhausted=bool(getattr(metrics, "capacity_exhausted", False)),
+            guaranteed_output_tokens=getattr(metrics, "guaranteed_output_tokens", None),
             elastic_output_tokens=int(
                 getattr(metrics, "elastic_output_tokens", 0) or 0
             ),
-            capacity_wait_ms=float(
-                getattr(metrics, "capacity_wait_ms", 0.0) or 0.0
-            ),
+            capacity_wait_ms=float(getattr(metrics, "capacity_wait_ms", 0.0) or 0.0),
         )
 
 

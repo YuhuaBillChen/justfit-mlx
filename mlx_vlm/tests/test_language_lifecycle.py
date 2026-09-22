@@ -75,12 +75,8 @@ def test_mxfp4_components_restore_none_biases_sentinel(monkeypatch, tmp_path):
     embedding_path = tmp_path / "embedding.safetensors"
     head_path.touch()
     embedding_path.touch()
-    head = nn.QuantizedLinear(
-        32, 64, bias=False, group_size=32, bits=4, mode="mxfp4"
-    )
-    embedding = nn.QuantizedEmbedding(
-        64, 32, group_size=32, bits=4, mode="mxfp4"
-    )
+    head = nn.QuantizedLinear(32, 64, bias=False, group_size=32, bits=4, mode="mxfp4")
+    embedding = nn.QuantizedEmbedding(64, 32, group_size=32, bits=4, mode="mxfp4")
     language_model = SimpleNamespace(
         lm_head=head, model=SimpleNamespace(embed_tokens=embedding)
     )

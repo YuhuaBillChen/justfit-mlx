@@ -39,7 +39,9 @@ class PagedTurboQuantConfig:
             raise ValueError("prefill_kv_head_group_size must be nonnegative")
 
     @classmethod
-    def from_env(cls, environ: Mapping[str, str] | None = None) -> PagedTurboQuantConfig:
+    def from_env(
+        cls, environ: Mapping[str, str] | None = None
+    ) -> PagedTurboQuantConfig:
         """Snapshot legacy overrides, rejecting typos before allocating a pool.
 
         Boolean overrides accept '0', '1', or an empty value (disabled).

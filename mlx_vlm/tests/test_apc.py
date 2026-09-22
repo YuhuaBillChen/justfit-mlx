@@ -142,9 +142,8 @@ def test_direct_exact_disk_write_roundtrip_is_immediately_visible(
     manager._disk_min_free_ram_bytes = 1
     monkeypatch.setattr(apc_module, "_free_ram_bytes", lambda: 0)
     stats_before = manager.stats_snapshot()
-    assert (
-        manager.peek_exact_prefix_length(token_ids + [999], extra_hash=17)
-        == len(token_ids)
+    assert manager.peek_exact_prefix_length(token_ids + [999], extra_hash=17) == len(
+        token_ids
     )
     assert manager.peek_exact_prefix_length(token_ids + [999], extra_hash=18) == 0
     assert manager.stats_snapshot() == stats_before
@@ -1540,7 +1539,7 @@ def test_exact_cache_large_write_is_bounded_and_roundtrips(tmp_path, monkeypatch
     original = apc_module.mx.save_safetensors
 
     def record_group(path, arrays, **kwargs):
-        if tuple(arrays) != ('dtype',):
+        if tuple(arrays) != ("dtype",):
             calls.append(tuple(arrays))
         return original(path, arrays, **kwargs)
 
@@ -1551,8 +1550,7 @@ def test_exact_cache_large_write_is_bounded_and_roundtrips(tmp_path, monkeypatch
     disk.flush()
     assert len(calls) == 5
     assert all(
-        names and len({name.split("_", 1)[0] for name in names}) == 1
-        for names in calls
+        names and len({name.split("_", 1)[0] for name in names}) == 1 for names in calls
     )
     manager.close()
 
@@ -1566,9 +1564,7 @@ def test_exact_cache_large_write_is_bounded_and_roundtrips(tmp_path, monkeypatch
     _assert_allclose(restored[0][2], recurrent[2])
     _assert_allclose(restored[1].keys[..., : len(token_ids), :], kv.keys)
     assert bool(
-        mx.array_equal(
-            restored[1].values[..., : len(token_ids), :], kv.values
-        ).item()
+        mx.array_equal(restored[1].values[..., : len(token_ids), :], kv.values).item()
     )
     assert restored[1].values.dtype == mx.uint32
     manager.close()
@@ -1593,6 +1589,7 @@ def test_exact_cache_bounded_write_removes_partial_files(tmp_path, monkeypatch):
 
     def fail_second_group(path, arrays, **kwargs):
         from mlx_vlm.apc_single_pass import PayloadSink
+
         if isinstance(path, PayloadSink):
             calls[0] += 1
             if calls[0] == 2:

@@ -280,9 +280,7 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
         )
         helper.key_codec = self.key_codec
         helper.value_codec = self.value_codec
-        quantized_keys, quantized_values = helper._try_fused_kv_quantize(
-            keys, values
-        )
+        quantized_keys, quantized_values = helper._try_fused_kv_quantize(keys, values)
         if quantized_keys is None:
             quantized_keys = self.key_codec.quantize(keys)
             quantized_values = self.value_codec.quantize(values)
@@ -408,10 +406,7 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
             and int(mask.shape[-1]) == self.sequence_lengths[0]
         )
         if not (
-            mask is None
-            or isinstance(mask, str)
-            and mask == "causal"
-            or causal_array
+            mask is None or isinstance(mask, str) and mask == "causal" or causal_array
         ):
             raise ValueError("paged MTP verification supports causal masking only")
         return paged_mse_q4_verify_attention(
@@ -456,9 +451,8 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
             and int(mask.shape[-2]) == query_length
             and int(mask.shape[-1]) == self.sequence_lengths[0]
         )
-        if (
-            self.config.prefill_impl == "direct_inverse"
-            and (isinstance(mask, str) and mask == "causal" or causal_array)
+        if self.config.prefill_impl == "direct_inverse" and (
+            isinstance(mask, str) and mask == "causal" or causal_array
         ):
             if self.storage is None or self.empty():
                 raise ValueError("cannot prefill against an empty paged cache")
@@ -632,9 +626,7 @@ class PagedBatchTurboQuantKVCache(_BaseCache):
             return
         append = self._rows.rows[0].append(token_count)
         try:
-            self.storage.write_append(
-                self._rows.rows[0], append, keys, values
-            )
+            self.storage.write_append(self._rows.rows[0], append, keys, values)
             mx.eval(self.storage.keys, self.storage.values)
         except Exception:
             self._rows.rows[0].rollback(append)

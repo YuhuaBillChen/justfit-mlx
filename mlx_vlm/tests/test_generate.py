@@ -69,17 +69,15 @@ def test_turboquant_decode_reserve_is_layerwise_and_opt_in(monkeypatch):
     ]
 
 
-def test_turboquant_decode_reserve_accepts_fixed_capacity_cache(
-    monkeypatch, caplog
-):
+def test_turboquant_decode_reserve_accepts_fixed_capacity_cache(monkeypatch, caplog):
     class FixedCapacity:
         decode_capacity_is_fixed = True
 
     monkeypatch.setenv("MLX_VLM_TQ_RESERVE_DECODE", "1")
     with caplog.at_level(logging.INFO):
-        assert ar_module._reserve_turboquant_decode_capacity(
-            [FixedCapacity()], 512
-        ) == 0
+        assert (
+            ar_module._reserve_turboquant_decode_capacity([FixedCapacity()], 512) == 0
+        )
     assert "skipped for fixed-capacity caches" in caplog.text
     assert "no cache supports it" not in caplog.text
 
@@ -887,11 +885,14 @@ class TestBatchGenerator:
 
         assert paged.storage is original_storage
         assert paged._rows.rows[0].page_ids == original_pages
-        assert tuple(
-            id(array)
-            for state in (original_storage.keys, original_storage.values)
-            for array in state
-        ) == original_payload_ids
+        assert (
+            tuple(
+                id(array)
+                for state in (original_storage.keys, original_storage.values)
+                for array in state
+            )
+            == original_payload_ids
+        )
         output = model(mx.array([[4], [5]], dtype=mx.int32), cache=active_cache)
         mx.eval(output.logits)
         assert output.logits.shape == (2, 1, config.vocab_size)
@@ -1364,9 +1365,7 @@ class TestBatchGenerator:
             acquire=MagicMock(),
             release=MagicMock(),
         )
-        model = MagicMock(
-            return_value=SimpleNamespace(logits=mx.ones((2, 3, 4)))
-        )
+        model = MagicMock(return_value=SimpleNamespace(logits=mx.ones((2, 3, 4))))
         model.supports_skip_logits = True
         model.prefill_head_phase_swap = phase_swap
         model.phase_residency_manager = residency
@@ -1393,9 +1392,7 @@ class TestBatchGenerator:
         phase_swap.unload.assert_not_called()
         phase_swap.load.assert_not_called()
 
-    def test_prompt_head_phase_swap_respects_active_generation_lease(
-        self, monkeypatch
-    ):
+    def test_prompt_head_phase_swap_respects_active_generation_lease(self, monkeypatch):
         cache_state = mx.array([1])
         phase_swap = SimpleNamespace(unload=MagicMock(), load=MagicMock())
         residency = SimpleNamespace(
@@ -1491,6 +1488,7 @@ class TestBatchGenerator:
         assert response.uid == 0
         assert response.token == 42
         assert response.finish_reason == "stop"
+
     def test_generation_batch_applies_per_sequence_logits_processors(self):
         class FixedLogitModel:
             def __call__(self, input_ids, cache=None, **kwargs):
@@ -2038,7 +2036,9 @@ class TestBatchGenerator:
         assert gen._generation_batch.uids == [100, 200]
         assert gen._generation_batch._mtp_repromotion["draft_model"] is draft
         draft.unload.assert_called_once_with()
-        assert "Demoted active MTP cohort to AR before cold peer admission" in caplog.text
+        assert (
+            "Demoted active MTP cohort to AR before cold peer admission" in caplog.text
+        )
         gen.close()
 
     def test_close_returns_rows_without_releasing_server_owned_paged_pool(self):
@@ -2179,17 +2179,29 @@ class TestBatchGenerator:
         assert active.thinking_budget_criteria == [active_criteria, pending_criteria]
         assert [(r.uid, r.token) for r in active.next()] == [(100, 3), (200, 9)]
 
-    @pytest.mark.parametrize("seed", [
-        0, 1,
-        pytest.param(56, marks=pytest.mark.xfail(
-            strict=True, raises=AssertionError,
-            reason="Existing production tiny-Qwen staggered divergence at seed 56",
-        )),
-        pytest.param(96, marks=pytest.mark.xfail(
-            strict=True, raises=AssertionError,
-            reason="Existing production tiny-Qwen staggered divergence at seed 96",
-        )),
-    ])
+    @pytest.mark.parametrize(
+        "seed",
+        [
+            0,
+            1,
+            pytest.param(
+                56,
+                marks=pytest.mark.xfail(
+                    strict=True,
+                    raises=AssertionError,
+                    reason="Existing production tiny-Qwen staggered divergence at seed 56",
+                ),
+            ),
+            pytest.param(
+                96,
+                marks=pytest.mark.xfail(
+                    strict=True,
+                    raises=AssertionError,
+                    reason="Existing production tiny-Qwen staggered divergence at seed 96",
+                ),
+            ),
+        ],
+    )
     def test_tiny_qwen_mtp_staggered_join_matches_singletons(self, seed):
         import mlx_vlm.models.qwen3_5.language as qwen_language
         from mlx_vlm.speculative.drafters.qwen3_5_mtp import (
@@ -2339,12 +2351,11 @@ class TestBatchGenerator:
         for uid, tokens in drain(promoted).items():
             transitioned_tokens.setdefault(uid, []).extend(tokens)
 
-        assert transitioned_tokens[210] == drain(
-            make_batch(210, [1, 2, 3, 4], 12)
-        )[210]
-        assert transitioned_tokens[220] == drain(
-            make_ar_batch(220, [5, 6, 7, 8, 9], 3)
-        )[220]
+        assert transitioned_tokens[210] == drain(make_batch(210, [1, 2, 3, 4], 12))[210]
+        assert (
+            transitioned_tokens[220]
+            == drain(make_ar_batch(220, [5, 6, 7, 8, 9], 3))[220]
+        )
 
         # A short row must be removed from the target/drafter cache before a
         # later request joins the still-active row.
@@ -2381,15 +2392,14 @@ class TestBatchGenerator:
         for uid, tokens in drain(three_way).items():
             three_way_tokens.setdefault(uid, []).extend(tokens)
 
-        assert three_way_tokens[600] == drain(
-            make_batch(600, [20, 21, 22, 23], 12)
-        )[600]
-        assert three_way_tokens[700] == drain(
-            make_batch(700, [24, 25, 26], 10)
-        )[700]
-        assert three_way_tokens[800] == drain(
-            make_batch(800, [27, 28, 29, 30, 31], 8)
-        )[800]
+        assert (
+            three_way_tokens[600] == drain(make_batch(600, [20, 21, 22, 23], 12))[600]
+        )
+        assert three_way_tokens[700] == drain(make_batch(700, [24, 25, 26], 10))[700]
+        assert (
+            three_way_tokens[800]
+            == drain(make_batch(800, [27, 28, 29, 30, 31], 8))[800]
+        )
 
     @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
     def test_tiny_qwen_singleton_mtp_stays_page_native(self, monkeypatch):
@@ -2494,9 +2504,7 @@ class TestBatchGenerator:
 
         storage = paged.storage
         payload_ids = tuple(
-            id(array)
-            for state in (storage.keys, storage.values)
-            for array in state
+            id(array) for state in (storage.keys, storage.values) for array in state
         )
         first_pages = paged._rows.rows[0].page_ids
         active_ar = batch.to_autoregressive()
@@ -2529,18 +2537,17 @@ class TestBatchGenerator:
 
         joined_paged = active_ar.prompt_cache[1]
         assert joined_paged.storage is storage
-        assert tuple(
-            id(array)
-            for state in (storage.keys, storage.values)
-            for array in state
-        ) == payload_ids
+        assert (
+            tuple(
+                id(array) for state in (storage.keys, storage.values) for array in state
+            )
+            == payload_ids
+        )
         assert joined_paged._rows.rows[0].page_ids == first_pages
         assert joined_paged.batch_size == 2
         responses = active_ar.next()
         assert {response.uid for response in responses} == {900, 901}
-        peer_response = next(
-            response for response in responses if response.uid == 901
-        )
+        peer_response = next(response for response in responses if response.uid == 901)
         assert peer_response.finish_reason == "length"
         assert active_ar.uids == [900]
 

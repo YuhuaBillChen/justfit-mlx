@@ -215,8 +215,10 @@ def test_real_qwen_layers_constraints_survive_mtp_ar_mtp(transition, greedy):
 
 def test_real_llguidance_json_with_mtp():
     import json
+
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
+
     from mlx_vlm.generate.ar import PromptProcessingBatch, SpeculativeGenerationBatch
     from mlx_vlm.structured import build_json_schema_logits_processor
 
@@ -335,6 +337,7 @@ def test_real_qwen_rows_finish_independently():
 @pytest.mark.parametrize("kind", ["mtp", "dflash", "eagle3"])
 def test_server_accepts_processors_only_for_supported_drafter(kind):
     from unittest.mock import Mock
+
     from mlx_vlm.server.generation import GenerationArguments, ResponseGenerator
 
     gen = ResponseGenerator.__new__(ResponseGenerator)
@@ -403,6 +406,7 @@ def test_thinking_budget_and_processor_keep_full_forced_sequence():
 @pytest.mark.parametrize("cadence", [1, 4])
 def test_immediate_processor_yield_resumes_due_prefill(cadence):
     from unittest.mock import Mock
+
     from mlx_vlm.generate.ar import BatchGenerator
 
     class Decode:

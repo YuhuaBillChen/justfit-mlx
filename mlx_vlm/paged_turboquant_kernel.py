@@ -695,8 +695,7 @@ def _singleton_paged_mse_verify_qtile_kernel(
             ]
         )
         score = "\n                    + ".join(
-            f"query_{query_idx}[{i}] * key_value_{i}"
-            for i in range(elems_per_lane)
+            f"query_{query_idx}[{i}] * key_value_{i}" for i in range(elems_per_lane)
         )
         value_updates = "\n".join(
             f"                output_{query_idx}[{i}] = output_{query_idx}[{i}] * factor_{query_idx} + exp_score_{query_idx} * value_{i} * value_norm;"
@@ -1098,12 +1097,8 @@ def paged_mse_q4_verify_attention(
         raise ValueError("verification cache is shorter than the query tile")
 
     repeats = query_heads // kv_heads
-    grouped = (queries * scale).reshape(
-        1, kv_heads, repeats, query_length, dim
-    )
-    q_rot = key_codec.prepare_queries(grouped).reshape(
-        query_heads * query_length, dim
-    )
+    grouped = (queries * scale).reshape(1, kv_heads, repeats, query_length, dim)
+    q_rot = key_codec.prepare_queries(grouped).reshape(query_heads * query_length, dim)
     kernel = _singleton_paged_mse_verify_qtile_kernel(4, 4, dim, page_size)
     if kernel is None:
         raise RuntimeError("paged Q4 verification kernel is unavailable")
@@ -1191,9 +1186,7 @@ def paged_mse_q4_decode_attention(
             num_blocks = 256
         else:
             num_blocks = 512
-        singleton_pass1 = _singleton_paged_mse_decode_pass1_kernel(
-            4, 4, dim, page_size
-        )
+        singleton_pass1 = _singleton_paged_mse_decode_pass1_kernel(4, 4, dim, page_size)
         singleton_pass2 = _singleton_paged_mse_decode_pass2_kernel()
         if singleton_pass1 is not None and singleton_pass2 is not None:
             acc_shape = (query_heads * num_blocks, dim)
@@ -1239,9 +1232,7 @@ def paged_mse_q4_decode_attention(
     # parallelism.  Keep a fixed split-K fan-out for multi-row decode so short
     # and ragged batches do not under-fill the device merely because P=256.
     num_blocks = 128
-    batched_pass1 = _batched_split_paged_mse_decode_pass1_kernel(
-        4, 4, dim, page_size
-    )
+    batched_pass1 = _batched_split_paged_mse_decode_pass1_kernel(4, 4, dim, page_size)
     split_pass2 = _singleton_paged_mse_decode_pass2_kernel()
     if batched_pass1 is not None and split_pass2 is not None:
         total_heads = batch * query_heads

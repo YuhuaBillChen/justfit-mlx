@@ -1574,9 +1574,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     # user message. URLs/data remain out of the rendered prompt.
                     msg["content"] = list(image_markers)
                     if text_content:
-                        msg["content"].append(
-                            {"type": "text", "text": text_content}
-                        )
+                        msg["content"].append({"type": "text", "text": text_content})
                 else:
                     msg["content"] = text_content
             else:

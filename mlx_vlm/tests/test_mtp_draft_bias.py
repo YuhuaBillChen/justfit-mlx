@@ -6,8 +6,8 @@ import mlx.core as mx
 import pytest
 
 from mlx_vlm.sample_utils import make_logits_processors
-from mlx_vlm.speculative.mtp import _DraftBiasSampler
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.qwen3_5_mtp import Qwen3_5MTPDraftModel
+from mlx_vlm.speculative.mtp import _DraftBiasSampler
 
 
 def bias(token):
@@ -38,7 +38,9 @@ def test_row_filter_and_rowwise_drafting_keep_request_bias():
     sampler = _DraftBiasSampler(lambda x: mx.argmax(x, axis=-1), [bias(2), bias(1)])
     logits = mx.array([[[0.0, 5.0, 10.0]], [[0.0, 10.0, 5.0]]])
     assert sampler.sample_draft(logits, greedy=True).tolist() == [[1], [2]]
-    assert sampler.select_rows([1]).sample_draft(logits[1:], greedy=True).tolist() == [[2]]
+    assert sampler.select_rows([1]).sample_draft(logits[1:], greedy=True).tolist() == [
+        [2]
+    ]
     # Normal/target invocation must retain its original distribution.
     assert sampler(logits).tolist() == [[2], [1]]
 
@@ -78,14 +80,25 @@ def test_real_qwen_proposals_follow_target_bias(monkeypatch, transition):
         return tokens
 
     monkeypatch.setattr(Qwen3_5MTPDraftModel, "draft_block", capture)
-    processors = make_logits_processors(logit_bias={i: -10000 for i in range(32) if i != 7})
+    processors = make_logits_processors(
+        logit_bias={i: -10000 for i in range(32) if i != 7}
+    )
     prompt = PromptProcessingBatch(
-        model=target, uids=[0], input_ids=[[1, 6, 7]], max_tokens=[12],
-        inputs_embeds=None, prompt_kwargs={}, logits_processors=[processors],
-        draft_model=draft, draft_kind="mtp", draft_block_size=3,
+        model=target,
+        uids=[0],
+        input_ids=[[1, 6, 7]],
+        max_tokens=[12],
+        inputs_embeds=None,
+        prompt_kwargs={},
+        logits_processors=[processors],
+        draft_model=draft,
+        draft_kind="mtp",
+        draft_block_size=3,
         greedy_sampling=True,
     )
-    batch = prompt.generate(lambda x: mx.argmax(x, axis=-1), lambda t: False, compute_logprobs=False)
+    batch = prompt.generate(
+        lambda x: mx.argmax(x, axis=-1), lambda t: False, compute_logprobs=False
+    )
     output = [r.token for r in batch.next()]
     output.extend(r.token for r in batch.next())
     if transition:
@@ -120,9 +133,7 @@ def test_real_qwen_compaction_keeps_per_request_bias(monkeypatch):
 
     monkeypatch.setattr(Qwen3_5MTPDraftModel, "draft_block", capture)
     processors = [
-        make_logits_processors(
-            logit_bias={i: -10000 for i in range(32) if i != token}
-        )
+        make_logits_processors(logit_bias={i: -10000 for i in range(32) if i != token})
         for token in (7, 9)
     ]
     prompt = PromptProcessingBatch(

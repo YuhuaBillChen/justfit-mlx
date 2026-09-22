@@ -29,7 +29,7 @@ from weakref import WeakSet
 
 import mlx.core as mx
 
-from .paged_turboquant import PagePoolSpec, PagePoolStats, PagedPoolSet
+from .paged_turboquant import PagedPoolSet, PagePoolSpec, PagePoolStats
 from .paged_turboquant_cache import PagedBatchTurboQuantKVCache
 from .paged_turboquant_config import PagedTurboQuantConfig
 from .paged_turboquant_kernel import (
@@ -56,10 +56,7 @@ class PagedTurboQuantLayerSpec:
     index_dtype: object = mx.uint32
 
     def __post_init__(self) -> None:
-        if (
-            int(self.capacity_pages) != self.capacity_pages
-            or self.capacity_pages <= 0
-        ):
+        if int(self.capacity_pages) != self.capacity_pages or self.capacity_pages <= 0:
             raise ValueError("capacity_pages must be positive")
         if int(self.kv_heads) != self.kv_heads or self.kv_heads <= 0:
             raise ValueError("kv_heads must be positive")
@@ -437,9 +434,7 @@ class PagedTurboQuantPoolRegistry:
                 capacity_layer_pages=sum(value.capacity_pages for value in values),
                 used_layer_pages=sum(value.used_pages for value in values),
                 free_layer_pages=sum(value.free_pages for value in values),
-                high_water_layer_pages=sum(
-                    value.high_water_pages for value in values
-                ),
+                high_water_layer_pages=sum(value.high_water_pages for value in values),
                 used_token_slots=sum(
                     value.used_pages * value.page_size for value in values
                 ),

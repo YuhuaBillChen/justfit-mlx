@@ -31,10 +31,7 @@ from ..generate import (  # noqa: F401 - compatibility re-exported by server.__i
     BatchGenerator,
     _make_cache,
 )
-from ..generate.common import (
-    DEFAULT_COMPLETION_BATCH_SIZE,
-    DEFAULT_PREFILL_BATCH_SIZE,
-)
+from ..generate.common import DEFAULT_COMPLETION_BATCH_SIZE, DEFAULT_PREFILL_BATCH_SIZE
 from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
@@ -264,9 +261,7 @@ def get_paged_scheduler_scan_limit() -> int:
     try:
         value = int(raw)
     except ValueError:
-        logger.warning(
-            "Invalid MLX_VLM_PAGED_SCHEDULER_SCAN_LIMIT=%r; using 32.", raw
-        )
+        logger.warning("Invalid MLX_VLM_PAGED_SCHEDULER_SCAN_LIMIT=%r; using 32.", raw)
         return 32
     return max(1, value)
 
@@ -276,9 +271,7 @@ def get_paged_scheduler_max_bypass() -> int:
     try:
         value = int(raw)
     except ValueError:
-        logger.warning(
-            "Invalid MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS=%r; using 8.", raw
-        )
+        logger.warning("Invalid MLX_VLM_PAGED_SCHEDULER_MAX_BYPASS=%r; using 8.", raw)
         return 8
     return max(0, value)
 
@@ -349,8 +342,7 @@ def make_paged_turboquant_registry(language_model):
     # hidden_size/num_heads, which is not the configured Q/K/V head width for
     # models such as 5120/24 with explicit head_dim=256. Prefer model config.
     head_dim = int(
-        getattr(model_args, "head_dim", 0)
-        or getattr(language_model, "head_dim", 0)
+        getattr(model_args, "head_dim", 0) or getattr(language_model, "head_dim", 0)
     )
     kv_heads = int(
         getattr(
@@ -362,9 +354,7 @@ def make_paged_turboquant_registry(language_model):
     layout = language_model.make_cache()
     specs = {
         index: PagedTurboQuantLayerSpec(
-            capacity_pages=(
-                capacity_tokens + PAGED_TURBOQUANT_PAGE_SIZE - 1
-            )
+            capacity_pages=(capacity_tokens + PAGED_TURBOQUANT_PAGE_SIZE - 1)
             // PAGED_TURBOQUANT_PAGE_SIZE,
             kv_heads=kv_heads,
             head_dim=head_dim,
@@ -1173,17 +1163,14 @@ class GenerationMetrics:
         if draft_n is not None:
             self.draft_n = int(draft_n)
         self.capacity_exhausted = bool(
-            self.capacity_exhausted
-            or getattr(result, "capacity_exhausted", False)
+            self.capacity_exhausted or getattr(result, "capacity_exhausted", False)
         )
         guaranteed = getattr(result, "guaranteed_output_tokens", None)
         if guaranteed is not None:
             self.guaranteed_output_tokens = int(guaranteed)
         elastic = getattr(result, "elastic_output_tokens", None)
         if elastic is not None:
-            self.elastic_output_tokens = max(
-                self.elastic_output_tokens, int(elastic)
-            )
+            self.elastic_output_tokens = max(self.elastic_output_tokens, int(elastic))
         wait_ms = getattr(result, "capacity_wait_ms", None)
         if wait_ms is not None:
             self.capacity_wait_ms = max(self.capacity_wait_ms, float(wait_ms))
@@ -1485,9 +1472,7 @@ class ResponseGenerator:
                 # tokenizer's own EOS token. Capacity qualification needs an
                 # actually empty predicate so generation reaches max_tokens.
                 stopping_criteria.eos_token_ids = []
-            logger.warning(
-                "Capacity benchmark mode enabled: EOS stopping is disabled."
-            )
+            logger.warning("Capacity benchmark mode enabled: EOS stopping is disabled.")
 
         draft_model = None
         draft_kind = self.draft_kind_override or os.environ.get("MLX_VLM_DRAFT_KIND")
@@ -1568,9 +1553,7 @@ class ResponseGenerator:
         )
         if vision_component:
             self.vision_phase_swap = VisionTowerPhaseSwap(model, vision_component)
-            self.component_residency.register(
-                "vision_tower", self.vision_phase_swap
-            )
+            self.component_residency.register("vision_tower", self.vision_phase_swap)
         language_head_component = os.environ.get(
             "MLX_VLM_LANGUAGE_HEAD_PHASE_SWAP_PATH"
         )
@@ -1592,10 +1575,13 @@ class ResponseGenerator:
                 language_model, embedding_component
             )
             self.component_residency.register(
-                "input_embedding", language_model.prefill_embedding_phase_swap,
+                "input_embedding",
+                language_model.prefill_embedding_phase_swap,
                 retain_on_release=True,
             )
-        vision_embedding_component = os.environ.get("MLX_VLM_VISION_EMBEDDING_SWAP_PATH")
+        vision_embedding_component = os.environ.get(
+            "MLX_VLM_VISION_EMBEDDING_SWAP_PATH"
+        )
         if vision_embedding_component and not embedding_component:
             if getattr(config, "model_type", None) != "qwen3_5":
                 raise ValueError("Vision-only embedding swap requires Qwen3.5.")
@@ -1606,11 +1592,14 @@ class ResponseGenerator:
             )
         if isinstance(draft_model, LazyDrafter):
             dependencies = tuple(
-                name for name in ("input_embedding", "lm_head")
+                name
+                for name in ("input_embedding", "lm_head")
                 if self.component_residency.contains(name)
             )
             self.component_residency.register(
-                "mtp_drafter", draft_model, dependencies=dependencies,
+                "mtp_drafter",
+                draft_model,
+                dependencies=dependencies,
             )
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
@@ -2122,7 +2111,9 @@ class ResponseGenerator:
                     features = encode_features(
                         pixel_values,
                         data_kwargs.get("image_grid_thw"),
-                        batch_size=_get_nonnegative_env_int("MLX_VLM_VISION_IMAGE_BATCH_SIZE"),
+                        batch_size=_get_nonnegative_env_int(
+                            "MLX_VLM_VISION_IMAGE_BATCH_SIZE"
+                        ),
                     )
                     mx.eval(features)
                     mx.synchronize()
@@ -2423,11 +2414,7 @@ class ResponseGenerator:
         """
 
         residency = getattr(self, "component_residency", None)
-        if (
-            not pending
-            or residency is None
-            or not residency.contains("lm_head")
-        ):
+        if not pending or residency is None or not residency.contains("lm_head"):
             return list(pending), []
 
         limit = get_lm_head_mixed_prefill_max_tokens()
@@ -2472,9 +2459,7 @@ class ResponseGenerator:
         """Estimate model-prefill work after an exact APC prefix match."""
         prompt_tokens = max(0, int(getattr(request, "prompt_tokens", 0) or 0))
         if getattr(request, "apc_prefix_probe_done", False):
-            prefix_tokens = int(
-                getattr(request, "apc_prefix_tokens_hint", 0) or 0
-            )
+            prefix_tokens = int(getattr(request, "apc_prefix_tokens_hint", 0) or 0)
             return max(0, prompt_tokens - prefix_tokens)
 
         request.apc_prefix_probe_done = True
@@ -2495,9 +2480,7 @@ class ResponseGenerator:
             if hasattr(input_ids, "reshape"):
                 input_ids = input_ids.reshape(-1)
             token_ids = (
-                input_ids.tolist()
-                if hasattr(input_ids, "tolist")
-                else list(input_ids)
+                input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
             )
             if token_ids and isinstance(token_ids[0], (list, tuple)):
                 token_ids = [token for row in token_ids for token in row]
@@ -2586,8 +2569,7 @@ class ResponseGenerator:
             return []
         usable = max(
             0,
-            int(capacity)
-            - self._page_round_tokens(get_paged_kv_safety_tokens()),
+            int(capacity) - self._page_round_tokens(get_paged_kv_safety_tokens()),
         )
         budgets = {
             uid: self._page_round_tokens(
@@ -2615,9 +2597,7 @@ class ResponseGenerator:
                 eligible,
                 key=lambda uid: (
                     int(active[uid].get("generated_tokens", 0) or 0)
-                    - int(
-                        active[uid].get("guaranteed_output_tokens", 0) or 0
-                    ),
+                    - int(active[uid].get("guaranteed_output_tokens", 0) or 0),
                     float(active[uid].get("queued_at", 0.0) or 0.0),
                 ),
             )
@@ -2625,9 +2605,7 @@ class ResponseGenerator:
             del budgets[victim]
         return victims
 
-    def _finish_elastic_capacity_victims(
-        self, batch_gen, active: dict
-    ) -> list[int]:
+    def _finish_elastic_capacity_victims(self, batch_gen, active: dict) -> list[int]:
         victims = self._elastic_capacity_victims(active)
         for uid in victims:
             info = active.get(uid)
@@ -2658,9 +2636,7 @@ class ResponseGenerator:
                     capacity_exhausted=True,
                     guaranteed_output_tokens=guaranteed,
                     elastic_output_tokens=max(0, generated - guaranteed),
-                    capacity_wait_ms=float(
-                        info.get("capacity_wait_ms", 0.0) or 0.0
-                    ),
+                    capacity_wait_ms=float(info.get("capacity_wait_ms", 0.0) or 0.0),
                 )
             )
             info["rqueue"].put(None)
@@ -2738,9 +2714,7 @@ class ResponseGenerator:
             projected = context_budgets + [request_budget]
             projected_slots = (
                 sum(
-                    (
-                        value + PAGED_TURBOQUANT_PAGE_SIZE - 1
-                    )
+                    (value + PAGED_TURBOQUANT_PAGE_SIZE - 1)
                     // PAGED_TURBOQUANT_PAGE_SIZE
                     * PAGED_TURBOQUANT_PAGE_SIZE
                     for value in projected
@@ -2862,9 +2836,7 @@ class ResponseGenerator:
                     active_count=len(active), max_num_seqs=max_num_seqs
                 )
                 collection_capacity = capacity
-                if paged_scheduler_enabled() and (
-                    capacity is None or capacity > 0
-                ):
+                if paged_scheduler_enabled() and (capacity is None or capacity > 0):
                     collection_capacity = get_paged_scheduler_scan_limit()
                 if (
                     active_batch
@@ -2899,8 +2871,7 @@ class ResponseGenerator:
                     phase_deferral_signature = (
                         len(active),
                         tuple(
-                            self._request_log_id(item)
-                            for item in phase_deferred_items
+                            self._request_log_id(item) for item in phase_deferred_items
                         ),
                     )
                     if phase_deferral_signature != last_phase_deferral_signature:
@@ -2930,9 +2901,11 @@ class ResponseGenerator:
                             len(active),
                             len(new_items),
                             len(deferred_items),
-                            get_paged_kv_capacity_tokens()
-                            if paged_turboquant_enabled()
-                            else get_batch_kv_slot_budget(),
+                            (
+                                get_paged_kv_capacity_tokens()
+                                if paged_turboquant_enabled()
+                                else get_batch_kv_slot_budget()
+                            ),
                         )
                         last_kv_deferral_signature = deferral_signature
                 else:
@@ -3148,19 +3121,17 @@ class ResponseGenerator:
                             (time.perf_counter() - request.queued_at) * 1000.0,
                         ),
                         "prompt_tokens": max(0, int(prompt_tokens)),
-                        "requested_output_tokens": max(
-                            0, int(args.max_tokens or 0)
-                        ),
+                        "requested_output_tokens": max(0, int(args.max_tokens or 0)),
                         "guaranteed_output_tokens": min(
                             max(0, int(args.max_tokens or 0)),
-                            get_paged_output_guarantee_tokens()
-                            if paged_turboquant_enabled()
-                            and get_paged_output_guarantee_tokens() is not None
-                            else max(0, int(args.max_tokens or 0)),
+                            (
+                                get_paged_output_guarantee_tokens()
+                                if paged_turboquant_enabled()
+                                and get_paged_output_guarantee_tokens() is not None
+                                else max(0, int(args.max_tokens or 0))
+                            ),
                         ),
-                        "context_budget_tokens": self._request_context_budget(
-                            request
-                        ),
+                        "context_budget_tokens": self._request_context_budget(request),
                         "spec_snapshot": (
                             speculative_stats_snapshot(self.draft_model)
                             if self.draft_model is not None
@@ -3469,19 +3440,13 @@ class ResponseGenerator:
                     token_count=token_count,
                     emitted_at=emitted_at,
                     capacity_exhausted=False,
-                    guaranteed_output_tokens=info.get(
-                        "guaranteed_output_tokens"
-                    ),
+                    guaranteed_output_tokens=info.get("guaranteed_output_tokens"),
                     elastic_output_tokens=max(
                         0,
                         int(info.get("generated_tokens", 0) or 0)
-                        - int(
-                            info.get("guaranteed_output_tokens", 0) or 0
-                        ),
+                        - int(info.get("guaranteed_output_tokens", 0) or 0),
                     ),
-                    capacity_wait_ms=float(
-                        info.get("capacity_wait_ms", 0.0) or 0.0
-                    ),
+                    capacity_wait_ms=float(info.get("capacity_wait_ms", 0.0) or 0.0),
                 )
             )
 
