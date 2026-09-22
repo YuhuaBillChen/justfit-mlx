@@ -19,9 +19,10 @@ copy each command in order.
 
 ## What you need
 
-- An Apple-silicon Mac with an M3-or-newer chip (M3/M4/M5 family). The fused
-  MTP qtile kernel needs a 1024-thread threadgroup that M1 and M2 reject at the
-  27B head dimension, so this profile does not run on those chips.
+- An Apple-silicon Mac. This profile was tested on an M4 Pro. The fused MTP
+  qtile kernel asks for a 1024-thread threadgroup at the 27B head dimension,
+  and an M1-class GPU refuses it, so M1 is not a supported target. M2 and M3
+  have not been tested.
 - **24 GB unified memory or more.** The published setup was tested on an
   M4 Pro MacBook Pro with 24 GB. A 16 GB Mac is not a supported target for
   this 27B profile.
