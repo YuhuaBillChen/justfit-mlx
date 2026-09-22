@@ -11,9 +11,9 @@ across concurrent requests — inside 24 GiB of unified memory.**
 
 [Paper](https://arxiv.org/abs/2609.17475) ·
 [Project page](https://yuhuabillchen.github.io/mlx-vlm/) ·
-[Quick Start](examples/justfit/quickstart.md) ·
-[Reproduction kit](examples/justfit/README.md) ·
-[Serving guide](docs/justfit-serving.md) ·
+[Quick Start](https://github.com/YuhuaBillChen/justfit-mlx/blob/main/examples/justfit/quickstart.md) ·
+[Reproduction kit](https://github.com/YuhuaBillChen/justfit-mlx/blob/main/examples/justfit/README.md) ·
+[Serving guide](https://github.com/YuhuaBillChen/justfit-mlx/blob/main/docs/justfit-serving.md) ·
 [Pinned components](https://huggingface.co/billchen42/JustFit-Qwen3.8-27B-components)
 
 JustFit is an MLX inference runtime for long-context local serving. Quantizing
@@ -45,7 +45,7 @@ cd justfit-mlx && examples/justfit/run_server.sh
 ```
 
 Start with the 8K+64 smoke profile in the
-[Quick Start](examples/justfit/quickstart.md). Only attempt 240K+16K after
+[Quick Start](https://github.com/YuhuaBillChen/justfit-mlx/blob/main/examples/justfit/quickstart.md). Only attempt 240K+16K after
 verifying the checkpoint, component files, thermal conditions, free disk space,
 and a process-footprint monitor.
 
@@ -80,7 +80,7 @@ In a separate capability protocol, paged TQ4 answered 29/30 AIME 2026 problems
 correctly and generated 696,834 tokens at 15.04 token-weighted tok/s.
 
 Full cohort detail, protocol boundaries, and the source map are in
-[`docs/justfit.md`](docs/justfit.md).
+[`docs/justfit.md`](https://github.com/YuhuaBillChen/justfit-mlx/blob/main/docs/justfit.md).
 
 ## What these numbers do not claim
 
@@ -117,7 +117,7 @@ Prince Canuma, and ships the whole library — every VLM, omni-model, and
 fine-tuning capability upstream provides still works here. Model
 implementations, kernels, and loading paths are upstream's work; JustFit adds
 paged KV execution, component residency, and the serving layer above them. That
-documentation is preserved at [`docs/mlx-vlm-usage.md`](docs/mlx-vlm-usage.md).
+documentation is preserved at [`docs/mlx-vlm-usage.md`](https://github.com/YuhuaBillChen/justfit-mlx/blob/main/docs/mlx-vlm-usage.md).
 
 Please report bugs that reproduce on plain mlx-vlm, without the JustFit runtime,
 to [upstream](https://github.com/Blaizzy/mlx-vlm/issues) rather than here.
@@ -143,4 +143,4 @@ which stays available permanently so published links keep working.
 ## License
 
 MIT. Copyright © 2026 Yuhua Chen, and © 2025 Prince Canuma for the upstream
-mlx-vlm portions. See [LICENSE](LICENSE).
+mlx-vlm portions. See [LICENSE](https://github.com/YuhuaBillChen/justfit-mlx/blob/main/LICENSE).
