@@ -3,6 +3,12 @@
 **Run a 27B model over its full 256K-token context — and share that context
 across concurrent requests — inside 24 GiB of unified memory.**
 
+> Built on [**MLX**](https://github.com/ml-explore/mlx), Apple's array framework
+> for Apple silicon, and [**mlx-vlm**](https://github.com/Blaizzy/mlx-vlm) by
+> Prince Canuma, which this project extends and ships in full. JustFit adds a
+> serving runtime on top of their work; the models, kernels, and loading paths
+> underneath are theirs. See [Built on mlx-vlm](#built-on-mlx-vlm).
+
 [Paper](https://arxiv.org/abs/2609.17475) ·
 [Project page](https://yuhuabillchen.github.io/mlx-vlm/) ·
 [Quick Start](examples/justfit/quickstart.md) ·
@@ -98,10 +104,17 @@ does not claim general paged-attention support for every mlx-vlm model.
 
 ## Built on mlx-vlm
 
-JustFit is a derivative of [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) by
+JustFit runs on [MLX](https://github.com/ml-explore/mlx), Apple's array
+framework for Apple silicon. Its unified-memory model, lazy evaluation, and
+quantization primitives are what make a memory budget something a runtime can
+schedule against at all.
+
+The project is a derivative of [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) by
 Prince Canuma, and ships the whole library — every VLM, omni-model, and
-fine-tuning capability upstream provides still works here. That documentation is
-preserved at [`docs/mlx-vlm-usage.md`](docs/mlx-vlm-usage.md).
+fine-tuning capability upstream provides still works here. Model
+implementations, kernels, and loading paths are upstream's work; JustFit adds
+paged KV execution, component residency, and the serving layer above them. That
+documentation is preserved at [`docs/mlx-vlm-usage.md`](docs/mlx-vlm-usage.md).
 
 Please report bugs that reproduce on plain mlx-vlm, without the JustFit runtime,
 to [upstream](https://github.com/Blaizzy/mlx-vlm/issues) rather than here.
