@@ -3,13 +3,17 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mlx-vlm"
+name = "justfit-mlx"
 dynamic = ["version", "dependencies"]
-description = "MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX."
+description = "JustFit is an MLX inference runtime for long-context local LLM serving, combining compressed KV execution, phase-aware component residency, and state-preserving serving transitions. Built on mlx-vlm."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
+# The import package remains `mlx_vlm`: this is a renamed distribution of a
+# derivative work, not a rewrite. Upstream authorship is retained here and the
+# original copyright notice is retained in LICENSE.
 authors = [
+    {name = "Yuhua Chen"},
     {name = "Prince Canuma", email = "prince.gdt@gmail.com"},
 ]
 classifiers = [
@@ -23,9 +27,11 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Blaizzy/mlx-vlm"
-Repository = "https://github.com/Blaizzy/mlx-vlm"
-Issues = "https://github.com/Blaizzy/mlx-vlm/issues"
+Homepage = "https://github.com/YuhuaBillChen/justfit-mlx"
+Repository = "https://github.com/YuhuaBillChen/justfit-mlx"
+Issues = "https://github.com/YuhuaBillChen/justfit-mlx/issues"
+Paper = "https://arxiv.org/abs/2609.17475"
+Upstream = "https://github.com/Blaizzy/mlx-vlm"
 
 [project.scripts]
 "mlx_vlm.chat_ui" = "mlx_vlm.chat_ui:main"

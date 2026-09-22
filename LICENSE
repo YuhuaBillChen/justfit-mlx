@@ -1,6 +1,11 @@
 MIT License
 
 Copyright © 2025 Prince Canuma
+Copyright © 2026 Yuhua Chen
+
+This project is a derivative work of mlx-vlm (https://github.com/Blaizzy/mlx-vlm)
+by Prince Canuma. The original copyright notice above is retained as required by
+the MIT License and applies to the upstream portions of this software.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
