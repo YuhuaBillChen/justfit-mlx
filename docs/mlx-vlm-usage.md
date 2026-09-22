@@ -8,9 +8,11 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 > project renamed the distribution; see [`../README.md`](../README.md) for
 > JustFit itself.
 >
-> Two things differ from upstream: install with `pip install justfit-mlx`
-> instead of `pip install mlx-vlm` (the import package is still `mlx_vlm`), and
-> features added after the fork point are not included here.
+> Two things differ from upstream: the `pip install mlx-vlm` commands below
+> install upstream's package, not this one — JustFit is not on PyPI yet, so
+> install it from source per [Installation](installation.md) (the import
+> package is still `mlx_vlm`) — and features added upstream after the fork
+> point are not included here.
 
 ## Table of Contents
 - [Installation](#installation)

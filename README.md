@@ -28,13 +28,16 @@ measured peak of 20,357 MiB under a 21,000 MiB fail-closed guard.
 
 ## Install
 
+JustFit is not on PyPI yet — install from source:
+
 ```sh
-pip install justfit-mlx
+git clone https://github.com/YuhuaBillChen/justfit-mlx
+cd justfit-mlx && pip install -e .
 ```
 
-The import package is still `mlx_vlm`, so existing mlx-vlm code keeps working.
+The import package is `mlx_vlm`, so existing mlx-vlm code keeps working.
 
-To reproduce the paper's runs, use the pinned tree rather than the release:
+To reproduce the paper's runs, use the pinned tree instead:
 
 ```sh
 git clone --branch justfit-repro-v4 https://github.com/YuhuaBillChen/mlx-vlm
