@@ -12,6 +12,7 @@ from mlx_vlm.paged_turboquant_kernel import (
     paged_mse_q4_verify_attention,
 )
 from mlx_vlm.paged_turboquant_storage import PagedTurboQuantMSEStorage
+from mlx_vlm.tests.gpu_support import skip_if_threadgroup_refused
 from mlx_vlm.turboquant import TurboQuantKVCache
 
 H_Q = 24
@@ -222,13 +223,11 @@ def test_page_backed_storage_feeds_kernel_without_contiguous_repack():
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
 @pytest.mark.parametrize("query_length", [2, 3, 4])
 @pytest.mark.parametrize("token_count", [PAGE * 2 + 1, PAGE * 16 + 3])
+@skip_if_threadgroup_refused
 def test_singleton_paged_verify_matches_contiguous_qtile(
     monkeypatch, query_length, token_count
 ):
     monkeypatch.setenv("MLX_VLM_TQ_MTP_QTILE", "1")
-    # The default 32 simd groups ask for a 1024-thread threadgroup, which some
-    # Apple GPUs refuse for this kernel at head_dim 256.
-    monkeypatch.setenv("MLX_VLM_TQ_MTP_QTILE_SIMDGROUPS", "8")
     mx.random.seed(7400 + query_length + token_count)
     row = _make_rows([token_count])[0]
     page_count = (token_count + PAGE - 1) // PAGE

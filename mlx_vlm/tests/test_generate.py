@@ -37,6 +37,7 @@ from mlx_vlm.models.cache import (
     PoolingCache,
     RotatingKVCache,
 )
+from mlx_vlm.tests.gpu_support import skip_if_threadgroup_refused
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
@@ -2402,6 +2403,7 @@ class TestBatchGenerator:
         )
 
     @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+    @skip_if_threadgroup_refused
     def test_tiny_qwen_singleton_mtp_stays_page_native(self, monkeypatch):
         import mlx_vlm.models.qwen3_5.language as qwen_language
         from mlx_vlm.paged_turboquant_pool import (
@@ -2414,9 +2416,6 @@ class TestBatchGenerator:
         from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 
         monkeypatch.setenv("MLX_VLM_TQ_MTP_QTILE", "1")
-        # The default 32 simd groups ask for a 1024-thread threadgroup, which
-        # some Apple GPUs refuse for this kernel at head_dim 256.
-        monkeypatch.setenv("MLX_VLM_TQ_MTP_QTILE_SIMDGROUPS", "8")
         config = qwen_language.TextConfig(
             model_type="qwen3_5_text",
             hidden_size=512,

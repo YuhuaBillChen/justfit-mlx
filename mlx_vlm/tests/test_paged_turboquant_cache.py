@@ -7,6 +7,7 @@ from mlx_vlm.models.base import scaled_dot_product_attention
 from mlx_vlm.paged_turboquant_cache import PagedBatchTurboQuantKVCache
 from mlx_vlm.paged_turboquant_config import PagedTurboQuantConfig
 from mlx_vlm.paged_turboquant_kernel import PAGED_TURBOQUANT_PAGE_SIZE
+from mlx_vlm.tests.gpu_support import skip_if_threadgroup_refused
 from mlx_vlm.turboquant import TurboQuantKVCache
 
 H_Q = 24
@@ -301,13 +302,11 @@ def test_direct_inverse_prefill_is_bitwise_with_fragmented_physical_pages(
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
 @pytest.mark.parametrize("query_length", [2, 3, 4])
+@skip_if_threadgroup_refused
 def test_paged_mtp_qtile_dispatch_never_materializes_contiguous_kv(
     monkeypatch, query_length
 ):
     monkeypatch.setenv("MLX_VLM_TQ_MTP_QTILE", "1")
-    # The default 32 simd groups ask for a 1024-thread threadgroup, which some
-    # Apple GPUs refuse for this kernel at head_dim 256.
-    monkeypatch.setenv("MLX_VLM_TQ_MTP_QTILE_SIMDGROUPS", "8")
     mx.random.seed(8105 + query_length)
     keys, values = _kv(PAGE * 2 + 9)
     queries = mx.random.normal((1, H_Q, query_length, D)).astype(mx.bfloat16)
