@@ -37,6 +37,7 @@ from mlx_vlm.models.cache import (
     PoolingCache,
     RotatingKVCache,
 )
+from mlx_vlm.tests.gpu_support import qtile_threadgroup_supported
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
@@ -2401,7 +2402,10 @@ class TestBatchGenerator:
             == drain(make_batch(800, [27, 28, 29, 30, 31], 8))[800]
         )
 
-    @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+    @pytest.mark.skipif(
+        not qtile_threadgroup_supported(),
+        reason="requires an M3-or-newer Apple GPU for the MTP qtile kernel",
+    )
     def test_tiny_qwen_singleton_mtp_stays_page_native(self, monkeypatch):
         import mlx_vlm.models.qwen3_5.language as qwen_language
         from mlx_vlm.paged_turboquant_pool import (

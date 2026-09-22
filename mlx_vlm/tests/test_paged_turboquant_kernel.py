@@ -12,6 +12,7 @@ from mlx_vlm.paged_turboquant_kernel import (
     paged_mse_q4_verify_attention,
 )
 from mlx_vlm.paged_turboquant_storage import PagedTurboQuantMSEStorage
+from mlx_vlm.tests.gpu_support import qtile_threadgroup_supported
 from mlx_vlm.turboquant import TurboQuantKVCache
 
 H_Q = 24
@@ -219,7 +220,10 @@ def test_page_backed_storage_feeds_kernel_without_contiguous_repack():
     assert mx.allclose(actual, expected, rtol=2e-2, atol=2e-2).item()
 
 
-@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+@pytest.mark.skipif(
+    not qtile_threadgroup_supported(),
+    reason="requires an M3-or-newer Apple GPU for the MTP qtile kernel",
+)
 @pytest.mark.parametrize("query_length", [2, 3, 4])
 @pytest.mark.parametrize("token_count", [PAGE * 2 + 1, PAGE * 16 + 3])
 def test_singleton_paged_verify_matches_contiguous_qtile(

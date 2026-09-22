@@ -40,7 +40,7 @@ profile is 64K input + 8K output (73,728 total positions).
 
 ## 1. Install the pinned source
 
-On an Apple-silicon Mac with a working MLX environment:
+On an Apple-silicon Mac with an M3-or-newer chip and a working MLX environment:
 
 ```bash
 git clone https://github.com/YuhuaBillChen/justfit-mlx.git

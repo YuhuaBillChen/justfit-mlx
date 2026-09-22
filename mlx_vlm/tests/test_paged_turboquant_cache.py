@@ -7,6 +7,7 @@ from mlx_vlm.models.base import scaled_dot_product_attention
 from mlx_vlm.paged_turboquant_cache import PagedBatchTurboQuantKVCache
 from mlx_vlm.paged_turboquant_config import PagedTurboQuantConfig
 from mlx_vlm.paged_turboquant_kernel import PAGED_TURBOQUANT_PAGE_SIZE
+from mlx_vlm.tests.gpu_support import qtile_threadgroup_supported
 from mlx_vlm.turboquant import TurboQuantKVCache
 
 H_Q = 24
@@ -299,7 +300,10 @@ def test_direct_inverse_prefill_is_bitwise_with_fragmented_physical_pages(
     assert mx.array_equal(actual, expected).item()
 
 
-@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+@pytest.mark.skipif(
+    not qtile_threadgroup_supported(),
+    reason="requires an M3-or-newer Apple GPU for the MTP qtile kernel",
+)
 @pytest.mark.parametrize("query_length", [2, 3, 4])
 def test_paged_mtp_qtile_dispatch_never_materializes_contiguous_kv(
     monkeypatch, query_length
