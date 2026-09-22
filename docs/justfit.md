@@ -22,11 +22,12 @@ contexts under a fixed unified-memory budget. It coordinates three mechanisms:
   Completed or cancelled requests return page IDs to the resident pool only
   after pending state has been evaluated.
 
-The production entry point is the
-[`production/qwen-paged-continuous-batching`](https://github.com/YuhuaBillChen/mlx-vlm/tree/production/qwen-paged-continuous-batching)
-branch. The immutable `justfit-repro-v4` tag packages the current runtime,
-Quick Start, and result manifests. Every measured cohort records its own source
-commit; results from different cold/warm protocols are not pooled.
+Development happens on `main` in this repository. The immutable
+[`justfit-repro-v4`](https://github.com/YuhuaBillChen/mlx-vlm/tree/justfit-repro-v4/examples/justfit)
+tag in the research fork packages the runtime, Quick Start, and result manifests
+exactly as the paper cites them, and stays available permanently. Every measured
+cohort records its own source commit; results from different cold/warm protocols
+are not pooled.
 
 ## Measured results
 
@@ -142,7 +143,7 @@ checkpoint-side vision representation was quantized differently.
 
 ```bibtex
 @misc{chen2026justfit,
-  title         = {JustFit: 320K-Token Serving for a 27B LLM on a 24 GiB Laptop with Just-in-Time State Management},
+  title         = {JustFit: Just-in-Time State Management for Local LLM Serving},
   author        = {Yuhua Chen},
   year          = {2026},
   eprint        = {2609.17475},

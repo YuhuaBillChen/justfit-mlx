@@ -82,10 +82,16 @@ extra_css:
 
 nav:
     - Home: index.md
+    - JustFit:
+        - Overview and results: justfit.md
+        - Serving guide: justfit-serving.md
+        - Paged runtime quality: paged-runtime-quality.md
+        - Component residency quality: component-residency-quality.md
     - Installation: installation.md
     - CLI Reference: cli_reference.md
     - Examples: examples.md
     - Speculative Decoding: speculative-decoding.md
+    - mlx-vlm usage: mlx-vlm-usage.md
     - Contributing: contributing.md
     - Community Projects: community_projects.md
     - Report Issues: report_issues.md
