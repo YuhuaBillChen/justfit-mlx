@@ -116,16 +116,16 @@ the same source:
 
 ```bash
 cd "$HOME"
-git clone https://github.com/YuhuaBillChen/mlx-vlm.git
-cd mlx-vlm
+git clone https://github.com/YuhuaBillChen/justfit-mlx.git
+cd justfit-mlx
 git checkout justfit-repro-v4
 ```
 
 If you cloned the repository previously, update it instead:
 
 ```bash
-cd "$HOME/mlx-vlm"
-git fetch fork 2>/dev/null || git fetch origin
+cd "$HOME/justfit-mlx"
+git fetch --tags origin
 git checkout justfit-repro-v4
 ```
 
@@ -134,7 +134,7 @@ git checkout justfit-repro-v4
 This keeps JustFit's Python packages separate from the rest of your Mac:
 
 ```bash
-cd "$HOME/mlx-vlm"
+cd "$HOME/justfit-mlx"
 /opt/homebrew/bin/python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -146,7 +146,7 @@ Your Terminal prompt should now begin with `(.venv)`. Whenever you open a new
 Terminal for JustFit, run these two commands again:
 
 ```bash
-cd "$HOME/mlx-vlm"
+cd "$HOME/justfit-mlx"
 source .venv/bin/activate
 ```
 
@@ -155,7 +155,7 @@ source .venv/bin/activate
 These are public downloads; a Hugging Face login is not required:
 
 ```bash
-cd "$HOME/mlx-vlm"
+cd "$HOME/justfit-mlx"
 
 hf download mlx-community/Qwen3.8-27B-mxfp4 \
   --revision 97ab0819817ab1c61d7d39f9169fc71999915641 \
@@ -237,7 +237,7 @@ Keep this first Terminal open. The command uses one serving lane with a
 64K-input + 8K-output envelope:
 
 ```bash
-cd "$HOME/mlx-vlm"
+cd "$HOME/justfit-mlx"
 source .venv/bin/activate
 export JUSTFIT_API_KEY="$(cat "$HOME/.config/justfit/api-key")"
 
@@ -274,7 +274,7 @@ mode, and concurrency must be qualified as one configuration.
 Open a **second Terminal window**, then run:
 
 ```bash
-cd "$HOME/mlx-vlm"
+cd "$HOME/justfit-mlx"
 source .venv/bin/activate
 export JUSTFIT_API_KEY="$(cat "$HOME/.config/justfit/api-key")"
 
@@ -302,7 +302,7 @@ In the Terminal running JustFit, press `Control-C`. Run the same server command
 again, but change `HOST=127.0.0.1` to `HOST=0.0.0.0`:
 
 ```bash
-cd "$HOME/mlx-vlm"
+cd "$HOME/justfit-mlx"
 source .venv/bin/activate
 export JUSTFIT_API_KEY="$(cat "$HOME/.config/justfit/api-key")"
 
@@ -414,12 +414,12 @@ client timeout to at least 1,800 seconds.
 - Return to the tested source at any time:
 
   ```bash
-  cd "$HOME/mlx-vlm"
+  cd "$HOME/justfit-mlx"
   git checkout justfit-repro-v4
   ```
 
-Your model downloads remain in `~/mlx-vlm/justfit-qwen38` and
-`~/mlx-vlm/justfit-components`; checking out the tag does not download them
+Your model downloads remain in `~/justfit-mlx/justfit-qwen38` and
+`~/justfit-mlx/justfit-components`; checking out the tag does not download them
 again.
 
 ## Troubleshooting
@@ -429,7 +429,7 @@ again.
 Reactivate the Python environment:
 
 ```bash
-cd "$HOME/mlx-vlm"
+cd "$HOME/justfit-mlx"
 source .venv/bin/activate
 python -m pip install -U huggingface_hub
 ```

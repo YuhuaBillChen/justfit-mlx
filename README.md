@@ -40,8 +40,8 @@ The import package is `mlx_vlm`, so existing mlx-vlm code keeps working.
 To reproduce the paper's runs, use the pinned tree instead:
 
 ```sh
-git clone --branch justfit-repro-v4 https://github.com/YuhuaBillChen/mlx-vlm
-cd mlx-vlm && examples/justfit/run_server.sh
+git clone --branch justfit-repro-v4 https://github.com/YuhuaBillChen/justfit-mlx
+cd justfit-mlx && examples/justfit/run_server.sh
 ```
 
 Start with the 8K+64 smoke profile in the

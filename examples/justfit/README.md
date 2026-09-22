@@ -43,8 +43,8 @@ profile is 64K input + 8K output (73,728 total positions).
 On an Apple-silicon Mac with a working MLX environment:
 
 ```bash
-git clone https://github.com/YuhuaBillChen/mlx-vlm.git
-cd mlx-vlm
+git clone https://github.com/YuhuaBillChen/justfit-mlx.git
+cd justfit-mlx
 git checkout justfit-repro-v4
 python3 -m venv .venv
 source .venv/bin/activate
@@ -57,7 +57,7 @@ the full-window, EVO10, and current B4 records carry their later runtime
 provenance in the checked-in result files. The tag itself adds documentation
 and evidence without changing the measured runtime modules.
 The earlier 4.985-tok/s cohort remains preserved in the immutable
-[`justfit-repro-v3`](https://github.com/YuhuaBillChen/mlx-vlm/tree/justfit-repro-v3/examples/justfit/results)
+[`justfit-repro-v3`](https://github.com/YuhuaBillChen/justfit-mlx/tree/justfit-repro-v3/examples/justfit/results)
 tag and is not pooled with the updated measurements.
 
 The evolving branch is useful for daily use, but an experiment should always

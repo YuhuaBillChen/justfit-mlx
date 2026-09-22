@@ -24,8 +24,8 @@ local model directory name. The directory name is exposed as the model ID by
 the OpenAI-compatible endpoint.
 
 ```bash
-git clone https://github.com/YuhuaBillChen/mlx-vlm.git
-cd mlx-vlm
+git clone https://github.com/YuhuaBillChen/justfit-mlx.git
+cd justfit-mlx
 git checkout justfit-repro-v4
 
 python3 -m venv .venv

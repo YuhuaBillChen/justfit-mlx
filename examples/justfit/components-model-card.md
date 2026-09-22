@@ -15,7 +15,7 @@ tags:
 # JustFit Qwen3.8-27B components
 
 Published checkpoint-side components for the
-[JustFit reproduction kit](https://github.com/YuhuaBillChen/mlx-vlm/tree/production/qwen-paged-continuous-batching/examples/justfit)
+[JustFit reproduction kit](https://github.com/YuhuaBillChen/justfit-mlx/tree/justfit-repro-v4/examples/justfit)
 and [paper](https://arxiv.org/abs/2609.17475).
 
 This repository does not duplicate the target model. Download the pinned

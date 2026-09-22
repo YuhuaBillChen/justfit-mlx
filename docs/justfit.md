@@ -23,11 +23,13 @@ contexts under a fixed unified-memory budget. It coordinates three mechanisms:
   after pending state has been evaluated.
 
 Development happens on `main` in this repository. The immutable
-[`justfit-repro-v4`](https://github.com/YuhuaBillChen/mlx-vlm/tree/justfit-repro-v4/examples/justfit)
-tag in the research fork packages the runtime, Quick Start, and result manifests
-exactly as the paper cites them, and stays available permanently. Every measured
-cohort records its own source commit; results from different cold/warm protocols
-are not pooled.
+[`justfit-repro-v4`](https://github.com/YuhuaBillChen/justfit-mlx/tree/justfit-repro-v4/examples/justfit)
+tag packages the runtime, Quick Start, and result manifests exactly as the paper
+measured them. The same tag object also exists in the
+[research fork](https://github.com/YuhuaBillChen/mlx-vlm/tree/justfit-repro-v4/examples/justfit),
+which is where the paper's published URLs resolve; both point at the same tree,
+and both stay available permanently. Every measured cohort records its own
+source commit; results from different cold/warm protocols are not pooled.
 
 ## Measured results
 
