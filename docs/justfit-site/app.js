@@ -7,21 +7,96 @@ const frames=[
  {active:["A"],detail:"E completes. A is singleton again, so the drafter can return after the safe cohort boundary.",mode:"B1 · MTP resumes",head:"generation lease",drafter:"attached",vision:"detached",note:"A resumes MTP with the same target KV and recurrent state."},
  {active:[],detail:"A completes and the text cohort closes. Image request F can enter its separate media-embedding phase.",mode:"Vision phase",head:"detached",drafter:"detached",vision:"attached",note:"No shown KV owner does not mean zero memory use: vision is active while the resident pool remains allocated."}
 ];
-const pool=document.querySelector("#pool");
-function render(index){
- const frame=frames[index],owners=Array(18).fill("");
- frame.active.forEach(id=>slots[id].forEach(slot=>owners[slot]=id));
- pool.replaceChildren(...owners.map((owner,i)=>{
-   const el=document.createElement("div");el.className="slot";el.dataset.owner=owner||"free";
-   if(index===2&&slots.B.includes(i))el.dataset.reused="true";
-   el.innerHTML=`<small>${String(i+1).padStart(2,"0")}</small><b>${owner||"—"}</b>`;return el;
- }));
- const used=owners.filter(Boolean).length;
- document.querySelector("#pool-count").textContent=`${used} occupied / ${18-used} free`;
- document.querySelector("#event-detail").textContent=frame.detail;
- document.querySelector("#pool-note").textContent=frame.note;
- for(const key of ["mode","head","drafter","vision"])document.querySelector(`#${key}`).textContent=frame[key];
- document.querySelectorAll("#event-tabs button").forEach((button,i)=>button.setAttribute("aria-pressed",String(i===index)));
+
+// `lever` names which segment of the budget bar each frame is exercising, so
+// the flat bar lights up in step with the 3D scene: the mechanism doing work
+// right now is the one keeping that slice of memory unmaterialized.
+const levers = ["kv", "kv", "kv", "kv", "comp", "comp"];
+
+let pool3d = null; // set once the 3D module loads; render() tolerates null
+
+function render(index) {
+  const frame = frames[index];
+  const owners = Array(18).fill("");
+  frame.active.forEach((id) => slots[id].forEach((slot) => (owners[slot] = id)));
+  const attached = [
+    frame.head !== "detached",
+    frame.drafter === "attached",
+    frame.vision === "attached",
+  ];
+  if (pool3d) pool3d.setFrame(owners, attached);
+
+  const used = owners.filter(Boolean).length;
+  document.querySelector("#pool-count").textContent = `${used} / 18 pages`;
+  document.querySelector("#stage-caption").textContent = frame.detail;
+  document.querySelector("#run-mode").textContent = frame.mode;
+
+  document.querySelectorAll(".chip[data-owner]").forEach((chip) => {
+    chip.classList.toggle("is-on", frame.active.includes(chip.dataset.owner));
+  });
+  document.querySelectorAll(".chip[data-comp]").forEach((chip) => {
+    chip.classList.toggle("is-on", attached[Number(chip.dataset.comp)]);
+  });
+  document.querySelectorAll(".seg[data-lever]").forEach((seg) => {
+    seg.classList.toggle("is-lit", seg.dataset.lever === levers[index]);
+  });
+  document.querySelectorAll("#event-tabs button").forEach((button, i) => {
+    button.setAttribute("aria-pressed", String(i === index));
+  });
 }
-document.querySelectorAll("#event-tabs button").forEach(button=>button.addEventListener("click",()=>render(Number(button.dataset.frame))));
-render(0);
+
+let currentIndex = 0;
+let auto = null;
+
+function show(index, manual) {
+  currentIndex = (index + frames.length) % frames.length;
+  render(currentIndex);
+  if (manual && auto) {
+    clearInterval(auto); // a click takes over; stop advancing on its own
+    auto = null;
+  }
+}
+
+document.querySelectorAll("#event-tabs button").forEach((button) =>
+  button.addEventListener("click", () => show(Number(button.dataset.frame), true))
+);
+
+render(currentIndex);
+if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  auto = setInterval(() => show(currentIndex + 1), 2600);
+}
+
+window.addEventListener("load", () => {
+  import("./pool3d.js").then((m) => {
+    pool3d = m.mountPagePool(document.getElementById("pool"));
+    render(currentIndex);
+  });
+});
+
+// Install-block tab switcher (Quick Start / Full pinned reproduce).
+document.querySelectorAll(".install-tabs button").forEach((button) => {
+  button.addEventListener("click", () => {
+    document.querySelectorAll(".install-tabs button").forEach((b) => b.classList.toggle("active", b === button));
+    const tab = button.dataset.tab;
+    document.querySelectorAll(".install-block").forEach((pre) => {
+      pre.hidden = pre.dataset.panel !== tab;
+    });
+  });
+});
+
+// Copy the currently visible install block to the clipboard.
+const copyBtn = document.querySelector(".copy-btn");
+if (copyBtn) {
+  copyBtn.addEventListener("click", async () => {
+    const visible = document.querySelector(".install-block:not([hidden])");
+    if (!visible) return;
+    try {
+      await navigator.clipboard.writeText(visible.textContent.trim());
+      const original = copyBtn.textContent;
+      copyBtn.textContent = "Copied";
+      setTimeout(() => (copyBtn.textContent = original), 1400);
+    } catch {
+      /* clipboard API unavailable (e.g. non-secure context) — silent no-op */
+    }
+  });
+}
