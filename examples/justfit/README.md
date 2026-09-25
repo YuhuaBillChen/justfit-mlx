@@ -253,6 +253,14 @@ capacity for every admitted lane and remains enabled.
 Do not treat two sequential requests as B2, or add per-request decode rates to
 manufacture an aggregate result.
 
+## Supplementary device results
+
+The primary evaluation remains M4 Pro / 24 GiB. A supplementary
+[M3 Pro reconstruction](results/m3-pro/README.md) completes six selected
+public-kit runs under the same 21,000-MiB process-footprint guard. The result
+directory records raw-evidence audit results, repeat counts, host differences
+and the distinction between cumulative work and simultaneous occupancy.
+
 ## Reproduction-kit smoke evidence
 
 On 2026-09-15, the tagged source flow was exercised on the paper's M4 Pro / 24

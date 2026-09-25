@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "role": "Supplementary public-kit reconstruction; primary results remain M4 Pro 24 GiB",
+  "source_commit": "3cc6e0cf41f1d0ed939a9702926bd62642a3fef8",
+  "source_tag": "justfit-repro-v4",
+  "hardware": {
+    "chip": "Apple M3 Pro",
+    "cpu_cores": 12,
+    "gpu_cores": 18,
+    "unified_memory_gib": 36,
+    "macos": "27.0 / 26A428"
+  },
+  "guard_mib": 21000,
+  "memory_counter": "sampled physical process footprint; not RSS or Metal allocated bytes",
+  "iogpu_wired_limit_mb": 0,
+  "dependencies": {
+    "python": "3.12.12",
+    "mlx": "0.32.2",
+    "mlx-metal": "0.32.2",
+    "transformers": "5.17.0"
+  },
+  "model": {
+    "repo": "mlx-community/Qwen3.8-27B-mxfp4",
+    "revision": "97ab0819817ab1c61d7d39f9169fc71999915641"
+  },
+  "components": {
+    "repo": "billchen42/JustFit-Qwen3.8-27B-components",
+    "revision": "13e0462fa911a1bcbdccbaa759120500c0f90582"
+  },
+  "evidence_bundle": {
+    "filename": "justfit-paper-core-evidence.tar.gz",
+    "bytes": 8277800,
+    "sha256": "99b0029577f04a15a1642a8aab381aacaf54e2379643343b66f344d56f3b1bdc",
+    "publication": "Separate companion asset; no public download URL assigned in this change"
+  },
+  "fixed_n3_medians": {
+    "prefill_work_tps": 87.10895370142104,
+    "decode_tps": 12.603059454897842,
+    "sampled_peak_phys_footprint_mib": 15650.433204650879
+  },
+  "runs": [
+    {
+      "name": "fixed-32k-6k-r1",
+      "prefill_work_tps": 83.72346891879572,
+      "decode_tps": 11.935296483593985,
+      "decode_interval_tokens": 6143,
+      "decode_interval_seconds": 514.691864458,
+      "sampled_peak_phys_footprint_mib": 15650.433204650879,
+      "paged_high_water_position_slots": 38912,
+      "completed_input_output_positions": 38912,
+      "wall_seconds": 906.3630668750011,
+      "token_ids_sha256": "d8f514d0503ffa0b69e6e45cdda89cd62ae2e2fe32b14a85143f2e8a59aef43d",
+      "text_sha256": "efccb090e203706f1f3e17e2a4258450082fd80f6a32675333657a9538a2e8bb"
+    },
+    {
+      "name": "fixed-32k-6k-r2",
+      "prefill_work_tps": 87.10895370142104,
+      "decode_tps": 12.736041040195067,
+      "decode_interval_tokens": 6143,
+      "decode_interval_seconds": 482.33198845800143,
+      "sampled_peak_phys_footprint_mib": 15650.870590209961,
+      "paged_high_water_position_slots": 38912,
+      "completed_input_output_positions": 38912,
+      "wall_seconds": 858.839248833001,
+      "token_ids_sha256": "d8f514d0503ffa0b69e6e45cdda89cd62ae2e2fe32b14a85143f2e8a59aef43d",
+      "text_sha256": "efccb090e203706f1f3e17e2a4258450082fd80f6a32675333657a9538a2e8bb"
+    },
+    {
+      "name": "fixed-32k-6k-r3",
+      "prefill_work_tps": 87.24100816010302,
+      "decode_tps": 12.603059454897842,
+      "decode_interval_tokens": 6143,
+      "decode_interval_seconds": 487.4213298750001,
+      "sampled_peak_phys_footprint_mib": 15643.245635986328,
+      "paged_high_water_position_slots": 38912,
+      "completed_input_output_positions": 38912,
+      "wall_seconds": 863.2550537499992,
+      "token_ids_sha256": "d8f514d0503ffa0b69e6e45cdda89cd62ae2e2fe32b14a85143f2e8a59aef43d",
+      "text_sha256": "efccb090e203706f1f3e17e2a4258450082fd80f6a32675333657a9538a2e8bb"
+    },
+    {
+      "name": "b1-cold-240k-16k",
+      "prefill_work_tps": 44.40315349101411,
+      "decode_tps": 4.944230129838737,
+      "decode_interval_tokens": 16383,
+      "decode_interval_seconds": 3313.5593549999976,
+      "sampled_peak_phys_footprint_mib": 20904.99513244629,
+      "paged_high_water_position_slots": 262144,
+      "completed_input_output_positions": 262144,
+      "wall_seconds": 8849.779454292002,
+      "token_ids_sha256": "b879e9bf7ac72e0615388c122c14b8d3710fcee3d0798ec9b9912d50c6c254ef",
+      "text_sha256": "3a0b2b28db8eb00602d15de538b66a4a427db7132ae3ecbbd2b954cb886bcb33"
+    },
+    {
+      "name": "b2-cold-128k-16k",
+      "prefill_work_tps": 57.2620974842633,
+      "decode_tps": 7.101483856075701,
+      "decode_interval_tokens": 16372,
+      "decode_interval_seconds": 2305.4336715829995,
+      "sampled_peak_phys_footprint_mib": 20749.088859558105,
+      "paged_high_water_position_slots": 286720,
+      "completed_input_output_positions": 294912,
+      "wall_seconds": 9619.613627208,
+      "token_ids_sha256": "b879e9bf7ac72e0615388c122c14b8d3710fcee3d0798ec9b9912d50c6c254ef",
+      "text_sha256": "3a0b2b28db8eb00602d15de538b66a4a427db7132ae3ecbbd2b954cb886bcb33"
+    },
+    {
+      "name": "b4-incumbent-128k-3x8k-12k",
+      "prefill_work_tps": 62.88847123762324,
+      "decode_tps": 16.800212679099186,
+      "decode_interval_tokens": 42944,
+      "decode_interval_seconds": 2556.1581165829994,
+      "sampled_peak_phys_footprint_mib": 19285.07314300537,
+      "paged_high_water_position_slots": 201728,
+      "completed_input_output_positions": 204800,
+      "wall_seconds": 5554.807522917006,
+      "token_ids_sha256": "1ce497707f0dbf4e91932697f989cdae93c574a19c6a4d8ebec40737c79c82fc",
+      "text_sha256": "6e0ad11cd8b30e375626375bd031ea9e7cf49774114f9c0b52e19ccf38405cd2"
+    }
+  ],
+  "limitations": [
+    "Long workloads are n=1; fixed workload is n=3 fresh processes.",
+    "Equal process guards do not emulate equal host RAM.",
+    "B2 host swap usage changed; swap usage is not swap I/O.",
+    "B2 completed 294912 positions cumulatively; observed simultaneous page-capacity high-water was 286720.",
+    "B2 preparation cadence differs from the historical M4 cohort.",
+    "No warm 320K, vision, AIME, historical ablation, or Dash claim.",
+    "Local output hash agreement is not a comparison to unavailable historical M4 token traces."
+  ]
+}
